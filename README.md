@@ -16,7 +16,7 @@ All three are self-hostable and authenticate with a token in a header, which is 
 
 ## Installing
 
-Do not copy these files by hand. Install them from the catalogue — the store's **Catalogue** tab under Target systems — so that the digest is verified and the version is recorded. A plugin arrives disabled; storing credentials and switching it on stay separate, deliberate steps.
+Do not copy these files by hand. Install them from the **Store** tab under Target systems, so that the digest is verified and the version is recorded. A plugin arrives disabled; storing credentials and switching it on stay separate, deliberate steps.
 
 Credentials follow Covey's convention, stored under Secrets and assigned to the agent:
 
