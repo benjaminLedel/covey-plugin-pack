@@ -1,0 +1,124 @@
+name: build
+
+# The pack is a module of its own now, and that is exactly why it needs a
+# pipeline: nothing else compiles it any more. Before the split, a broken plugin
+# failed Covey's own build; today Covey pins a released version and would not
+# notice for weeks.
+#
+# The job that matters most is the last one — building against the SDK's main
+# branch. It answers "did a change to the contract just break the plugins?"
+# while the change is still somebody's pull request, not after it is tagged.
+
+on:
+  push:
+  pull_request:
+  # The contract can break the plugins without anybody touching this repository,
+  # so check it on a schedule too.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+      # A plugin package that nobody blank-imports still has to REGISTER itself
+      # when it is imported — that is the whole contract. This builds a binary
+      # that imports every package in the pack, so a missing or duplicate
+      # Register shows up here rather than in an operator's store.
+      - name: Every plugin registers itself
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/regcheck && cd /tmp/regcheck
+          # printf, not a heredoc: inside a YAML block the heredoc body keeps
+          # its indentation, and a go.mod with leading spaces is not a go.mod.
+          printf 'module regcheck\n\ngo 1.24\n' > go.mod
+          {
+            echo 'package main'
+            echo
+            echo 'import ('
+            echo '  "fmt"'
+            echo '  "os"'
+            echo '  "github.com/benjaminLedel/covey-plugin-sdk/target"'
+            for d in $(cd "$GITHUB_WORKSPACE" && go list ./... | grep -v '/manifests'); do
+              echo "  _ \"$d\""
+            done
+            echo ')'
+            echo
+            echo 'func main() {'
+            echo '  seen := map[string]bool{}'
+            echo '  for _, d := range target.All() {'
+            echo '    if seen[d.Name] { fmt.Println("duplicate registration:", d.Name); os.Exit(1) }'
+            echo '    seen[d.Name] = true'
+            echo '    if d.System == nil { fmt.Println("registered without a System:", d.Name); os.Exit(1) }'
+            echo '    fmt.Println(" ", d.Name, "-", d.Category)'
+            echo '  }'
+            echo '  fmt.Println(len(seen), "plugin(s) registered")'
+            echo '  if len(seen) == 0 { os.Exit(1) }'
+            echo '}'
+          } > main.go
+          go mod edit -replace github.com/benjaminLedel/covey-plugin-pack="$GITHUB_WORKSPACE"
+          go mod edit -require github.com/benjaminLedel/covey-plugin-pack@v0.0.0
+          GOFLAGS=-mod=mod go mod tidy
+          go run .
+
+  manifests:
+    name: lint the manifest plugins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The manifests here are checked by the same binary that installs them.
+      # Until a Covey release ships `covey plugin lint`, this reports and passes
+      # rather than pretending to check something.
+      - name: Fetch the covey binary
+        id: covey
+        run: |
+          set -euo pipefail
+          url=$(curl -sSL https://api.github.com/repos/benjaminLedel/covey/releases/latest \
+                | python3 -c 'import json,sys; r=json.load(sys.stdin); print(next((a["browser_download_url"] for a in r.get("assets",[]) if a["name"].endswith("linux-amd64")), ""))')
+          if [ -z "$url" ]; then
+            echo "::notice::no covey release asset yet — skipping the manifest lint"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -sSL -o /usr/local/bin/covey "$url"
+          chmod +x /usr/local/bin/covey
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Lint
+        if: steps.covey.outputs.available == 'true'
+        run: covey plugin lint manifests/*.json
+
+  against-sdk-main:
+    name: build against the SDK's main branch
+    runs-on: ubuntu-latest
+    # Informational: a contract change that breaks the plugins should be visible
+    # immediately, but it must not block a pull request in THIS repository —
+    # the fix belongs in the SDK or in a coordinated release, not in a red tick
+    # on somebody's unrelated change.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Point at the SDK's main and build
+        run: |
+          set -euo pipefail
+          GOFLAGS=-mod=mod go get github.com/benjaminLedel/covey-plugin-sdk@main
+          go build ./...
+          go test ./... -count=1
