@@ -1,0 +1,61 @@
+{
+  "name": "redmine",
+  "label": "Redmine",
+  "description": "Issue tracker: find issues, read them, comment, change status and assignee.",
+  "category": "ticketing",
+  "auth": {
+    "header": "X-Redmine-API-Key",
+    "format": "{token}"
+  },
+  "webhook": {
+    "id_field": "issue.id",
+    "event_id_field": "journal.id",
+    "title_field": "issue.subject",
+    "body_field": "journal.notes"
+  },
+  "scopes": ["read", "comment", "write"],
+  "probe": {
+    "path": "/users/current.json",
+    "identity_field": "user.login"
+  },
+  "poll": {
+    "": {
+      "path": "/issues.json?assigned_to_id=me&status_id=open&sort=updated_on:desc&limit=50",
+      "items_field": "issues",
+      "signature_field": "updated_on"
+    }
+  },
+  "actions": {
+    "list_issues": {
+      "method": "GET",
+      "path": "/issues.json",
+      "scope": "read",
+      "doc": "find issues; params go into the query as Redmine expects them (project_id, status_id, assigned_to_id, sort, limit)"
+    },
+    "get_issue": {
+      "method": "GET",
+      "path": "/issues/{id}.json",
+      "scope": "read",
+      "doc": "read one issue including its journals; params: id"
+    },
+    "comment": {
+      "method": "PUT",
+      "path": "/issues/{id}.json",
+      "scope": "comment",
+      "doc": "add a note; params: id, issue={\"notes\":\"…\"} (Redmine nests everything under issue)"
+    },
+    "update_issue": {
+      "method": "PUT",
+      "path": "/issues/{id}.json",
+      "scope": "write",
+      "doc": "change status, assignee or priority; params: id, issue={\"status_id\":N,\"assigned_to_id\":N,\"priority_id\":N}"
+    },
+    "create_issue": {
+      "method": "POST",
+      "path": "/issues.json",
+      "scope": "write",
+      "doc": "file a new issue; params: issue={\"project_id\":N,\"subject\":\"…\",\"description\":\"…\"}"
+    }
+  },
+  "prompt_doc": "Redmine is your issue tracker. The base URL and the API key come from the platform — you never see them.\n\nRedmine nests request bodies under a single key (\"issue\"), so pass that object as one parameter rather than flat fields. Read an issue before you comment on it: the journals hold the history you are answering to."
+}

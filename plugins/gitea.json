@@ -1,0 +1,79 @@
+{
+  "name": "gitea",
+  "label": "Gitea / Forgejo",
+  "description": "Self-hosted git forge: find issues and pull requests, read them, comment, label and close.",
+  "category": "code",
+  "auth": {
+    "header": "Authorization",
+    "format": "token {token}"
+  },
+  "webhook": {
+    "signature": "hmac-sha256",
+    "signature_header": "X-Gitea-Signature",
+    "id_field": "issue.id",
+    "event_id_field": "comment.id",
+    "title_field": "issue.title",
+    "body_field": "issue.body",
+    "ignore_when": [{ "field": "sender.login", "equals": "covey" }]
+  },
+  "scopes": ["read", "comment", "write", "review"],
+  "probe": {
+    "path": "/api/v1/user",
+    "identity_field": "login"
+  },
+  "poll": {
+    "": {
+      "path": "/api/v1/repos/issues/search?state=open&assigned=true&type=issues&limit=50",
+      "signature_field": "updated_at"
+    },
+    "review": {
+      "path": "/api/v1/repos/issues/search?state=open&review_requested=true&type=pulls&limit=50",
+      "signature_field": "updated_at"
+    }
+  },
+  "actions": {
+    "search_issues": {
+      "method": "GET",
+      "path": "/api/v1/repos/issues/search",
+      "scope": "read",
+      "doc": "find issues and pull requests across repositories; params: state, assigned, type (issues|pulls), q, limit"
+    },
+    "get_issue": {
+      "method": "GET",
+      "path": "/api/v1/repos/{owner}/{repo}/issues/{index}",
+      "scope": "read",
+      "doc": "read one issue or pull request; params: owner, repo, index"
+    },
+    "list_comments": {
+      "method": "GET",
+      "path": "/api/v1/repos/{owner}/{repo}/issues/{index}/comments",
+      "scope": "read",
+      "doc": "read the discussion; params: owner, repo, index"
+    },
+    "comment": {
+      "method": "POST",
+      "path": "/api/v1/repos/{owner}/{repo}/issues/{index}/comments",
+      "scope": "comment",
+      "doc": "write a comment; params: owner, repo, index, body"
+    },
+    "create_issue": {
+      "method": "POST",
+      "path": "/api/v1/repos/{owner}/{repo}/issues",
+      "scope": "write",
+      "doc": "file an issue; params: owner, repo, title, body"
+    },
+    "update_issue": {
+      "method": "PATCH",
+      "path": "/api/v1/repos/{owner}/{repo}/issues/{index}",
+      "scope": "write",
+      "doc": "change state, labels or assignees; params: owner, repo, index, state (open|closed), labels, assignees"
+    },
+    "list_pull_files": {
+      "method": "GET",
+      "path": "/api/v1/repos/{owner}/{repo}/pulls/{index}/files",
+      "scope": "review",
+      "doc": "see what a pull request changes; params: owner, repo, index"
+    }
+  },
+  "prompt_doc": "Gitea (and Forgejo, which speaks the same API) is your git forge. The base URL and the token come from the platform — you never see them.\n\nsearch_issues finds work across every repository you can reach; get_issue and list_comments give you the case itself. Read the discussion before you answer it: a comment that repeats what somebody already said costs a person their time."
+}

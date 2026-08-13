@@ -1,0 +1,61 @@
+{
+  "name": "openproject",
+  "label": "OpenProject",
+  "description": "Project management: find work packages, read them, comment and move them through their status.",
+  "category": "ticketing",
+  "auth": {
+    "header": "Authorization",
+    "format": "Basic {token}"
+  },
+  "webhook": {
+    "id_field": "work_package.id",
+    "event_id_field": "action",
+    "title_field": "work_package.subject",
+    "body_field": "work_package._embedded.description.raw"
+  },
+  "scopes": ["read", "comment", "write"],
+  "probe": {
+    "path": "/api/v3/users/me",
+    "identity_field": "login"
+  },
+  "poll": {
+    "": {
+      "path": "/api/v3/work_packages?filters=%5B%7B%22assignee%22%3A%7B%22operator%22%3A%22%3D%22%2C%22values%22%3A%5B%22me%22%5D%7D%7D%2C%7B%22status%22%3A%7B%22operator%22%3A%22o%22%2C%22values%22%3A%5B%5D%7D%7D%5D&pageSize=50",
+      "items_field": "_embedded.elements",
+      "signature_field": "updatedAt"
+    }
+  },
+  "actions": {
+    "list_work_packages": {
+      "method": "GET",
+      "path": "/api/v3/work_packages",
+      "scope": "read",
+      "doc": "find work packages; params: filters (OpenProject's JSON filter syntax), sortBy, pageSize"
+    },
+    "get_work_package": {
+      "method": "GET",
+      "path": "/api/v3/work_packages/{id}",
+      "scope": "read",
+      "doc": "read one work package; params: id"
+    },
+    "list_activities": {
+      "method": "GET",
+      "path": "/api/v3/work_packages/{id}/activities",
+      "scope": "read",
+      "doc": "read the history and comments; params: id"
+    },
+    "comment": {
+      "method": "POST",
+      "path": "/api/v3/work_packages/{id}/activities",
+      "scope": "comment",
+      "doc": "add a comment; params: id, comment={\"raw\":\"…\"}"
+    },
+    "update_work_package": {
+      "method": "PATCH",
+      "path": "/api/v3/work_packages/{id}",
+      "scope": "write",
+      "doc": "change status, assignee or dates; params: id, lockVersion (from get_work_package), _links={\"status\":{\"href\":\"/api/v3/statuses/N\"}}"
+    }
+  },
+  "prompt_doc": "OpenProject holds the work packages. The base URL and the credential come from the platform — you never see them.\n\nTwo things about this API are easy to get wrong. Updates need the lockVersion you read in get_work_package: it is how OpenProject notices that somebody else changed the record while you were thinking, and an update without it is refused rather than silently overwriting them. And status or assignee are set through _links, not through plain fields."
+}
