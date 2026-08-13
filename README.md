@@ -18,6 +18,7 @@ These used to live inside Covey's own repository, compiled in from `internal/`. 
 | `browser/` | headless Chrome | the universal adapter for web applications without a plugin of their own |
 | `dev/` | the sandbox itself | shell commands, long-running processes, sub-agent runs inside a checkout |
 | `vulndb/` | OSV, GHSA, NVD | known vulnerabilities in declared dependencies |
+| `k8s/` | Kubernetes | read pods, logs, events and workloads; restart a Deployment, delete a stuck Pod. Secrets are never readable, and writes stay small because a GitOps cluster takes its desired state from its repository |
 
 **Manifest plugins** (`manifests/`, JSON — no Go, no rebuild): Redmine, Gitea/Forgejo, OpenProject. These are listed in the [catalogue](https://github.com/benjaminLedel/covey-plugins) and installed at runtime.
 
