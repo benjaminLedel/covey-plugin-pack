@@ -2,7 +2,11 @@ package zammad
 
 import (
 	"crypto/hmac"
-	"crypto/sha1"
+	// SHA-1, and not by choice: Zammad signs its webhooks with HMAC-SHA1, so
+	// verifying one means computing one. The weakness gosec warns about
+	// (collision resistance) is not what HMAC relies on, and picking a stronger
+	// hash here would simply reject every genuine webhook.
+	"crypto/sha1" // #nosec G505 -- the wire format is Zammad's, not ours
 	"encoding/hex"
 	"encoding/json"
 	"fmt"

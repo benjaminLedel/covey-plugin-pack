@@ -102,7 +102,7 @@ jobs:
       # away, and then it protects nobody.
       - name: gosec
         run: |
-          go run github.com/securego/gosec/v2/cmd/gosec@v2.21.4 \
+          go run github.com/securego/gosec/v2/cmd/gosec@v2.22.9 \
             -include=G101,G102,G106,G107,G108,G109,G110,G201,G202,G203,G303,G305,G401,G402,G403,G404,G501,G502,G503,G504,G505 \
             -exclude-dir=.go ./...
 
