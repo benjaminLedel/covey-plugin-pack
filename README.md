@@ -1,49 +1,52 @@
 # covey-plugin-pack
 
-Manifest plugins for [Covey](https://github.com/benjaminLedel/covey) — target systems an agent can work in, described as JSON rather than compiled into the binary.
+The target-system plugins [Covey](https://github.com/benjaminLedel/covey) ships with — and the proof that shipping with Covey is not a privilege.
 
-This repository **hosts the plugins**. It is not the catalogue: the catalogue is [covey-plugins](https://github.com/benjaminLedel/covey-plugins), which points at the files here and pins each version by digest. That split is the point — a plugin lives with its author, and the index only says where.
+These used to live inside Covey's own repository, compiled in from `internal/`. They live here now, as an ordinary Go module against the public [SDK](https://github.com/benjaminLedel/covey-plugin-sdk), built the same way anybody else's plugin is built. Covey's default binary blank-imports this module; you can leave it out, replace it, or add your own alongside.
 
 ## What is in here
 
-| Plugin | System | Actions |
+**Compiled plugins** (Go, one package each):
+
+| | System | |
 |---|---|---|
-| [`plugins/redmine.json`](plugins/redmine.json) | Redmine | find, read, comment, update, create issues |
-| [`plugins/gitea.json`](plugins/gitea.json) | Gitea / Forgejo | find and read issues and pull requests, comment, label, close, see a PR's files |
-| [`plugins/openproject.json`](plugins/openproject.json) | OpenProject | find and read work packages, comment, move through status |
+| `zammad/` | Zammad | helpdesk: read tickets, reply, set state, escalate; webhook intake |
+| `gitlab/` · `github/` | GitLab, GitHub | issues and merge/pull requests as the working set: check out, fix, commit, open an MR/PR, live the review loop |
+| `email/` | IMAP/SMTP | a mail account of its own: sift the inbox, read attachments, reply |
+| `teams/` | Microsoft Teams | a chat channel through the Azure Bot Service |
+| `sharepoint/` · `nextcloud/` | SharePoint, Nextcloud | document libraries: list, read, write, delete |
+| `browser/` | headless Chrome | the universal adapter for web applications without a plugin of their own |
+| `dev/` | the sandbox itself | shell commands, long-running processes, sub-agent runs inside a checkout |
+| `vulndb/` | OSV, GHSA, NVD | known vulnerabilities in declared dependencies |
 
-All three are self-hostable and authenticate with a token in a header, which is what a manifest plugin can express. Each declares the optional capabilities too: a `probe` (so the store can test the connection), a `poll` (so `nur-wenn:` in `HEARTBEAT.md` gates on real work), a `scopes` vocabulary for `ACCESS.md`, and per-action `doc` lines so the prompt documentation can be narrowed to what an agent may actually do.
+**Manifest plugins** (`manifests/`, JSON — no Go, no rebuild): Redmine, Gitea/Forgejo, OpenProject. These are listed in the [catalogue](https://github.com/benjaminLedel/covey-plugins) and installed at runtime.
 
-## Installing
+## Using it
 
-Do not copy these files by hand. Install them from the **Store** tab under Target systems, so that the digest is verified and the version is recorded. A plugin arrives disabled; storing credentials and switching it on stay separate, deliberate steps.
+The default Covey build already includes the compiled ones. To build a Covey with a different set, blank-import what you want:
 
-Credentials follow Covey's convention, stored under Secrets and assigned to the agent:
-
-| Plugin | `<name>_url` | `<name>_token` |
-|---|---|---|
-| redmine | `https://redmine.example.com` | the API key from *My account → API access key* |
-| gitea | `https://git.example.com` | a personal access token with the scopes you want it to have |
-| openproject | `https://op.example.com` | base64 of `apikey:<your-api-key>` (OpenProject uses HTTP Basic) |
-
-## Status: untested against live systems
-
-These manifests are written from each system's published API documentation. They lint clean, and their shape is verified — but **they have not been exercised against a running Redmine, Gitea or OpenProject**. That is why they are `0.1.0`.
-
-If you run one of these systems and something is wrong — a path, a parameter, a field the poll reads — please open an issue or a pull request. A corrected version is a new version in the catalogue; the old one keeps working for whoever installed it until they choose to update.
-
-## Changing a plugin
-
-1. Edit the file under `plugins/`.
-2. `covey plugin lint plugins/<name>.json` — the same check the catalogue's CI and every Covey instance runs.
-3. Open a pull request here.
-4. After the merge, tag a release and open a pull request against [covey-plugins](https://github.com/benjaminLedel/covey-plugins) adding the new version, with the digest of the file at that tag:
-
-```sh
-curl -sL https://raw.githubusercontent.com/benjaminLedel/covey-plugin-pack/vX.Y.Z/plugins/<name>.json | shasum -a 256
+```go
+import (
+    _ "github.com/benjaminLedel/covey-plugin-pack/zammad"
+    _ "github.com/example/covey-plugin-jira"   // somebody else's, on equal terms
+)
 ```
 
-Never edit a published version in place. Instances have pinned its digest, and rewriting it would change what they believe they installed — which is precisely what the digest exists to prevent.
+## Writing a plugin
+
+You do not need this repository for that. A plugin is one package that calls `target.Register` in `init()` — see the [SDK](https://github.com/benjaminLedel/covey-plugin-sdk). If you would rather not compile anything into Covey at all, write a **manifest**, an **MCP configuration** or a **WebAssembly module** and publish it through the [catalogue](https://github.com/benjaminLedel/covey-plugins); those install at runtime, with no rebuild.
+
+These plugins are here because they are the common ones, not because they are special. Nothing in this module can do anything a third-party plugin cannot.
+
+## Development
+
+```sh
+go build ./...
+go test ./...
+covey plugin lint manifests/redmine.json
+```
+
+Changing a plugin means changing it here, tagging a release, and — for the manifests — opening a pull request against the catalogue with the new digest.
 
 ## Licence
 
