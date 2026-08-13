@@ -75,6 +75,37 @@ jobs:
           GOFLAGS=-mod=mod go mod tidy
           go run .
 
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      # The same two tools Covey itself runs, and they matter more here, not
+      # less: this code talks to other people's systems with other people's
+      # credentials, and it is linked into every Covey that ships.
+      #
+      # govulncheck reports only what the code actually CALLS — almost no false
+      # positives, so it is a hard step. Pinned on purpose: a tool fetched fresh
+      # from the network on every run is itself a way in.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      # gosec complements it: the one knows published holes in DEPENDENCIES, the
+      # other looks for patterns in our OWN code. With an explicit rule list
+      # rather than "everything except…", because unfiltered it reports what
+      # these plugins are FOR — the dev plugin runs shell commands, the file
+      # plugins read paths. A job that prints a hundred findings gets clicked
+      # away, and then it protects nobody.
+      - name: gosec
+        run: |
+          go run github.com/securego/gosec/v2/cmd/gosec@v2.21.4 \
+            -include=G101,G102,G106,G107,G108,G109,G110,G201,G202,G203,G303,G305,G401,G402,G403,G404,G501,G502,G503,G504,G505 \
+            -exclude-dir=.go ./...
+
   manifests:
     name: lint the manifest plugins
     runs-on: ubuntu-latest

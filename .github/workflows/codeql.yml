@@ -1,0 +1,34 @@
+# CodeQL for the plugin pack.
+#
+# It complements govulncheck rather than replacing it: govulncheck knows
+# published holes in DEPENDENCIES, CodeQL looks for patterns in our OWN code —
+# unchecked input, path manipulation, missing error handling.
+#
+# Worth having here in particular. These plugins are the code that talks to
+# other people's ticket systems and repositories, with credentials brokered to
+# them, and they are linked into every Covey that ships.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because the rule sets keep growing: a run over unchanged code may
+  # find more next month than it does today.
+  schedule:
+    - cron: "42 6 * * 2"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
