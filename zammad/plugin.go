@@ -17,6 +17,10 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_ZAMMAD_INTAKE_GROUPS",
+			"COVEY_ZAMMAD_REPLY_TYPE",
+		},
 		Name:        "zammad",
 		Label:       "Zammad",
 		Description: "Open-source helpdesk (spec/13): read tickets, reply, set state, escalate. Webhook wake via triggers, auth by API token (secrets zammad_token + zammad_url).",

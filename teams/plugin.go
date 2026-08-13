@@ -17,6 +17,11 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_TEAMS_ATTACHMENT_MAX_MB",
+			"COVEY_TEAMS_INTAKE_TENANTS",
+			"COVEY_TEAMS_TOKEN_URL",
+		},
 		Name:        "teams",
 		Label:       "Microsoft Teams",
 		Description: "Chat channel via the Azure Bot Service (spec/15): receive messages (messaging endpoint, JWT-verified) and send them (Bot Connector). Auth via OAuth2 (secrets teams_token = appId:appPassword + optional teams_url).",

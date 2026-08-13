@@ -22,6 +22,9 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_NEXTCLOUD_UPLOAD_MAX_MB",
+		},
 		Name:        "nextcloud",
 		Label:       "Nextcloud files",
 		Description: "A Nextcloud file store through a share link or an account login: list files (list), read them (read/download into the sandbox), deposit and edit them (write/upload), create folders (mkdir), delete (delete). Access over WebDAV; a bot needs no more than the link. Secrets nextcloud_url (share link https://host/s/… OR server URL) + nextcloud_token (share password resp. user:app-password). Intake through HEARTBEAT.md (polling, no webhook).",

@@ -8,7 +8,7 @@ module github.com/benjaminLedel/covey-plugin-pack
 go 1.26
 
 require (
-	github.com/benjaminLedel/covey-plugin-sdk v0.1.0
+	github.com/benjaminLedel/covey-plugin-sdk v0.2.0
 	github.com/chromedp/chromedp v0.16.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2

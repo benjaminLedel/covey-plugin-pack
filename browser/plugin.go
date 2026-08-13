@@ -21,6 +21,11 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_BROWSER_CHROME_PATH",
+			"COVEY_BROWSER_HEADFUL",
+			"COVEY_BROWSER_TIMEOUT_SECS",
+		},
 		Name:          "browser",
 		Label:         "Browser (headless Chrome)",
 		Description:   "A full headless Chrome as the universal adapter for web applications without a plugin of their own: open pages (navigate), read visible text/DOM (content), write screenshots into the sandbox (screenshot), click (click) and type (type). Runs locally in the daemon (chromedp/DevTools protocol), needs no secrets. Which pages are reachable is gated by the egress allowlist.",

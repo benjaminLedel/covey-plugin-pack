@@ -18,6 +18,11 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_EMAIL_ATTACHMENT_MAX_MB",
+			"COVEY_EMAIL_INTAKE_ADDRESSES",
+			"COVEY_EMAIL_SEND_DOMAINS",
+		},
 		Name:        "email",
 		Label:       "Email (IMAP/SMTP)",
 		Description: "A mail account of its own for the agent: sift through the inbox by IMAP (list_unread/get_message), load attachments into the sandbox and read them (get_attachment), reply or send by SMTP (reply/send), file mail by mark_seen/move. Intake by HEARTBEAT.md (polling, no webhook). Auth by the secrets email_url (mail server host, e.g. mail.example.com) and email_token (address:password).",

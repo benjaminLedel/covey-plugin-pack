@@ -24,6 +24,9 @@ type System struct{}
 
 func init() {
 	target.Register(target.Descriptor{
+		Env: []string{
+			"COVEY_SHAREPOINT_UPLOAD_MAX_MB",
+		},
 		Name:        "sharepoint",
 		Label:       "SharePoint / Teams files",
 		Description: "A SharePoint/Teams document library through a share link: list files (list), read them (read/download into the sandbox), deposit and edit them (write/upload), create folders (mkdir), delete (delete). Auth through an Entra ID app registration (client credentials), secrets sharepoint_url (share link) + sharepoint_token (tenant:client:secret). Intake through HEARTBEAT.md (polling, no webhook).",
