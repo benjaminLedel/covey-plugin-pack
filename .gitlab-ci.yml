@@ -1,0 +1,86 @@
+# GitLab CI for the Covey plugin pack.
+#
+# The same checks as the GitHub workflow, because the pack is mirrored to both
+# and a check that only runs on one of them is a check somebody will trip over
+# on the other.
+#
+# Why this module needs a pipeline at all: before the split the plugins lived in
+# Covey's repository, so a broken plugin failed Covey's own build. Today Covey
+# pins a released version and would not notice for weeks.
+
+stages: [test, contract]
+
+variables:
+  # Modules are cached inside the project directory so GitLab can cache them.
+  GOPATH: $CI_PROJECT_DIR/.go
+  GOTOOLCHAIN: local
+
+.go-cache: &go-cache
+  cache:
+    key: "go-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .go/pkg/mod
+
+test:
+  stage: test
+  image: golang:1.26
+  <<: *go-cache
+  script:
+    - go build ./...
+    - go vet ./...
+    # gofmt keeps the diffs about the change, not about the formatting.
+    - test -z "$(gofmt -l $(go list -f '{{.Dir}}' ./...) | tee /dev/stderr)"
+    - go test ./... -count=1
+
+registers:
+  stage: test
+  image: golang:1.26
+  <<: *go-cache
+  # A plugin package that nobody blank-imports still has to REGISTER itself when
+  # it is imported — that is the whole contract with Covey. This builds a binary
+  # importing every package in the pack, so a missing or duplicate registration
+  # shows up here rather than in an operator's store.
+  script:
+    - mkdir -p /tmp/regcheck && cd /tmp/regcheck
+    # printf, not a heredoc: a heredoc inside a YAML block keeps its
+    # indentation, and a go.mod with leading spaces is not a go.mod.
+    - printf 'module regcheck\n\ngo 1.24\n' > go.mod
+    - |
+      {
+        echo 'package main'
+        echo 'import ('
+        echo '  "fmt"'
+        echo '  "os"'
+        echo '  "github.com/benjaminLedel/covey-plugin-sdk/target"'
+        for d in $(cd "$CI_PROJECT_DIR" && go list ./...); do echo "  _ \"$d\""; done
+        echo ')'
+        echo 'func main() {'
+        echo '  seen := map[string]bool{}'
+        echo '  for _, d := range target.All() {'
+        echo '    if seen[d.Name] { fmt.Println("duplicate registration:", d.Name); os.Exit(1) }'
+        echo '    seen[d.Name] = true'
+        echo '    if d.System == nil { fmt.Println("registered without a System:", d.Name); os.Exit(1) }'
+        echo '    fmt.Println(" ", d.Name, "-", d.Category)'
+        echo '  }'
+        echo '  fmt.Println(len(seen), "plugin(s) registered")'
+        echo '  if len(seen) == 0 { os.Exit(1) }'
+        echo '}'
+      } > main.go
+    - go mod edit -replace github.com/benjaminLedel/covey-plugin-pack="$CI_PROJECT_DIR"
+    - go mod edit -require github.com/benjaminLedel/covey-plugin-pack@v0.0.0
+    - GOFLAGS=-mod=mod go mod tidy
+    - go run .
+
+against-sdk-main:
+  stage: contract
+  image: golang:1.26
+  <<: *go-cache
+  # The question that matters after the split: did a change to the CONTRACT just
+  # break the plugins? Allowed to fail — the pack may legitimately lag behind a
+  # change in the SDK, and the fix belongs there or in a coordinated release,
+  # not in a red pipeline on an unrelated commit here.
+  allow_failure: true
+  script:
+    - GOFLAGS=-mod=mod go get github.com/benjaminLedel/covey-plugin-sdk@main
+    - go build ./...
+    - go test ./... -count=1
