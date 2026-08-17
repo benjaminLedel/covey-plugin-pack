@@ -1059,3 +1059,23 @@ func TestAttachFileHonoursTheSizeLimit(t *testing.T) {
 		t.Fatalf("a file over the limit must be refused, not uploaded: %v", err)
 	}
 }
+
+// TestHasWorkOnATie: two events in the same millisecond compare equal, and the
+// question is which way to fall. Towards waiting — the timestamps never change
+// again, so treating a tie as answered would drop that customer's message for
+// good, while treating it as work costs one run that finds nothing to do.
+func TestHasWorkOnATie(t *testing.T) {
+	const sameMoment = "2026-08-17T09:00:00.000+0000"
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
+	f.messages = []map[string]any{
+		{"Id": "02s0000000001AAA", "ParentId": caseA, "MessageDate": sameMoment, "Incoming": true},
+	}
+	f.comments = []map[string]any{
+		{"Id": "00a0000000002AAA", "ParentId": caseA, "CreatedDate": sameMoment},
+	}
+	has, _, err := sys.HasWorkSigned(context.Background(), f.cred(), "")
+	if err != nil || !has {
+		t.Fatalf("a tie must not silently swallow the customer's message: %v %v", has, err)
+	}
+}

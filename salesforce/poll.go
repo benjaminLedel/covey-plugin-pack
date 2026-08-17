@@ -127,7 +127,14 @@ func casesAwaitingReply(ctx context.Context, c *Client, assignedOnly bool) ([]st
 			// No incoming mail: then the case itself is what came in.
 			last = k.CreatedAt
 		}
-		if last > answered[id] {
+		// >=, not >: Salesforce timestamps have millisecond resolution, and two
+		// events inside the same millisecond compare equal. With a strict
+		// comparison such a tie reads as "answered" — and because neither
+		// timestamp ever changes again, that message would never wake anybody:
+		// a customer silently waiting forever. A tie therefore counts as
+		// waiting. The cost of erring this way is one run that finds nothing to
+		// do, and the signature stops it from repeating.
+		if last >= answered[id] {
 			waiting = append(waiting, "case:"+id+"@"+last)
 		}
 	}
