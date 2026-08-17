@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,13 +49,18 @@ type fakeOrg struct {
 	cases    []map[string]any
 	messages []map[string]any
 	comments []map[string]any
+	links    []map[string]any // ContentDocumentLink
+	versions []map[string]any // ContentVersion
+	legacy   []map[string]any // Attachment (the old world)
+	blobs    map[string][]byte
+	uploaded []map[string]any // what attach_file posted
 
 	srv *httptest.Server
 }
 
 func newFakeOrg(t *testing.T) *fakeOrg {
 	t.Helper()
-	f := &fakeOrg{t: t, patched: map[string]map[string]any{}}
+	f := &fakeOrg{t: t, patched: map[string]map[string]any{}, blobs: map[string][]byte{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -118,6 +126,12 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 			writeRecords(w, f.comments)
 		case strings.Contains(q, "FROM EmailMessage"):
 			writeRecords(w, f.messages)
+		case strings.Contains(q, "FROM ContentDocumentLink"):
+			writeRecords(w, f.links)
+		case strings.Contains(q, "FROM ContentVersion"):
+			writeRecords(w, f.versions)
+		case strings.Contains(q, "FROM Attachment"):
+			writeRecords(w, f.legacy)
 		case strings.Contains(q, "FROM Group"):
 			writeRecords(w, []map[string]any{{"Id": "00G8d000001QueueAA"}})
 		case strings.Contains(q, "FROM Case"):
@@ -129,6 +143,33 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/search/"):
 		f.queries = append(f.queries, r.URL.Query().Get("q"))
 		json.NewEncoder(w).Encode(map[string]any{"searchRecords": f.cases})
+
+	case strings.HasSuffix(r.URL.Path, "/VersionData"), strings.HasSuffix(r.URL.Path, "/Body"):
+		parts := strings.Split(r.URL.Path, "/")
+		id := parts[len(parts)-2]
+		blob, ok := f.blobs[id]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `[{"message":"not found","errorCode":"NOT_FOUND"}]`)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(blob)
+
+	case strings.HasSuffix(r.URL.Path, "/sobjects/ContentVersion") && r.Method == http.MethodPost:
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		f.uploaded = append(f.uploaded, body)
+		// The upload has to be findable afterwards — the plugin looks the
+		// document id up before it links.
+		f.versions = []map[string]any{{"Id": "0688d000000UpldAAG", "ContentDocumentId": "0698d000000DocuAAG"}}
+		fmt.Fprint(w, `{"id":"0688d000000UpldAAG","success":true,"errors":[]}`)
+
+	case strings.HasSuffix(r.URL.Path, "/sobjects/ContentDocumentLink") && r.Method == http.MethodPost:
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		f.uploaded = append(f.uploaded, body)
+		fmt.Fprint(w, `{"id":"06A8d000000LinkAAG","success":true,"errors":[]}`)
 
 	case strings.HasSuffix(r.URL.Path, "/sobjects/CaseComment") && r.Method == http.MethodPost:
 		var body map[string]any
@@ -705,7 +746,7 @@ func TestActionSubject(t *testing.T) {
 // action that is never called.
 func TestPromptDocNamesEveryAction(t *testing.T) {
 	doc := sys.PromptDoc()
-	for _, action := range []string{"get_case", "list_cases", "list_messages", "search_cases", "reply", "set_status", "escalate"} {
+	for _, action := range []string{"get_case", "list_cases", "list_messages", "search_cases", "reply", "set_status", "escalate", "list_files", "download_file", "attach_file"} {
 		if !strings.Contains(doc, action) {
 			t.Errorf("the prompt doc does not name %q", action)
 		}
@@ -853,5 +894,168 @@ func TestUsernameAndAppAreDifferentSessions(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.tokenCalls != 2 {
 		t.Fatalf("connected app and named user each log in for themselves: %d", f.tokenCalls)
+	}
+}
+
+// ------------------------------------------------------------------ files on a case
+
+const (
+	fileID   = "0688d000000FileAAG" // a ContentVersion
+	legacyID = "00P8d000000OldAAG"  // an Attachment from the old world
+)
+
+func (f *fakeOrg) seedFiles() {
+	f.links = []map[string]any{{"ContentDocumentId": "0698d000000DocuAAG"}}
+	f.versions = []map[string]any{{
+		"Id": fileID, "ContentDocumentId": "0698d000000DocuAAG", "Title": "screenshot",
+		"FileExtension": "png", "ContentSize": 4, "CreatedDate": "2026-08-17T09:00:00.000+0000",
+	}}
+	f.legacy = []map[string]any{{
+		"Id": legacyID, "Name": "log.txt", "ContentType": "text/plain",
+		"BodyLength": 3, "CreatedDate": "2026-08-16T09:00:00.000+0000",
+	}}
+	f.blobs[fileID] = []byte("\x89PNG")
+	f.blobs[legacyID] = []byte("log")
+}
+
+// TestListFilesFindsBothWorlds: Salesforce stores attachments two ways and a
+// grown org has both. A plugin that knew only the modern one would come back
+// empty on an old case without saying it had looked in one place only.
+func TestListFilesFindsBothWorlds(t *testing.T) {
+	f := newFakeOrg(t)
+	f.seedFiles()
+
+	res := exec(t, f, "list_files", `{"case_id":"`+caseA+`"}`)
+	files := res.([]FileRef)
+	if len(files) != 2 {
+		t.Fatalf("both worlds belong in one list: %+v", files)
+	}
+	if files[0].Kind != "file" || files[0].Name != "screenshot.png" {
+		t.Fatalf("the extension belongs on the name — Salesforce keeps it in its own field: %+v", files[0])
+	}
+	if files[1].Kind != "attachment" || files[1].Name != "log.txt" {
+		t.Fatalf("legacy attachment: %+v", files[1])
+	}
+}
+
+// TestDownloadFileIntoSandbox: the file has to actually lie in the sandbox
+// afterwards — that is the whole point, because only then can the agent look at
+// it.
+func TestDownloadFileIntoSandbox(t *testing.T) {
+	f := newFakeOrg(t)
+	f.seedFiles()
+	dir := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), dir)
+
+	res, err := sys.Execute(ctx, "download_file", json.RawMessage(`{"file_id":"`+fileID+`","name":"screenshot.png"}`), f.cred())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := res.(DownloadResult)
+	data, err := os.ReadFile(got.Path)
+	if err != nil {
+		t.Fatalf("the file is not where the action says it is: %v", err)
+	}
+	if string(data) != "\x89PNG" {
+		t.Fatalf("content: %q", data)
+	}
+	if !strings.HasPrefix(got.Path, dir) {
+		t.Fatalf("the file must lie inside the sandbox: %s", got.Path)
+	}
+	if got.Hint == "" {
+		t.Error("the agent has to be told what it can do with the file")
+	}
+
+	// The old world downloads through a different endpoint, and the action has
+	// to pick it from the id alone.
+	if _, err := sys.Execute(ctx, "download_file", json.RawMessage(`{"file_id":"`+legacyID+`","name":"log.txt"}`), f.cred()); err != nil {
+		t.Fatalf("legacy attachment: %v", err)
+	}
+}
+
+func TestDownloadFileRejectsAForeignID(t *testing.T) {
+	f := newFakeOrg(t)
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+	for _, id := range []string{"5008d000004QsTAAA0", "../../etc/passwd", ""} {
+		if _, err := sys.Execute(ctx, "download_file", json.RawMessage(`{"file_id":"`+id+`"}`), f.cred()); err == nil {
+			t.Errorf("%q is not a file id and must be refused before a request goes out", id)
+		}
+	}
+}
+
+func TestDownloadNeedsASandbox(t *testing.T) {
+	f := newFakeOrg(t)
+	_, err := sys.Execute(context.Background(), "download_file", json.RawMessage(`{"file_id":"`+fileID+`"}`), f.cred())
+	if err == nil || !strings.Contains(err.Error(), "sandbox") {
+		t.Fatalf("without a working directory there is nowhere to put it: %v", err)
+	}
+}
+
+// TestAttachFileFromSandbox: uploading is two steps, and the second is the one
+// that matters — a file without a link is a file nobody finds.
+func TestAttachFileFromSandbox(t *testing.T) {
+	f := newFakeOrg(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "evidence.png"), []byte("\x89PNG-evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := target.WithWorkdir(context.Background(), dir)
+
+	res, err := sys.Execute(ctx, "attach_file", json.RawMessage(`{"case_id":"`+caseA+`","path":"evidence.png"}`), f.cred())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.(AttachResult); got.Filename != "evidence.png" || got.FileID == "" {
+		t.Fatalf("attach result: %+v", got)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.uploaded) != 2 {
+		t.Fatalf("upload and link are two calls: %+v", f.uploaded)
+	}
+	if f.uploaded[0]["Title"] != "evidence.png" {
+		t.Fatalf("the version carries the name: %+v", f.uploaded[0])
+	}
+	if raw, _ := base64.StdEncoding.DecodeString(fmt.Sprint(f.uploaded[0]["VersionData"])); string(raw) != "\x89PNG-evidence" {
+		t.Fatalf("the content has to travel base64-encoded: %+v", f.uploaded[0]["VersionData"])
+	}
+	if f.uploaded[1]["LinkedEntityId"] != caseA || f.uploaded[1]["ShareType"] != "V" {
+		t.Fatalf("the link puts the file on the case, as a viewer: %+v", f.uploaded[1])
+	}
+}
+
+// TestAttachFileStaysInTheSandbox: the path comes from the model, and the
+// action reads a file with the daemon's rights.
+func TestAttachFileStaysInTheSandbox(t *testing.T) {
+	f := newFakeOrg(t)
+	dir := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), dir)
+
+	for _, p := range []string{"../../etc/passwd", "/etc/passwd", ""} {
+		_, err := sys.Execute(ctx, "attach_file", json.RawMessage(`{"case_id":"`+caseA+`","path":"`+p+`"}`), f.cred())
+		if err == nil {
+			t.Errorf("path %q must not be readable", p)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.uploaded) != 0 {
+		t.Fatalf("nothing may have been uploaded: %+v", f.uploaded)
+	}
+}
+
+func TestAttachFileHonoursTheSizeLimit(t *testing.T) {
+	t.Setenv("COVEY_SALESFORCE_ATTACHMENT_MAX_MB", "1")
+	f := newFakeOrg(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 2<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := target.WithWorkdir(context.Background(), dir)
+
+	_, err := sys.Execute(ctx, "attach_file", json.RawMessage(`{"case_id":"`+caseA+`","path":"big.bin"}`), f.cred())
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("a file over the limit must be refused, not uploaded: %v", err)
 	}
 }

@@ -124,6 +124,29 @@ func TestLiveLoginAndRead(t *testing.T) {
 		t.Errorf("search_cases (SOSL): %v", err)
 	}
 
+	// Attachments, across all five cases rather than only the first: an org
+	// that stores them the old way looks exactly like an org that has none
+	// until one turns up, and which of the two it is decides whether an agent
+	// can see what the customer sent.
+	var files, legacy int
+	for _, k := range cases {
+		listed, err := sys.Execute(ctx, "list_files", json.RawMessage(`{"case_id":"`+k.ID+`"}`), cred)
+		if err != nil {
+			t.Fatalf("list_files on %s: %v", k.ID, err)
+		}
+		for _, f := range listed.([]FileRef) {
+			if f.Kind == "attachment" {
+				legacy++
+			} else {
+				files++
+			}
+		}
+	}
+	t.Logf("attachments on those %d cases: %d as Files, %d as legacy Attachments", len(cases), files, legacy)
+	if files == 0 && legacy == 0 {
+		t.Log("none of them carries a file — try again with a case that has a screenshot on it")
+	}
+
 	waiting, sig, err := sys.HasWorkSigned(ctx, cred, "")
 	if err != nil {
 		t.Fatalf("the heartbeat pre-check: %v", err)

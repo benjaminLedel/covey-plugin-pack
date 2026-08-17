@@ -22,10 +22,11 @@ func init() {
 			"COVEY_SALESFORCE_INTAKE_QUEUES",
 			"COVEY_SALESFORCE_REPLY_CHANNEL",
 			"COVEY_SALESFORCE_ESCALATION_QUEUE",
+			"COVEY_SALESFORCE_ATTACHMENT_MAX_MB",
 		},
 		Name:        "salesforce",
 		Label:       "Salesforce Service Cloud",
-		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
+		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), look at the screenshot the customer attached (list_files/download_file + vision) and put its own evidence on the case (attach_file), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
 		Kind:        "builtin",
 		Category:    target.CategoryTicketing,
 		Scopes:      []string{"read", "write", "comment"},
@@ -81,6 +82,7 @@ func init() {
    COVEY_SALESFORCE_INTAKE_QUEUES="Support Tier 1"   (empty = every owner)
    COVEY_SALESFORCE_REPLY_CHANNEL=email              (default: comment)
    COVEY_SALESFORCE_ESCALATION_QUEUE="Support Tier 2"
+   COVEY_SALESFORCE_ATTACHMENT_MAX_MB=25             (per file, 1…1024)
 
 Details: docs/ops-salesforce.md in the repository.`,
 	})
@@ -121,6 +123,9 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		Status     string `json:"status"`
 		Note       string `json:"note"`
 		Query      string `json:"query"`
+		FileID     string `json:"file_id"`
+		Name       string `json:"name"`
+		Path       string `json:"path"`
 		Assigned   bool   `json:"assigned"`
 		Open       *bool  `json:"open"`
 		Limit      int    `json:"limit"`
@@ -169,6 +174,15 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 
 	case "escalate":
 		return escalate(ctx, c, in.CaseID, in.Note)
+
+	case "list_files":
+		return c.ListFiles(ctx, in.CaseID)
+
+	case "download_file":
+		return DownloadFileToSandbox(ctx, c, in.FileID, in.Name, target.Workdir(ctx))
+
+	case "attach_file":
+		return AttachFileFromSandbox(ctx, c, in.CaseID, in.Path, target.Workdir(ctx))
 
 	default:
 		return nil, fmt.Errorf("unknown action %q", strings.TrimSpace(action))
@@ -252,7 +266,11 @@ func (System) PromptDoc() string {
    list_messages {"case_id":"500…"} (the whole conversation: incoming and outgoing mail plus comments,
    oldest first), search_cases {"query":"…","limit":10} (how was this answered before?),
    reply {"case_id":"500…","body":"…","internal":true|false,"subject":"…","to":"…"},
-   set_status {"case_id":"500…","status":"Working"}, escalate {"case_id":"500…","note":"…"}.
+   set_status {"case_id":"500…","status":"Working"}, escalate {"case_id":"500…","note":"…"},
+   list_files {"case_id":"500…"}, download_file {"file_id":"068…","name":"screenshot.png"},
+   attach_file {"case_id":"500…","path":"screenshot.png"}.
+   A case with a screenshot is answered by LOOKING at it: list_files, then download_file, then read the
+   file at the returned path — do not guess from the text what the picture shows.
    reply with internal=true writes an internal note; internal=false answers the customer — depending on the
    instance as a portal-visible comment or as a mail (the result says which one it was).
    Correlation key for status blocked: salesforce:case:<case_id>.`

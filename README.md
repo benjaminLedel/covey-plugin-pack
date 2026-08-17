@@ -11,7 +11,7 @@ These used to live inside Covey's own repository, compiled in from `internal/`. 
 | | System | |
 |---|---|---|
 | `zammad/` | Zammad | helpdesk: read tickets, reply, set state, escalate; webhook intake |
-| `salesforce/` | Salesforce Service Cloud | support cases: read the case and its whole conversation, look up how the question was answered before, reply as a note, a portal comment or a mail, escalate. Heartbeat intake; a webhook where a flow posts one |
+| `salesforce/` | Salesforce Service Cloud | support cases: read the case and its whole conversation, look at the screenshot the customer attached, look up how the question was answered before, reply as a note, a portal comment or a mail, escalate. Heartbeat intake; a webhook where a flow posts one |
 | `gitlab/` · `github/` | GitLab, GitHub | issues and merge/pull requests as the working set: check out, fix, commit, open an MR/PR, live the review loop |
 | `email/` | IMAP/SMTP | a mail account of its own: sift the inbox, read attachments, reply |
 | `teams/` | Microsoft Teams | a chat channel through the Azure Bot Service |

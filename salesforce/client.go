@@ -104,6 +104,42 @@ func (c *Client) attempt(ctx context.Context, method, path string, body, out any
 	return nil
 }
 
+// stream is do's sibling for binary bodies: it hands the response body back
+// open instead of reading it in. An attachment can be tens of megabytes, and
+// the point of the size limit is not to hold them in memory first and count
+// afterwards. The caller closes the body.
+func (c *Client) stream(ctx context.Context, path string) (string, io.ReadCloser, error) {
+	contentType, body, err := c.attemptStream(ctx, path)
+	var apiErr *apiError
+	if ok := asAPIError(err, &apiErr); ok && apiErr.status == http.StatusUnauthorized && c.cfg.StaticToken == "" {
+		c.cfg.invalidate()
+		return c.attemptStream(ctx, path)
+	}
+	return contentType, body, err
+}
+
+func (c *Client) attemptStream(ctx context.Context, path string) (string, io.ReadCloser, error) {
+	token, instance, err := c.cfg.AccessToken(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, instance+path, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return "", nil, &apiError{status: resp.StatusCode, method: http.MethodGet, path: path, body: data}
+	}
+	return resp.Header.Get("Content-Type"), resp.Body, nil
+}
+
 // apiError carries the HTTP status alongside the message so that do can
 // recognise the one case worth retrying.
 type apiError struct {
