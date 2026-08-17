@@ -79,9 +79,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # check-latest, and this job is where it carries the weight: without it
+      # setup-go takes the version preinstalled on the runner image as soon as
+      # that one matches the "1.26" line — and it is a patch release behind
+      # after every Go release. govulncheck checks the standard library of the
+      # toolchain it builds with, so the run then fails at something that is
+      # not in the source at all (go1.26.5 → five findings, every one of them
+      # "Fixed in go1.26.6"). Covey's own pipeline ran into this first; the
+      # pack inherits the answer rather than the surprise.
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          check-latest: true
           cache: true
 
       # The same two tools Covey itself runs, and they matter more here, not
