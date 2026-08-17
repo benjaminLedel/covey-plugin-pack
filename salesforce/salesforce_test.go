@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,7 +38,10 @@ type fakeOrg struct {
 	created      []map[string]any
 	patched      map[string]map[string]any
 	emails       []map[string]any
-	failNextAuth bool // the next API call answers INVALID_SESSION_ID
+	lastBearer   string
+	soapRequest  string
+	soapFault    string // when set, the SOAP login answers with this fault
+	failNextAuth bool   // the next API call answers INVALID_SESSION_ID
 
 	cases    []map[string]any
 	messages []map[string]any
@@ -63,14 +67,35 @@ func (f *fakeOrg) cred() target.Credential {
 	}
 }
 
+// credUser is the same double, reached with a username and a password instead
+// of a connected app.
+func (f *fakeOrg) credUser() target.Credential {
+	return target.Credential{BaseURL: f.srv.URL, Token: "user:agent@acme.example:pw-and-token"}
+}
+
 func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if b, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+		f.lastBearer = b
+	}
 
 	switch {
 	case r.URL.Path == "/services/oauth2/token":
 		f.tokenCalls++
 		fmt.Fprintf(w, `{"access_token":"tok-%d","instance_url":%q,"token_type":"Bearer"}`, f.tokenCalls, f.srv.URL)
+		return
+	case strings.HasPrefix(r.URL.Path, "/services/Soap/u/"):
+		f.tokenCalls++
+		if f.soapFault != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><soapenv:Fault><faultcode>sf:INVALID_LOGIN</faultcode><faultstring>%s</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>`, f.soapFault)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		f.soapRequest = string(body)
+		fmt.Fprintf(w, `<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body><loginResponse><result><sessionId>demo-session-%d</sessionId><serverUrl>%s/services/Soap/u/60.0/00D8d0000008abcEAA</serverUrl></result></loginResponse></soapenv:Body></soapenv:Envelope>`, f.tokenCalls, f.srv.URL)
 		return
 	case r.URL.Path == "/services/oauth2/userinfo":
 		fmt.Fprint(w, `{"user_id":"0058d000001AbCdAAK","name":"Covey Bot","preferred_username":"bot@acme.com","email":"bot@acme.com"}`)
@@ -722,5 +747,111 @@ func TestProbeNamesTheRunAsUser(t *testing.T) {
 	}
 	if who != "Covey Bot (bot@acme.com)" {
 		t.Fatalf("the probe has to name the run-as user: %q", who)
+	}
+}
+
+// ------------------------------------------------------------------ login by password
+
+func TestParseConfigUsernamePassword(t *testing.T) {
+	cfg, err := ParseConfig("https://acme.my.salesforce.com", "user:agent@acme.example:secret:with:colons")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Username != "agent@acme.example" || cfg.Password != "secret:with:colons" {
+		t.Fatalf("only the first colon after the username separates: %+v", cfg)
+	}
+	if cfg.ClientID != "" || cfg.StaticToken != "" {
+		t.Fatalf("the password form must not look like the other two: %+v", cfg)
+	}
+
+	for _, bad := range []string{"user:", "user:only-a-name", "user::password", "user:name:"} {
+		if _, err := ParseConfig("https://acme.my.salesforce.com", bad); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
+// TestSoapLogin: a username and a password get a session, and that session is
+// what the REST calls then carry.
+func TestSoapLogin(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
+
+	who, err := sys.Probe(context.Background(), f.credUser())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if who != "Covey Demo Bot (bot@acme.com)" && who != "Covey Bot (bot@acme.com)" {
+		t.Fatalf("the probe has to name the user: %q", who)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !strings.Contains(f.soapRequest, "<urn:username>agent@acme.example</urn:username>") {
+		t.Fatalf("username missing from the envelope: %s", f.soapRequest)
+	}
+	if !strings.Contains(f.soapRequest, "pw-and-token") {
+		t.Fatalf("password missing from the envelope: %s", f.soapRequest)
+	}
+	if !strings.HasPrefix(f.lastBearer, "demo-session-") {
+		t.Fatalf("the REST call has to carry the session from the login: %q", f.lastBearer)
+	}
+	if f.tokenCalls != 1 {
+		t.Fatalf("the session is cached like any other: %d logins", f.tokenCalls)
+	}
+}
+
+// TestSoapLoginEscapesTheCredential: a password with XML metacharacters must
+// not break the envelope — it is exactly the kind of string that carries an
+// ampersand.
+func TestSoapLoginEscapesTheCredential(t *testing.T) {
+	f := newFakeOrg(t)
+	cred := target.Credential{BaseURL: f.srv.URL, Token: "user:a&b@acme.example:pw<with>&specials"}
+	if _, err := sys.Probe(context.Background(), cred); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if strings.Contains(f.soapRequest, "pw<with>") {
+		t.Fatalf("the password went into the XML unescaped: %s", f.soapRequest)
+	}
+	if !strings.Contains(f.soapRequest, "pw&lt;with&gt;&amp;specials") {
+		t.Fatalf("escaped wrongly: %s", f.soapRequest)
+	}
+}
+
+// TestSoapLoginFault: the reason Salesforce gives is passed on, with the hint
+// that resolves it in nearly every case.
+func TestSoapLoginFault(t *testing.T) {
+	f := newFakeOrg(t)
+	f.soapFault = "INVALID_LOGIN: Invalid username, password, security token; or user locked out."
+
+	_, err := sys.Probe(context.Background(), f.credUser())
+	if err == nil {
+		t.Fatal("a rejected login must surface")
+	}
+	if !strings.Contains(err.Error(), "INVALID_LOGIN") {
+		t.Fatalf("Salesforce's own words belong in the error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SECURITY TOKEN") {
+		t.Fatalf("the hint is the useful half of this error: %v", err)
+	}
+}
+
+// TestUsernameAndAppAreDifferentSessions: the same org reached two ways is two
+// identities — they must not share a cached session.
+func TestUsernameAndAppAreDifferentSessions(t *testing.T) {
+	f := newFakeOrg(t)
+	ctx := context.Background()
+	if _, err := sys.Probe(ctx, f.cred()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sys.Probe(ctx, f.credUser()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tokenCalls != 2 {
+		t.Fatalf("connected app and named user each log in for themselves: %d", f.tokenCalls)
 	}
 }

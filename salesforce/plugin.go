@@ -25,7 +25,7 @@ func init() {
 		},
 		Name:        "salesforce",
 		Label:       "Salesforce Service Cloud",
-		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow (secrets salesforce_url + salesforce_token).",
+		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
 		Kind:        "builtin",
 		Category:    target.CategoryTicketing,
 		Scopes:      []string{"read", "write", "comment"},
@@ -46,6 +46,16 @@ func init() {
    salesforce_token = consumer-key:consumer-secret
    (A sandbox: add login=https://test.salesforce.com after the URL. An org
     that needs a newer REST version: api=v64.0.)
+
+   Without a connected app — where nobody will create one for you — a user
+   name and a password work too:
+   salesforce_token = user:agent@acme.example:<password + security token>
+   The security token is appended to the password with no separator (Settings
+   → Reset My Security Token in Salesforce sends it by mail); without it, and
+   without the caller's IP in the org's trusted range, Salesforce answers
+   INVALID_LOGIN. Steps 1 and 2 then fall away — but so does the separation
+   between the agent and a person's account, and the password sits in the
+   secret store until somebody changes it. Prefer the connected app.
 
 4. Enable it in the agent's ACCESS.md:
    - system: salesforce scope: read,write,comment

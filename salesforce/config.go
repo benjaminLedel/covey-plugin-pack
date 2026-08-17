@@ -24,12 +24,27 @@ import (
 //	                   [api=v60.0]
 //	                   [login=https://test.salesforce.com]
 //	salesforce_token = consumer-key:consumer-secret
+//	                 | user:<username>:<password+security token>
+//	                 | <a ready-made access token>
 //
-// The consumer key/secret pair belongs to a connected app with the OAuth
-// client-credentials flow enabled and a run-as user — that user is the identity
-// every action carries in Salesforce, and its permissions are the plugin's
-// permissions. A salesforce_token WITHOUT a colon is used as a ready-made
-// access token (tests, demos, an externally refreshed session).
+// Three forms, because there are three honest ways into a Salesforce org and
+// which one you may use is somebody else's decision:
+//
+//   - **Connected app** (the pair). A connected app with the OAuth
+//     client-credentials flow and a run-as user — that user is the identity
+//     every action carries, and its permissions are the plugin's permissions.
+//     No password is stored anywhere. This is the one to use where you can.
+//   - **Username and password** (prefix "user:"). The classic SOAP login, which
+//     needs no connected app and therefore no admin to set one up. The password
+//     has the user's security token appended unless the caller's IP is in the
+//     org's trusted range. It costs what it saves: a long-lived password lives
+//     in the secret store, and Salesforce is steadily narrowing this path.
+//   - **A ready-made access token** (no colon). For tests and demos — it expires
+//     and nothing here renews it.
+//
+// The prefix decides, not a guess about what the value looks like: a consumer
+// key and a username are both opaque strings, and a login that silently tries
+// the wrong flow fails with an error about the wrong thing.
 //
 // login= only matters where the token endpoint is not the instance itself
 // (a sandbox reached through test.salesforce.com); api= pins the REST API
@@ -49,12 +64,17 @@ type Config struct {
 	LoginURL    string // base of the OAuth token endpoint (default: InstanceURL)
 	APIVersion  string // "v60.0"
 
-	// The client-credentials pair — empty when StaticToken is set.
+	// The client-credentials pair of a connected app.
 	ClientID     string
 	ClientSecret string
 
-	// StaticToken is a ready-made access token (tests/demos) — then the OAuth
-	// flow falls away entirely.
+	// The SOAP login pair. Password carries the security token appended, the
+	// way Salesforce expects it.
+	Username string
+	Password string
+
+	// StaticToken is a ready-made access token (tests/demos) — then the login
+	// falls away entirely.
 	StaticToken string
 }
 
@@ -93,16 +113,26 @@ func ParseConfig(baseURL, token string) (Config, error) {
 	if token == "" {
 		return Config{}, fmt.Errorf("salesforce_token missing")
 	}
-	// SplitN with 2, not 3: a consumer secret may contain a colon, the
+	if rest, ok := strings.CutPrefix(token, "user:"); ok {
+		// Cut at the FIRST colon: a Salesforce password may contain one, a
+		// username may not.
+		user, password, ok := strings.Cut(rest, ":")
+		if !ok || strings.TrimSpace(user) == "" || password == "" {
+			return Config{}, fmt.Errorf("salesforce_token must be %q", "user:<username>:<password+security token>")
+		}
+		cfg.Username, cfg.Password = strings.TrimSpace(user), password
+		return cfg, nil
+	}
+	// Cut at the first colon here too: a consumer secret may contain one, a
 	// consumer key may not.
 	if key, secret, ok := strings.Cut(token, ":"); ok {
 		if key == "" || secret == "" {
 			return Config{}, fmt.Errorf("salesforce_token must be %q", "consumer-key:consumer-secret")
 		}
 		cfg.ClientID, cfg.ClientSecret = key, secret
-	} else {
-		cfg.StaticToken = token
+		return cfg, nil
 	}
+	cfg.StaticToken = token
 	return cfg, nil
 }
 
@@ -134,10 +164,14 @@ type cachedToken struct {
 
 const tokenTTL = 10 * time.Minute
 
-func (cfg Config) cacheKey() string { return cfg.LoginURL + "|" + cfg.ClientID }
+// cacheKey keeps two credentials for the same org apart — the connected app and
+// a named user act as different identities and must not share a session.
+func (cfg Config) cacheKey() string {
+	return cfg.LoginURL + "|" + cfg.ClientID + "|" + cfg.Username
+}
 
-// AccessToken returns a valid access token: the static one, the cached one or
-// one freshly fetched through the client-credentials flow. The second return
+// AccessToken returns a valid access token: the static one, the cached one, or
+// a fresh one from whichever login the credential asks for. The second return
 // value is the instance URL Salesforce itself names for the session — an org
 // whose My Domain differs from the API host (a sandbox, an org that has been
 // migrated) is thereby addressed the way Salesforce asks for, not the way the
@@ -153,6 +187,33 @@ func (cfg Config) AccessToken(ctx context.Context) (string, string, error) {
 		return cached.token, cached.instance, nil
 	}
 
+	var (
+		token, instance string
+		ttl             time.Duration
+		err             error
+	)
+	if cfg.Username != "" {
+		token, instance, ttl, err = cfg.soapLogin(ctx)
+	} else {
+		token, instance, ttl, err = cfg.oauthToken(ctx)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if instance == "" {
+		instance = cfg.InstanceURL
+	}
+	if ttl <= 0 {
+		ttl = tokenTTL
+	}
+	tokenMu.Lock()
+	tokenCache[cfg.cacheKey()] = cachedToken{token: token, instance: instance, expires: time.Now().Add(ttl)}
+	tokenMu.Unlock()
+	return token, instance, nil
+}
+
+// oauthToken is the connected app's client-credentials flow.
+func (cfg Config) oauthToken(ctx context.Context) (string, string, time.Duration, error) {
 	form := url.Values{
 		"grant_type":    {"client_credentials"},
 		"client_id":     {cfg.ClientID},
@@ -160,20 +221,20 @@ func (cfg Config) AccessToken(ctx context.Context) (string, string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.LoginURL+"/services/oauth2/token", strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := target.Client("salesforce", 15*time.Second).Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("salesforce token: %w", err)
+		return "", "", 0, fmt.Errorf("salesforce token: %w", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("salesforce token: HTTP %d: %.300s", resp.StatusCode, data)
+		return "", "", 0, fmt.Errorf("salesforce token: HTTP %d: %.300s", resp.StatusCode, data)
 	}
 	var out struct {
 		AccessToken string `json:"access_token"`
@@ -181,20 +242,13 @@ func (cfg Config) AccessToken(ctx context.Context) (string, string, error) {
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil || out.AccessToken == "" {
-		return "", "", fmt.Errorf("salesforce token: unexpected response")
+		return "", "", 0, fmt.Errorf("salesforce token: unexpected response")
 	}
-	instance := strings.TrimRight(out.InstanceURL, "/")
-	if instance == "" {
-		instance = cfg.InstanceURL
-	}
-	ttl := tokenTTL
+	var ttl time.Duration
 	if out.ExpiresIn > 120 {
 		ttl = time.Duration(out.ExpiresIn)*time.Second - 2*time.Minute
 	}
-	tokenMu.Lock()
-	tokenCache[cfg.cacheKey()] = cachedToken{token: out.AccessToken, instance: instance, expires: time.Now().Add(ttl)}
-	tokenMu.Unlock()
-	return out.AccessToken, instance, nil
+	return out.AccessToken, strings.TrimRight(out.InstanceURL, "/"), ttl, nil
 }
 
 // invalidate discards the cached session — called when Salesforce answers
