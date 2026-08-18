@@ -7,6 +7,12 @@ module github.com/benjaminLedel/covey-plugin-pack
 
 go 1.26
 
+// The standard library this module is built against, not a version its
+// consumers need: govulncheck is a hard step in this repository's pipeline and
+// reports the stdlib of whatever toolchain built the code. 1.26.6 is the one
+// without GO-2026-5972 and the five findings beside it.
+toolchain go1.26.6
+
 require (
 	github.com/benjaminLedel/covey-plugin-sdk v0.2.0
 	github.com/chromedp/chromedp v0.16.0
