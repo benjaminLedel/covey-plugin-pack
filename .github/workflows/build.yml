@@ -53,7 +53,12 @@ jobs:
             echo '  "fmt"'
             echo '  "os"'
             echo '  "github.com/benjaminLedel/covey-plugin-sdk/target"'
-            for d in $(cd "$GITHUB_WORKSPACE" && go list ./... | grep -v '/manifests'); do
+            # Only importable packages, and the filter is on what a package IS
+            # rather than on where it sits: the wasm modules under wasm/ are
+            # package main — programs the catalogue ships, which register with
+            # nothing in this binary and cannot be imported at all. A path
+            # exclusion would have to be remembered for the next one.
+            for d in $(cd "$GITHUB_WORKSPACE" && go list -f '{{if ne .Name "main"}}{{.ImportPath}}{{end}}' ./... | grep -v '/manifests'); do
               echo "  _ \"$d\""
             done
             echo ')'
