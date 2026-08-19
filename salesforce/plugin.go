@@ -26,7 +26,7 @@ func init() {
 		},
 		Name:        "salesforce",
 		Label:       "Salesforce Service Cloud",
-		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), look at the screenshot the customer attached (list_files/download_file + vision) and put its own evidence on the case (attach_file), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
+		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), see which queues the org routes cases to (list_queues), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), look at the screenshot the customer attached (list_files/download_file + vision) and put its own evidence on the case (attach_file), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
 		Kind:        "builtin",
 		Category:    target.CategoryTicketing,
 		Scopes:      []string{"read", "write", "comment"},
@@ -78,7 +78,9 @@ func init() {
       check off, for local tests only). The payload and a ready-made Apex
       snippet are in docs/ops-salesforce.md.
 
-6. Optional process env:
+6. Optional process env. Both queue settings are configured by NAME, and the
+   names are what list_queues reports — run that action once instead of
+   copying them out of the Salesforce setup UI:
    COVEY_SALESFORCE_INTAKE_QUEUES="Support Tier 1"   (empty = every owner)
    COVEY_SALESFORCE_REPLY_CHANNEL=email              (default: comment)
    COVEY_SALESFORCE_ESCALATION_QUEUE="Support Tier 2"
@@ -175,6 +177,9 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 	case "escalate":
 		return escalate(ctx, c, in.CaseID, in.Note)
 
+	case "list_queues":
+		return c.ListQueues(ctx)
+
 	case "list_files":
 		return c.ListFiles(ctx, in.CaseID)
 
@@ -267,6 +272,7 @@ func (System) PromptDoc() string {
    oldest first), search_cases {"query":"…","limit":10} (how was this answered before?),
    reply {"case_id":"500…","body":"…","internal":true|false,"subject":"…","to":"…"},
    set_status {"case_id":"500…","status":"Working"}, escalate {"case_id":"500…","note":"…"},
+   list_queues {} (the case queues of the org by name — the name is what a case's owner shows),
    list_files {"case_id":"500…"}, download_file {"file_id":"068…","name":"screenshot.png"},
    attach_file {"case_id":"500…","path":"screenshot.png"}.
    A case with a screenshot is answered by LOOKING at it: list_files, then download_file, then read the

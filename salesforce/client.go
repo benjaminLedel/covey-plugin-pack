@@ -618,6 +618,73 @@ func (c *Client) QueueID(ctx context.Context, name string) (string, error) {
 	return rows[0].ID, nil
 }
 
+// queueRecord is a QueueSobject row — the join table saying which queues may
+// own which object. Cases are what this plugin is about, so that is the filter:
+// a queue for leads is no answer to "where do my cases sit".
+type queueRecord struct {
+	QueueID string `json:"QueueId"`
+	Queue   *struct {
+		Name          string `json:"Name"`
+		DeveloperName string `json:"DeveloperName"`
+		Email         string `json:"Email"`
+	} `json:"Queue"`
+}
+
+// Queue is the shape the agent sees. The NAME carries the weight: it is what a
+// case's owner shows, what COVEY_SALESFORCE_INTAKE_QUEUES compares against and
+// what the escalation target is configured as. The id comes along because an
+// agent that has one does not have to resolve the name a second time.
+type Queue struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	DeveloperName string `json:"developer_name,omitempty"`
+	Email         string `json:"email,omitempty"`
+	// InIntakeScope: does this queue get through the instance's intake
+	// allowlist? Without it the list answers "which queues exist" but not the
+	// question somebody actually has, which is "why do the cases from this one
+	// never reach me".
+	InIntakeScope bool `json:"in_intake_scope"`
+}
+
+// ListQueues names the case queues of the org. It exists because every
+// queue-shaped setting here is configured by NAME — the intake allowlist, the
+// escalation target — and a name that has to be typed exactly has to be
+// readable somewhere first. Until this action the only place was the Salesforce
+// setup UI, which is precisely where whoever operates the platform is not.
+//
+// The list is queue owners only. A case can be owned by a USER just as well,
+// and the intake allowlist compares both — so an empty result means "this org
+// routes cases to people", not "the filter is broken".
+func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
+	rows, err := queryRows[queueRecord](ctx, c,
+		"SELECT QueueId, Queue.Name, Queue.DeveloperName, Queue.Email FROM QueueSobject WHERE SobjectType = 'Case'")
+	if err != nil {
+		return nil, err
+	}
+	// A queue can carry several object types; QueueSobject then holds one row
+	// per type and the queue would appear twice.
+	seen := make(map[string]bool, len(rows))
+	out := make([]Queue, 0, len(rows))
+	for _, r := range rows {
+		if r.Queue == nil || r.Queue.Name == "" || seen[r.QueueID] {
+			continue
+		}
+		seen[r.QueueID] = true
+		out = append(out, Queue{
+			ID:            r.QueueID,
+			Name:          r.Queue.Name,
+			DeveloperName: r.Queue.DeveloperName,
+			Email:         r.Queue.Email,
+			InIntakeScope: inIntakeScope(r.Queue.Name),
+		})
+	}
+	// Sorted here rather than in SOQL: ORDER BY across the QueueSobject
+	// relationship is not something every org's query planner takes, and the
+	// list is short enough that it does not matter where it happens.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 // ---------------------------------------------------------------- identity
 
 // UserInfo is what /services/oauth2/userinfo reports about the run-as user.

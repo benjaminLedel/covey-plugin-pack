@@ -70,6 +70,26 @@ func TestLiveLoginAndRead(t *testing.T) {
 	}
 	t.Logf("connected as: %s", who)
 
+	// The queues before the cases: this is the one place in the live test where
+	// names ARE printed, and deliberately so. A queue name is configuration,
+	// not a customer's data — and it is configuration that has to be typed
+	// EXACTLY into COVEY_SALESFORCE_INTAKE_QUEUES and the escalation target.
+	// Reading it out of a screenshot of the Salesforce setup UI is how a
+	// trailing space gets into an allowlist and nobody finds it for a week.
+	queued, err := sys.Execute(ctx, "list_queues", json.RawMessage(`{}`), cred)
+	if err != nil {
+		t.Errorf("list_queues: %v", err)
+	} else {
+		queues := queued.([]Queue)
+		t.Logf("case queues: %d", len(queues))
+		for _, q := range queues {
+			t.Logf("  %-40q intake_scope=%v developer_name=%s", q.Name, q.InIntakeScope, q.DeveloperName)
+		}
+		if len(queues) == 0 {
+			t.Log("no case queue — this org routes cases to users, not queues; the intake allowlist then takes user names")
+		}
+	}
+
 	listed, err := sys.Execute(ctx, "list_cases", json.RawMessage(`{"limit":5}`), cred)
 	if err != nil {
 		t.Fatalf("list_cases: %v", err)

@@ -47,6 +47,7 @@ type fakeOrg struct {
 	failNextAuth bool   // the next API call answers INVALID_SESSION_ID
 
 	cases    []map[string]any
+	queues   []map[string]any // QueueSobject rows (queue join table)
 	messages []map[string]any
 	comments []map[string]any
 	links    []map[string]any // ContentDocumentLink
@@ -132,6 +133,8 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 			writeRecords(w, f.versions)
 		case strings.Contains(q, "FROM Attachment"):
 			writeRecords(w, f.legacy)
+		case strings.Contains(q, "FROM QueueSobject"):
+			writeRecords(w, f.queues)
 		case strings.Contains(q, "FROM Group"):
 			writeRecords(w, []map[string]any{{"Id": "00G8d000001QueueAA"}})
 		case strings.Contains(q, "FROM Case"):
@@ -537,6 +540,101 @@ func TestEscalateWithoutAQueueKeepsTheOwner(t *testing.T) {
 	defer f.mu.Unlock()
 	if _, ok := f.patched[caseA]["OwnerId"]; ok {
 		t.Fatalf("without a configured queue the owner stays: %+v", f.patched[caseA])
+	}
+}
+
+// queueRow builds a QueueSobject row the way Salesforce answers it: the queue
+// hangs off the join row as a nested relationship, not as flat columns.
+func queueRow(id, name, devName, email string) map[string]any {
+	return map[string]any{
+		"QueueId": id,
+		"Queue":   map[string]any{"Name": name, "DeveloperName": devName, "Email": email},
+	}
+}
+
+func TestListQueuesNamesTheCaseQueues(t *testing.T) {
+	f := newFakeOrg(t)
+	f.queues = []map[string]any{
+		queueRow("00G000000000002", "Support Tier 2", "Support_Tier_2", "tier2@acme.example"),
+		queueRow("00G000000000001", "Support Tier 1", "Support_Tier_1", ""),
+	}
+	list := exec(t, f, "list_queues", `{}`).([]Queue)
+	if len(list) != 2 {
+		t.Fatalf("both queues belong in the list: %+v", list)
+	}
+	// Sorted by name, not by the order the org happened to answer in.
+	if list[0].Name != "Support Tier 1" || list[1].Name != "Support Tier 2" {
+		t.Fatalf("the list is sorted by name: %+v", list)
+	}
+	if list[0].ID != "00G000000000001" || list[0].DeveloperName != "Support_Tier_1" {
+		t.Fatalf("id and developer name travel along: %+v", list[0])
+	}
+	if list[1].Email != "tier2@acme.example" {
+		t.Fatalf("the queue email travels along: %+v", list[1])
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !strings.Contains(f.queries[0], "SobjectType = 'Case'") {
+		t.Fatalf("only queues that may own cases: %s", f.queries[0])
+	}
+}
+
+// A queue that may own several object types comes back once per type. The
+// agent asked for queues, not for join rows.
+func TestListQueuesDeduplicates(t *testing.T) {
+	f := newFakeOrg(t)
+	f.queues = []map[string]any{
+		queueRow("00G000000000001", "Support Tier 1", "Support_Tier_1", ""),
+		queueRow("00G000000000001", "Support Tier 1", "Support_Tier_1", ""),
+	}
+	list := exec(t, f, "list_queues", `{}`).([]Queue)
+	if len(list) != 1 {
+		t.Fatalf("one queue, one entry: %+v", list)
+	}
+}
+
+// The point of the flag: the list answers not only "which queues exist" but
+// "which of them does this instance let through" — the question somebody
+// actually has when the cases from a queue never arrive.
+func TestListQueuesMarksTheIntakeScope(t *testing.T) {
+	t.Setenv("COVEY_SALESFORCE_INTAKE_QUEUES", "Support Tier 1")
+	f := newFakeOrg(t)
+	f.queues = []map[string]any{
+		queueRow("00G000000000001", "Support Tier 1", "Support_Tier_1", ""),
+		queueRow("00G000000000002", "Billing", "Billing", ""),
+	}
+	list := exec(t, f, "list_queues", `{}`).([]Queue)
+	if len(list) != 2 {
+		t.Fatalf("the allowlist narrows the intake, not the listing: %+v", list)
+	}
+	byName := map[string]Queue{}
+	for _, q := range list {
+		byName[q.Name] = q
+	}
+	if !byName["Support Tier 1"].InIntakeScope {
+		t.Fatal("a queue on the allowlist is in scope")
+	}
+	if byName["Billing"].InIntakeScope {
+		t.Fatal("a queue outside the allowlist is not in scope")
+	}
+}
+
+// Without a configured allowlist every owner passes — the flag must not read
+// as "nothing gets through" in the default setup.
+func TestListQueuesWithoutAnAllowlistIsAllInScope(t *testing.T) {
+	f := newFakeOrg(t)
+	f.queues = []map[string]any{queueRow("00G000000000002", "Billing", "Billing", "")}
+	list := exec(t, f, "list_queues", `{}`).([]Queue)
+	if len(list) != 1 || !list[0].InIntakeScope {
+		t.Fatalf("no allowlist means every queue is in scope: %+v", list)
+	}
+}
+
+// list_queues is a read. It must not land under the same guard-rail subject as
+// an answer that leaves the house.
+func TestListQueuesIsItsOwnSubject(t *testing.T) {
+	if got := sys.ActionSubject("list_queues", nil); got != "salesforce:list_queues" {
+		t.Fatalf("subject: %s", got)
 	}
 }
 
