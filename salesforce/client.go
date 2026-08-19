@@ -346,6 +346,12 @@ type ListOptions struct {
 	// AssignedOnly counts only the cases owned by the run-as user — for an
 	// agent that works its own queue rather than everything in the org.
 	AssignedOnly bool
+	// Queue narrows to the cases one queue owns, by the queue's NAME — the
+	// string list_queues reports and the one a person sees in Salesforce.
+	// Resolved to an id and filtered in SOQL rather than compared on
+	// Owner.Name: the owner is polymorphic, and an org that will not filter on
+	// the relationship name still filters on OwnerId.
+	Queue string
 	// Status filters on one status value ("New", "Working").
 	Status string
 	Limit  int
@@ -364,12 +370,36 @@ func (c *Client) ListCases(ctx context.Context, opt ListOptions) ([]Case, error)
 	if opt.Status != "" {
 		where = append(where, fmt.Sprintf("Status = '%s'", soqlEscape(opt.Status)))
 	}
+	// The queue comes from the call, or — when the call names none — from the
+	// credential (queue= in salesforce_url). That is what makes it the agent's
+	// queue: every list_cases of this agent, and with it the heartbeat
+	// pre-check that runs through here, sees only what that queue owns.
+	//
+	// assigned is the narrower, explicit request and therefore beats the
+	// configured default rather than colliding with it. Only a queue named IN
+	// THE CALL plus assigned is a contradiction — both narrow the owner, to
+	// different owners, and together they can only ever answer "nothing". An
+	// empty list would read as a quiet day instead of as a contradiction.
+	queue := strings.TrimSpace(opt.Queue)
+	if queue != "" && opt.AssignedOnly {
+		return nil, fmt.Errorf("assigned and queue exclude each other: the first means the cases of the run-as user, the second the cases of a queue")
+	}
+	if queue == "" && !opt.AssignedOnly {
+		queue = strings.TrimSpace(c.cfg.Queue)
+	}
 	if opt.AssignedOnly {
 		me, err := c.MeID(ctx)
 		if err != nil {
 			return nil, err
 		}
 		where = append(where, fmt.Sprintf("OwnerId = '%s'", soqlEscape(me)))
+	}
+	if queue != "" {
+		id, err := c.QueueID(ctx, queue)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, fmt.Sprintf("OwnerId = '%s'", soqlEscape(id)))
 	}
 	clause := ""
 	if len(where) > 0 {

@@ -48,6 +48,16 @@ func init() {
    (A sandbox: add login=https://test.salesforce.com after the URL. An org
     that needs a newer REST version: api=v64.0.)
 
+   THIS agent is only to look after ONE queue? Then name it in the URL:
+     salesforce_url = https://acme.my.salesforce.com queue="Support Tier 1"
+   The name is the one list_queues reports; the quotes matter, queue names
+   contain spaces. It then applies to every list_cases of this agent that
+   does not name a queue of its own, and to the heartbeat pre-check with it —
+   so the agent is not even woken by a case from another queue. Unlike
+   COVEY_SALESFORCE_INTAKE_QUEUES (step 6) this is per agent, not per
+   installation: which queue is mine is a property of the employee, not of
+   the machine they run on.
+
    Without a connected app — where nobody will create one for you — a user
    name and a password work too:
    salesforce_token = user:agent@acme.example:<password + security token>
@@ -125,6 +135,7 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		Status     string `json:"status"`
 		Note       string `json:"note"`
 		Query      string `json:"query"`
+		Queue      string `json:"queue"`
 		FileID     string `json:"file_id"`
 		Name       string `json:"name"`
 		Path       string `json:"path"`
@@ -149,6 +160,7 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		return c.ListCases(ctx, ListOptions{
 			OpenOnly:     in.Open == nil || *in.Open,
 			AssignedOnly: in.Assigned,
+			Queue:        in.Queue,
 			Status:       in.Status,
 			Limit:        in.Limit,
 		})
@@ -267,7 +279,9 @@ func escalate(ctx context.Context, c *Client, caseID, note string) (any, error) 
 
 func (System) PromptDoc() string {
 	return `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
-   {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20},
+   {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
+   (plus "queue":"Support Tier 1" for only what that queue owns — the name comes from list_queues;
+   queue and assigned exclude each other),
    list_messages {"case_id":"500…"} (the whole conversation: incoming and outgoing mail plus comments,
    oldest first), search_cases {"query":"…","limit":10} (how was this answered before?),
    reply {"case_id":"500…","body":"…","internal":true|false,"subject":"…","to":"…"},

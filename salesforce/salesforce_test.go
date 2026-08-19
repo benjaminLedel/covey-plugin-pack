@@ -48,6 +48,7 @@ type fakeOrg struct {
 
 	cases    []map[string]any
 	queues   []map[string]any // QueueSobject rows (queue join table)
+	noQueue  bool             // the queue lookup finds nothing
 	messages []map[string]any
 	comments []map[string]any
 	links    []map[string]any // ContentDocumentLink
@@ -136,6 +137,10 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 		case strings.Contains(q, "FROM QueueSobject"):
 			writeRecords(w, f.queues)
 		case strings.Contains(q, "FROM Group"):
+			if f.noQueue {
+				writeRecords(w, nil)
+				return
+			}
 			writeRecords(w, []map[string]any{{"Id": "00G8d000001QueueAA"}})
 		case strings.Contains(q, "FROM Case"):
 			writeRecords(w, f.matchingCases(q))
@@ -540,6 +545,170 @@ func TestEscalateWithoutAQueueKeepsTheOwner(t *testing.T) {
 	defer f.mu.Unlock()
 	if _, ok := f.patched[caseA]["OwnerId"]; ok {
 		t.Fatalf("without a configured queue the owner stays: %+v", f.patched[caseA])
+	}
+}
+
+// The queue filter resolves the NAME to an id and puts that into the WHERE
+// clause. Comparing on Owner.Name would be the obvious route and the wrong
+// one — the owner is polymorphic and not every org filters on it.
+func TestListCasesNarrowsToAQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
+	list := exec(t, f, "list_cases", `{"queue":"Digital Learning Support"}`).([]Case)
+	if len(list) != 1 {
+		t.Fatalf("the case of the queue belongs in the list: %+v", list)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var resolve, cases string
+	for _, q := range f.queries {
+		if strings.Contains(q, "FROM Group") {
+			resolve = q
+		}
+		// "FROM Case " with the space: FROM CaseComment must not match.
+		if strings.Contains(q, "FROM Case ") {
+			cases = q
+		}
+	}
+	if !strings.Contains(resolve, "Name = 'Digital Learning Support'") {
+		t.Fatalf("the name is resolved against Group: %s", resolve)
+	}
+	if !strings.Contains(cases, "OwnerId = '00G8d000001QueueAA'") {
+		t.Fatalf("the resolved id filters the cases: %s", cases)
+	}
+	// Owner.Name stays in the SELECT — it is the displayed owner. What must not
+	// contain it is the WHERE.
+	_, clause, _ := strings.Cut(cases, " WHERE ")
+	if strings.Contains(clause, "Owner.Name") {
+		t.Fatalf("the polymorphic relationship name must not be a filter: %s", clause)
+	}
+}
+
+// A queue nobody can find is an error, not an empty list — an empty list reads
+// as "a quiet day" and hides the typo in the config for a week.
+func TestListCasesUnknownQueueIsAnError(t *testing.T) {
+	f := newFakeOrg(t)
+	f.noQueue = true
+	if _, err := sys.Execute(context.Background(), "list_cases",
+		json.RawMessage(`{"queue":"Tippfehler"}`), f.cred()); err == nil {
+		t.Fatal("an unknown queue must not pass as an empty result")
+	}
+}
+
+// assigned and queue narrow the same field to different owners. Together they
+// can only answer "nothing", so the contradiction is named rather than served.
+func TestListCasesQueueAndAssignedExcludeEachOther(t *testing.T) {
+	f := newFakeOrg(t)
+	_, err := sys.Execute(context.Background(), "list_cases",
+		json.RawMessage(`{"queue":"Digital Learning Support","assigned":true}`), f.cred())
+	if err == nil {
+		t.Fatal("queue plus assigned must not silently return nothing")
+	}
+	if !strings.Contains(err.Error(), "exclude each other") {
+		t.Fatalf("the error should say why: %v", err)
+	}
+}
+
+// credQueue is the double reached with a queue configured in salesforce_url —
+// the agent's own queue, brokered rather than set on the machine.
+func (f *fakeOrg) credQueue(queue string) target.Credential {
+	return target.Credential{
+		BaseURL: f.srv.URL + ` queue="` + queue + `"`,
+		Token:   "key-" + f.t.Name() + ":secret",
+	}
+}
+
+func TestParseConfigReadsTheQueue(t *testing.T) {
+	cfg, err := ParseConfig(`https://acme.my.salesforce.com queue="Digital Learning Support" api=v64.0`, "key:secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Queue != "Digital Learning Support" {
+		t.Fatalf("a quoted queue name keeps its spaces: %q", cfg.Queue)
+	}
+	if cfg.APIVersion != "v64.0" || cfg.InstanceURL != "https://acme.my.salesforce.com" {
+		t.Fatalf("the other components survive beside it: %+v", cfg)
+	}
+}
+
+// Without the quotes the name falls apart into components, and the second word
+// is not a component anybody declared. Better an error at the credential than a
+// queue silently named "Digital".
+func TestParseConfigRejectsAnUnquotedQueueWithSpaces(t *testing.T) {
+	if _, err := ParseConfig("https://acme.my.salesforce.com queue=Digital Learning Support", "key:secret"); err == nil {
+		t.Fatal("an unquoted queue name with spaces must not pass quietly")
+	}
+}
+
+// The configured queue is the agent's default: a plain list_cases sees only
+// what that queue owns, without the agent having to know it.
+func TestListCasesFallsBackToTheConfiguredQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{}`),
+		f.credQueue("Digital Learning Support")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cases string
+	for _, q := range f.queries {
+		// "FROM Case " with the space: FROM CaseComment must not match.
+		if strings.Contains(q, "FROM Case ") {
+			cases = q
+		}
+	}
+	if !strings.Contains(cases, "OwnerId = '00G8d000001QueueAA'") {
+		t.Fatalf("the configured queue narrows a plain list_cases: %s", cases)
+	}
+}
+
+// assigned is the narrower, explicit request — it beats the configured default
+// instead of colliding with it, so a nur-wenn: salesforce:assigned heartbeat
+// keeps working on an agent that has a queue configured.
+func TestAssignedBeatsTheConfiguredQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"assigned":true}`),
+		f.credQueue("Digital Learning Support")); err != nil {
+		t.Fatalf("assigned must not collide with the configured queue: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cases string
+	for _, q := range f.queries {
+		// "FROM Case " with the space: FROM CaseComment must not match.
+		if strings.Contains(q, "FROM Case ") {
+			cases = q
+		}
+	}
+	if !strings.Contains(cases, "OwnerId = '0058d000001AbCdAAK'") {
+		t.Fatalf("assigned filters on the run-as user: %s", cases)
+	}
+	if strings.Contains(cases, "00G8d000001QueueAA") {
+		t.Fatalf("and not additionally on the queue: %s", cases)
+	}
+}
+
+// The heartbeat pre-check runs through the same ListCases, so it inherits the
+// queue — otherwise the agent would be woken by cases it may not even see.
+func TestHasWorkInheritsTheConfiguredQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
+	if _, err := sys.HasWork(context.Background(), f.credQueue("Digital Learning Support")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cases string
+	for _, q := range f.queries {
+		// "FROM Case " with the space: FROM CaseComment must not match.
+		if strings.Contains(q, "FROM Case ") {
+			cases = q
+		}
+	}
+	if !strings.Contains(cases, "OwnerId = '00G8d000001QueueAA'") {
+		t.Fatalf("the pre-check sees only the agent's queue: %s", cases)
 	}
 }
 

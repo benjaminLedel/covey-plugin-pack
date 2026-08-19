@@ -23,6 +23,7 @@ import (
 //	salesforce_url   = https://acme.my.salesforce.com
 //	                   [api=v60.0]
 //	                   [login=https://test.salesforce.com]
+//	                   [queue="Support Tier 1"]
 //	salesforce_token = consumer-key:consumer-secret
 //	                 | user:<username>:<password+security token>
 //	                 | <a ready-made access token>
@@ -63,6 +64,13 @@ type Config struct {
 	InstanceURL string // https://acme.my.salesforce.com — without a trailing slash
 	LoginURL    string // base of the OAuth token endpoint (default: InstanceURL)
 	APIVersion  string // "v60.0"
+	// Queue is the default case queue of THIS agent: every list_cases without
+	// its own queue, and with it the heartbeat pre-check, sees only what this
+	// queue owns. It sits in the credential rather than in the process
+	// environment on purpose — COVEY_SALESFORCE_INTAKE_QUEUES narrows a whole
+	// installation, and "which queue is mine" is a property of the employee,
+	// not of the machine they run on.
+	Queue string
 
 	// The client-credentials pair of a connected app.
 	ClientID     string
@@ -78,20 +86,51 @@ type Config struct {
 	StaticToken string
 }
 
+// splitComponents cuts salesforce_url into its space-separated components —
+// strings.Fields, except that a double-quoted run stays together. Queue names
+// contain spaces ("Digital Learning Support"), and a setting that cannot hold
+// the value people actually have is a setting nobody uses.
+func splitComponents(s string) []string {
+	var out []string
+	var cur strings.Builder
+	quoted := false
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range s {
+		switch {
+		case r == '"':
+			quoted = !quoted
+			cur.WriteRune(r)
+		case !quoted && (r == ' ' || r == '\t' || r == '\n' || r == '\r'):
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return out
+}
+
 // ParseConfig breaks the brokered credential down into the connection
 // configuration.
 func ParseConfig(baseURL, token string) (Config, error) {
 	cfg := Config{APIVersion: apiVersionFromEnv()}
-	for _, part := range strings.Fields(baseURL) {
+	for _, part := range splitComponents(baseURL) {
 		switch {
 		case strings.HasPrefix(part, "api="):
 			cfg.APIVersion = strings.TrimPrefix(part, "api=")
 		case strings.HasPrefix(part, "login="):
 			cfg.LoginURL = strings.TrimRight(strings.TrimPrefix(part, "login="), "/")
+		case strings.HasPrefix(part, "queue="):
+			cfg.Queue = strings.TrimSpace(strings.Trim(strings.TrimPrefix(part, "queue="), `"`))
 		case cfg.InstanceURL == "":
 			cfg.InstanceURL = strings.TrimRight(part, "/")
 		default:
-			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…])", part)
+			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…] [queue=\"…\"])", part)
 		}
 	}
 	if cfg.InstanceURL == "" {
