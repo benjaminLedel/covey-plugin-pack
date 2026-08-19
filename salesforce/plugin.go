@@ -51,12 +51,16 @@ func init() {
    THIS agent is only to look after ONE queue? Then name it in the URL:
      salesforce_url = https://acme.my.salesforce.com queue="Support Tier 1"
    The name is the one list_queues reports; the quotes matter, queue names
-   contain spaces. It then applies to every list_cases of this agent that
-   does not name a queue of its own, and to the heartbeat pre-check with it —
-   so the agent is not even woken by a case from another queue. Unlike
-   COVEY_SALESFORCE_INTAKE_QUEUES (step 6) this is per agent, not per
-   installation: which queue is mine is a property of the employee, not of
-   the machine they run on.
+   contain spaces.
+
+   This is a BOUNDARY, not a default. The agent sees that queue's cases and
+   no others — including through get_case by the number a customer quotes,
+   through search_cases, and through everything that writes: an action on a
+   case owned by somebody else fails, it does not quietly succeed. The
+   heartbeat pre-check inherits it too, so the agent is not even woken by a
+   case from another queue. Unlike COVEY_SALESFORCE_INTAKE_QUEUES (step 6)
+   this is per agent, not per installation: which queue is mine is a property
+   of the employee, not of the machine they run on.
 
    Without a connected app — where nobody will create one for you — a user
    name and a password work too:
@@ -149,8 +153,26 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		}
 	}
 
+	// The wall around a pinned queue, in ONE place: every action below that
+	// addresses a case does so by id or by number, and both are things an agent
+	// can be handed. Checking each call site would mean remembering to check
+	// the next one too.
+	var guarded *Case
+	if q := strings.TrimSpace(c.cfg.Queue); q != "" && (in.CaseID != "" || in.CaseNumber != "") {
+		k, err := c.CaseInQueue(ctx, in.CaseID, in.CaseNumber, q)
+		if err != nil {
+			return nil, err
+		}
+		guarded = &k
+	}
+
 	switch action {
 	case "get_case":
+		// Already read by the wall — reading it a second time would make the
+		// safety cost an API call for nothing.
+		if guarded != nil {
+			return *guarded, nil
+		}
 		if in.CaseID == "" && in.CaseNumber != "" {
 			return c.GetCaseByNumber(ctx, in.CaseNumber)
 		}
@@ -281,7 +303,8 @@ func (System) PromptDoc() string {
 	return `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
    {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
    (plus "queue":"Support Tier 1" for only what that queue owns — the name comes from list_queues;
-   queue and assigned exclude each other),
+   queue and assigned exclude each other. Is your credential pinned to a queue, that queue is a
+   CEILING: you see and touch its cases and no others, and naming a different one is an error),
    list_messages {"case_id":"500…"} (the whole conversation: incoming and outgoing mail plus comments,
    oldest first), search_cases {"query":"…","limit":10} (how was this answered before?),
    reply {"case_id":"500…","body":"…","internal":true|false,"subject":"…","to":"…"},

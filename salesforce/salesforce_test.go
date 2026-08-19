@@ -663,30 +663,108 @@ func TestListCasesFallsBackToTheConfiguredQueue(t *testing.T) {
 	}
 }
 
-// assigned is the narrower, explicit request — it beats the configured default
-// instead of colliding with it, so a nur-wenn: salesforce:assigned heartbeat
-// keeps working on an agent that has a queue configured.
-func TestAssignedBeatsTheConfiguredQueue(t *testing.T) {
+// Unter einer gepinnten Queue kann assigned nicht mehr gelten: die Cases
+// gehoeren der Queue, nicht dem Benutzer. Frueher schlug assigned die Vorgabe —
+// seit die Queue eine Decke ist, waere das ein Ausbruch nach oben.
+func TestAssignedFailsUnderAPinnedQueue(t *testing.T) {
 	f := newFakeOrg(t)
-	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
-	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"assigned":true}`),
-		f.credQueue("Digital Learning Support")); err != nil {
-		t.Fatalf("assigned must not collide with the configured queue: %v", err)
+	_, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"assigned":true}`),
+		f.credQueue("Digital Learning Support"))
+	if err == nil {
+		t.Fatal("assigned unter gepinnter Queue muss scheitern, nicht leer zurueckkommen")
+	}
+	if !strings.Contains(err.Error(), "pinned queue") {
+		t.Fatalf("der Fehler soll den Grund nennen: %v", err)
+	}
+}
+
+// Eine andere Queue zu nennen ist keine engere, sondern eine weitere Bitte.
+func TestForeignQueueIsOutOfReach(t *testing.T) {
+	f := newFakeOrg(t)
+	_, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"queue":"Sdui Support DACH"}`),
+		f.credQueue("Digital Learning Support"))
+	if err == nil {
+		t.Fatal("eine fremde Queue darf nicht erreichbar sein")
+	}
+	if !strings.Contains(err.Error(), "out of its reach") {
+		t.Fatalf("der Fehler soll die Decke benennen: %v", err)
+	}
+}
+
+// Der Kern des Umbaus: die Nummer, die ein Kunde nennt, ist kein Schluessel
+// mehr. Ohne diese Pruefung waere die Queue nur eine Sichtfilterung.
+func TestForeignCaseIsOutOfReachByNumber(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseB, "00001027", "Sdui Support DACH", "2026-08-17T09:00:00.000+0000")}
+	_, err := sys.Execute(context.Background(), "get_case", json.RawMessage(`{"case_number":"00001027"}`),
+		f.credQueue("Digital Learning Support"))
+	if err == nil {
+		t.Fatal("ein fremder Case darf auch ueber seine Nummer nicht lesbar sein")
+	}
+	if !strings.Contains(err.Error(), "Sdui Support DACH") {
+		t.Fatalf("der Fehler soll sagen, wem er gehoert: %v", err)
+	}
+}
+
+// Und dasselbe fuer alles, was schreibt.
+func TestWritingToAForeignCaseIsBlocked(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseB, "00001027", "Sdui Support DACH", "2026-08-17T09:00:00.000+0000")}
+	_, err := sys.Execute(context.Background(), "reply",
+		json.RawMessage(`{"case_id":"`+caseB+`","internal":true,"body":"Notiz"}`),
+		f.credQueue("Digital Learning Support"))
+	if err == nil {
+		t.Fatal("eine interne Notiz an einem fremden Case muss scheitern")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var cases string
+	if len(f.created) != 0 {
+		t.Fatalf("und zwar BEVOR etwas geschrieben wird: %+v", f.created)
+	}
+}
+
+// Der eigene Case geht durch — und wird dabei nur EINMAL gelesen. Die Wache
+// darf keine zweite Abfrage kosten.
+func TestOwnCasePassesAndIsReadOnce(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000")}
+	res, err := sys.Execute(context.Background(), "get_case", json.RawMessage(`{"case_id":"`+caseA+`"}`),
+		f.credQueue("Digital Learning Support"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.(Case).Number != "00001026" {
+		t.Fatalf("der eigene Case kommt zurueck: %+v", res)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int
 	for _, q := range f.queries {
-		// "FROM Case " with the space: FROM CaseComment must not match.
 		if strings.Contains(q, "FROM Case ") {
-			cases = q
+			n++
 		}
 	}
-	if !strings.Contains(cases, "OwnerId = '0058d000001AbCdAAK'") {
-		t.Fatalf("assigned filters on the run-as user: %s", cases)
+	if n != 1 {
+		t.Fatalf("die Wache darf den Case nicht ein zweites Mal lesen: %d Abfragen", n)
 	}
-	if strings.Contains(cases, "00G8d000001QueueAA") {
-		t.Fatalf("and not additionally on the queue: %s", cases)
+}
+
+// search_cases ist die einzige Aktion ohne WHERE — ohne diese Filterung waere
+// sie das Loch in der Wand.
+func TestSearchIsNarrowedToThePinnedQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{
+		openCase(caseA, "00001026", "Digital Learning Support", "2026-08-17T08:00:00.000+0000"),
+		openCase(caseB, "00001027", "Sdui Support DACH", "2026-08-17T09:00:00.000+0000"),
+	}
+	res, err := sys.Execute(context.Background(), "search_cases", json.RawMessage(`{"query":"Login"}`),
+		f.credQueue("Digital Learning Support"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := res.([]Case)
+	if len(list) != 1 || list[0].ID != caseA {
+		t.Fatalf("die Suche darf nicht ueber die Queue hinausreichen: %+v", list)
 	}
 }
 

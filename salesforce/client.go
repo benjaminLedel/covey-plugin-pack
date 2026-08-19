@@ -381,11 +381,26 @@ func (c *Client) ListCases(ctx context.Context, opt ListOptions) ([]Case, error)
 	// different owners, and together they can only ever answer "nothing". An
 	// empty list would read as a quiet day instead of as a contradiction.
 	queue := strings.TrimSpace(opt.Queue)
+	pinned := strings.TrimSpace(c.cfg.Queue)
+	if pinned != "" {
+		// A pinned queue is a CEILING, not a suggestion. Naming another one is
+		// not a narrower request but a wider one, and the whole point of
+		// putting the queue in the credential is that the agent cannot widen
+		// its own reach.
+		if queue != "" && !strings.EqualFold(queue, pinned) {
+			return nil, fmt.Errorf("this credential is pinned to the queue %q; %q is out of its reach", pinned, queue)
+		}
+		// assigned means "owned by the run-as user" — and a case owned by the
+		// queue is not owned by a user. Under a pinned queue the two can never
+		// both hold, so say so instead of returning an empty list that reads
+		// like a quiet day.
+		if opt.AssignedOnly {
+			return nil, fmt.Errorf("assigned does not work under a pinned queue: the cases of queue %q are owned by the queue, not by the run-as user", pinned)
+		}
+		queue = pinned
+	}
 	if queue != "" && opt.AssignedOnly {
 		return nil, fmt.Errorf("assigned and queue exclude each other: the first means the cases of the run-as user, the second the cases of a queue")
-	}
-	if queue == "" && !opt.AssignedOnly {
-		queue = strings.TrimSpace(c.cfg.Queue)
 	}
 	if opt.AssignedOnly {
 		me, err := c.MeID(ctx)
@@ -460,9 +475,18 @@ func (c *Client) SearchCases(ctx context.Context, term string, limit int) ([]Cas
 	if err := c.do(ctx, http.MethodGet, c.api("/search/?q="+url.QueryEscape(sosl)), nil, &res); err != nil {
 		return nil, err
 	}
+	// A search reaches across the whole org by design. Under a pinned queue it
+	// must not — otherwise the one action without a WHERE clause would be the
+	// hole in the wall. SOSL cannot filter on the polymorphic owner, so the
+	// narrowing happens here.
+	pinned := strings.TrimSpace(c.cfg.Queue)
 	out := make([]Case, 0, len(res.SearchRecords))
 	for _, r := range res.SearchRecords {
-		out = append(out, c.normalize(r))
+		k := c.normalize(r)
+		if pinned != "" && !strings.EqualFold(strings.TrimSpace(k.Owner), pinned) {
+			continue
+		}
+		out = append(out, k)
 	}
 	return out, nil
 }
@@ -713,6 +737,36 @@ func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
 	// list is short enough that it does not matter where it happens.
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// CaseInQueue is the wall around a pinned queue. Narrowing list_cases alone
+// would only hide cases, not put them out of reach: every other action
+// addresses a case by id or by the number a customer quotes, and a number is
+// something an agent can simply be told. So the case is fetched once and its
+// owner checked before anything happens to it.
+//
+// The case comes back so that the caller does not read it twice — for get_case
+// the check IS the read.
+func (c *Client) CaseInQueue(ctx context.Context, caseID, caseNumber, queue string) (Case, error) {
+	var (
+		k   Case
+		err error
+	)
+	if strings.TrimSpace(caseID) != "" {
+		k, err = c.GetCase(ctx, caseID)
+	} else {
+		k, err = c.GetCaseByNumber(ctx, caseNumber)
+	}
+	if err != nil {
+		return Case{}, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(k.Owner), strings.TrimSpace(queue)) {
+		// The owner is named rather than hidden: whoever hits this wall is
+		// usually an agent that was given the wrong case number, and "belongs
+		// to somebody else" without saying whom costs a second round.
+		return Case{}, fmt.Errorf("case %s belongs to %q — this credential reaches only the queue %q", k.Number, k.Owner, queue)
+	}
+	return k, nil
 }
 
 // ---------------------------------------------------------------- identity
