@@ -84,6 +84,8 @@ func init() {
         Events: Comment created, Issue created, Issue updated
         JQL:    project = ACME AND assignee = covey-bot
         Secret: a random string — Jira signs the body with it (X-Hub-Signature)
+      The same value goes into COVEY_JIRA_WEBHOOK_SECRET on the control plane
+      (process env; empty = check off, for local tests only).
       The JQL filter is the sharp instrument here: it decides which issues
       reach the agent at all, and it does so in Jira, where the person who
       owns the board can see it.
