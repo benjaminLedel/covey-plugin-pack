@@ -13,6 +13,7 @@ These used to live inside Covey's own repository, compiled in from `internal/`. 
 | `zammad/` | Zammad | helpdesk: read tickets, reply, set state, escalate; webhook intake |
 | `salesforce/` | Salesforce Service Cloud | support cases: read the case and its whole conversation, look at the screenshot the customer attached, look up how the question was answered before, reply as a note, a portal comment or a mail, escalate. Heartbeat intake; a webhook where a flow posts one |
 | `gitlab/` · `github/` | GitLab, GitHub | issues and merge/pull requests as the working set: check out, fix, commit, open an MR/PR, live the review loop |
+| `jira/` | Jira (Cloud and Server/Data Center) | the ticket half of a developer's day: find work by JQL, read an issue with its thread and its screenshots, take it on, move it through its workflow, comment, keep the board honest (labels, story points, worklog, sub-tasks) — the code stays in GitLab/GitHub, the issue key ties the two together |
 | `email/` | IMAP/SMTP | a mail account of its own: sift the inbox, read attachments, reply |
 | `teams/` | Microsoft Teams | a chat channel through the Azure Bot Service |
 | `sharepoint/` · `nextcloud/` | SharePoint, Nextcloud | document libraries: list, read, write, delete |
@@ -30,7 +31,7 @@ The default Covey build already includes the compiled ones. To build a Covey wit
 ```go
 import (
     _ "github.com/benjaminLedel/covey-plugin-pack/zammad"
-    _ "github.com/example/covey-plugin-jira"   // somebody else's, on equal terms
+    _ "github.com/example/covey-plugin-servicenow"   // somebody else's, on equal terms
 )
 ```
 
