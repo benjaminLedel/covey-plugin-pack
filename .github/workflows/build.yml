@@ -105,8 +105,16 @@ jobs:
       # govulncheck reports only what the code actually CALLS — almost no false
       # positives, so it is a hard step. Pinned on purpose: a tool fetched fresh
       # from the network on every run is itself a way in.
+      #
+      # The pin has to move with the toolchain, though, and that is the second
+      # half of the same arrangement as above: govulncheck builds the SSA of
+      # the code it scans, with the x/tools its own release pins. A version
+      # from before the current Go meets syntax that library does not know and
+      # does not report a finding — it panics ("unexpected expr"), which reads
+      # like a broken build and is none. So: the newest release, bumped when
+      # Go moves, never "@latest".
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
       # gosec complements it: the one knows published holes in DEPENDENCIES, the
       # other looks for patterns in our OWN code. With an explicit rule list
