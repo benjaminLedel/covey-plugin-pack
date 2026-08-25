@@ -154,11 +154,15 @@ func renderBlock(n adfNode, indent string) string {
 		// The picture itself is not in the document — the document points at an
 		// attachment. Naming it is what lets the agent go and fetch it with
 		// download_attachment instead of wondering what was in the gap.
-		name := n.attr("alt")
-		if name == "" {
-			name = n.attr("id")
+		//
+		// Without an alt text there is only the media id, and that is NOT the
+		// attachment id download_attachment wants — a screenshot pasted into a
+		// comment carries one and no file name. Printing it would invite a call
+		// that cannot work, so the pointer goes to list_attachments instead.
+		if name := n.attr("alt"); name != "" {
+			return indent + "[attachment: " + name + "]\n\n"
 		}
-		return indent + "[attachment: " + name + "]\n\n"
+		return indent + "[attachment — list_attachments names the files on this issue]\n\n"
 	case "text":
 		return indent + renderInline([]adfNode{n}) + "\n\n"
 	default:

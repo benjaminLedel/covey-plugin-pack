@@ -146,7 +146,7 @@ func (p WebhookPayload) DedupKey() string {
 	case p.Comment != nil && p.Comment.ID != "":
 		// A comment that is edited gets a second event with the same id — the
 		// updated timestamp is what tells the two apart.
-		return base + "comment:" + p.Comment.ID + ":" + p.Comment.Updated
+		return base + "comment:" + string(p.Comment.ID) + ":" + p.Comment.Updated
 	case p.Changelog != nil && p.Changelog.ID != "":
 		return base + "change:" + p.Changelog.ID
 	default:
