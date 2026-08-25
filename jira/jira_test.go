@@ -130,6 +130,22 @@ func TestFlattenReadsBothStorageFormats(t *testing.T) {
 	}
 }
 
+// A screenshot pasted into a comment carries no file name — only a media id,
+// and that id is not what download_attachment takes. Printing it would send the
+// agent after a call that cannot work.
+func TestFlattenPointsAtListAttachmentsWhenTheImageHasNoName(t *testing.T) {
+	doc := `{"type":"doc","content":[
+	  {"type":"mediaSingle","content":[{"type":"media","attrs":{"type":"file","id":"601321af-eee7-43f9-b419-2ded46a94ab0"}}]}
+	]}`
+	got := Flatten(json.RawMessage(doc))
+	if !strings.Contains(got, "list_attachments") {
+		t.Errorf("rendered text should point at list_attachments:\n%s", got)
+	}
+	if strings.Contains(got, "601321af") {
+		t.Errorf("the media id is not an attachment id and must not look like one:\n%s", got)
+	}
+}
+
 func TestFlattenKeepsTheSentenceOfAnUnknownNode(t *testing.T) {
 	// Atlassian adds node types. A plugin from last year should lose the
 	// formatting, not the sentence.
