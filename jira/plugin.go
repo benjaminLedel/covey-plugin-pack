@@ -293,7 +293,9 @@ const docWrite = `   transition {"issue_key":"ACME-17","to":"In Progress","comme
    name of the transition OR of the target status; comment and resolution are optional (a workflow that
    demands a resolution says so). NEVER guess a status name: list_transitions says what is possible here
    and now, and a status in Jira is not set, it is reached.
-   assign {"issue_key":"ACME-17","assignee":"me"} ("" clears it),
+   assign {"issue_key":"ACME-17","assignee":"me"} ("" clears it) — "me" is you, otherwise write the
+   person the way the ticket names them ("Dana Fischer", a mail address, a login): the name is looked up
+   on the site, and an ambiguous one comes back with the candidates instead of a guess,
    update_issue {"issue_key":"ACME-17","fields":{"priority":"High","Story Points":3},"add_labels":["backend"],"remove_labels":[]}
    — fields are named the way they are named on the screen; a custom field is resolved by its name, so
    "Story Points" works without anybody knowing its number. Labels are added and removed, never replaced.

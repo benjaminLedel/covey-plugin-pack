@@ -202,6 +202,31 @@ type User struct {
 	Email       string `json:"email,omitempty"`
 }
 
+// flexString reads a field that Jira documents as a string and sometimes sends
+// as a number. Ids are the place it happens: the same attachment arrives as
+// "id":"10412" through one endpoint and as "id":10412 through another, and a
+// plugin that insists on the documented shape does not fail at the id — it
+// fails at the whole response, so list_attachments dies on a screenshot the
+// agent was supposed to look at. Read both, keep the string.
+type flexString string
+
+func (s *flexString) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	switch {
+	case len(data) == 0 || string(data) == "null":
+		*s = ""
+	case data[0] == '"':
+		var str string
+		if err := json.Unmarshal(data, &str); err != nil {
+			return err
+		}
+		*s = flexString(str)
+	default:
+		*s = flexString(data)
+	}
+	return nil
+}
+
 type rawUser struct {
 	AccountID    string `json:"accountId"`
 	Name         string `json:"name"`
@@ -515,7 +540,7 @@ type Comment struct {
 }
 
 type rawComment struct {
-	ID         string          `json:"id"`
+	ID         flexString      `json:"id"`
 	Author     *rawUser        `json:"author"`
 	Body       json.RawMessage `json:"body"`
 	Created    string          `json:"created"`
@@ -529,7 +554,7 @@ type rawComment struct {
 
 func (r rawComment) comment() Comment {
 	out := Comment{
-		ID:      r.ID,
+		ID:      string(r.ID),
 		Author:  r.Author.label(),
 		Body:    Flatten(r.Body),
 		Created: r.Created,
@@ -622,8 +647,8 @@ type Transition struct {
 }
 
 type rawTransition struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID   flexString `json:"id"`
+	Name string     `json:"name"`
 	To   *struct {
 		Name string `json:"name"`
 	} `json:"to"`
@@ -649,7 +674,7 @@ func (c *Client) Transitions(ctx context.Context, key string) ([]Transition, err
 	}
 	list := make([]Transition, 0, len(out.Transitions))
 	for _, t := range out.Transitions {
-		entry := Transition{ID: t.ID, Name: t.Name}
+		entry := Transition{ID: string(t.ID), Name: t.Name}
 		if t.To != nil {
 			entry.To = t.To.Name
 		}
@@ -787,6 +812,27 @@ func (c *Client) Assign(ctx context.Context, key, who string) (map[string]any, e
 			value = me.Name
 		}
 		label = me.DisplayName
+	case c.cfg.Cloud() && looksLikeAccountID(who):
+		// Already the opaque id the field wants — no lookup to do.
+	default:
+		// What an agent has is what stands on the ticket: "Tabea Schwarz", a
+		// mail address, a login. What Cloud wants is an accountId, and it
+		// answers anything else with a 404 that reads like a permission
+		// problem ("the specified user does not exist"). So the name is
+		// resolved here rather than guessed there — on Data Center too, where
+		// the field wants the login and a display name fails just as quietly.
+		u, err := c.resolveAssignee(ctx, key, who)
+		if err != nil {
+			return nil, err
+		}
+		if c.cfg.Cloud() {
+			value = u.AccountID
+		} else {
+			value = u.Name
+		}
+		if u.DisplayName != "" {
+			label = u.DisplayName
+		}
 	}
 	payload := map[string]any{field: any(value)}
 	if value == "" {
@@ -796,6 +842,95 @@ func (c *Client) Assign(ctx context.Context, key, who string) (map[string]any, e
 		return nil, err
 	}
 	return map[string]any{"key": strings.ToUpper(key), "assignee": label}, nil
+}
+
+// looksLikeAccountID recognises the two shapes Cloud gives out — the modern
+// "712020:<uuid>" and the older 24-character opaque one. Anything else is a
+// name a person typed and has to be looked up.
+func looksLikeAccountID(s string) bool {
+	if strings.Contains(s, ":") {
+		return true
+	}
+	if len(s) != 24 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveAssignee turns what somebody wrote into the one user this site means
+// by it. It asks the assignable search first — that list is narrowed to the
+// people who may actually hold this issue, which is the difference between
+// "Tabea from support" and "Tabea who left the project last year" — and falls
+// back to the site-wide search where the endpoint is not available.
+//
+// An ambiguous answer is an error, not a coin flip: assigning a ticket to the
+// wrong person is quiet, and the agent is the last one who would notice.
+func (c *Client) resolveAssignee(ctx context.Context, issueKey, who string) (User, error) {
+	users, err := c.searchUsers(ctx, issueKey, who)
+	if err != nil {
+		return User{}, err
+	}
+	switch len(users) {
+	case 0:
+		return User{}, fmt.Errorf("no user on this site matches %q — assign takes a display name, a mail address or an accountId (Cloud hides mail addresses by default, so the name is the reliable one)", who)
+	case 1:
+		return users[0], nil
+	}
+	// Several hits: an exact match on what was written settles it, otherwise
+	// the error names the candidates so the next attempt can be precise.
+	for _, u := range users {
+		if strings.EqualFold(u.DisplayName, who) || strings.EqualFold(u.Email, who) || strings.EqualFold(u.Name, who) {
+			return u, nil
+		}
+	}
+	names := make([]string, 0, len(users))
+	for i, u := range users {
+		if i == 5 {
+			names = append(names, "…")
+			break
+		}
+		id := u.AccountID
+		if id == "" {
+			id = u.Name
+		}
+		names = append(names, fmt.Sprintf("%s (%s)", u.DisplayName, id))
+	}
+	return User{}, fmt.Errorf("%q matches several users: %s — say which one", who, strings.Join(names, ", "))
+}
+
+// searchUsers asks the site who it knows by that name. The parameter is called
+// query on Cloud and username on Data Center; the endpoint is the same.
+func (c *Client) searchUsers(ctx context.Context, issueKey, query string) ([]User, error) {
+	param := "query"
+	if !c.cfg.Cloud() {
+		param = "username"
+	}
+	q := url.Values{param: {query}, "maxResults": {"20"}}
+	if issueKey != "" {
+		q.Set("issueKey", strings.ToUpper(issueKey))
+	}
+	var raw []rawUser
+	err := c.do(ctx, http.MethodGet, c.api("/user/assignable/search?"+q.Encode()), nil, &raw)
+	if err != nil {
+		// Not every deployment offers the assignable list to every account.
+		// The site-wide search is the weaker question — it can name somebody
+		// who cannot hold the issue — but a weaker answer beats none.
+		q.Del("issueKey")
+		raw = nil
+		if err2 := c.do(ctx, http.MethodGet, c.api("/user/search?"+q.Encode()), nil, &raw); err2 != nil {
+			return nil, err
+		}
+	}
+	out := make([]User, 0, len(raw))
+	for i := range raw {
+		out = append(out, raw[i].user())
+	}
+	return out, nil
 }
 
 // UpdateIssue changes fields on an issue. Named fields are resolved through the
@@ -1184,18 +1319,18 @@ type File struct {
 }
 
 type rawAttachment struct {
-	ID       string   `json:"id"`
-	Filename string   `json:"filename"`
-	MimeType string   `json:"mimeType"`
-	Size     int64    `json:"size"`
-	Created  string   `json:"created"`
-	Author   *rawUser `json:"author"`
-	Content  string   `json:"content"`
+	ID       flexString `json:"id"`
+	Filename string     `json:"filename"`
+	MimeType string     `json:"mimeType"`
+	Size     int64      `json:"size"`
+	Created  string     `json:"created"`
+	Author   *rawUser   `json:"author"`
+	Content  string     `json:"content"`
 }
 
 func (r rawAttachment) file() File {
 	return File{
-		ID: r.ID, Name: r.Filename, MIME: r.MimeType, Bytes: r.Size,
+		ID: string(r.ID), Name: r.Filename, MIME: r.MimeType, Bytes: r.Size,
 		Created: r.Created, Author: r.Author.label(), contentX: r.Content,
 	}
 }

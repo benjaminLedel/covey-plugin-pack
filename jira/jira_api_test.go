@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,6 +47,9 @@ type fakeJira struct {
 	issues      map[string]map[string]any
 	blobs       map[string][]byte
 	searchHits  []map[string]any
+	users       []map[string]any // what /user/…/search answers
+	userQueries []string         // the queries it was asked, in order
+	numericIDs  bool             // ids as numbers, the way some Cloud responses send them
 
 	srv *httptest.Server
 }
@@ -129,6 +133,25 @@ func (f *fakeJira) handle(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		f.json(w, map[string]any{"issues": hits})
 
+	case strings.HasPrefix(path, "/user/"):
+		param := "query"
+		if !f.cloud {
+			param = "username"
+		}
+		f.mu.Lock()
+		f.userQueries = append(f.userQueries, path+"?"+param+"="+r.URL.Query().Get(param))
+		hits := []map[string]any{}
+		for _, u := range f.users {
+			name, _ := u["displayName"].(string)
+			mail, _ := u["emailAddress"].(string)
+			q := strings.ToLower(r.URL.Query().Get(param))
+			if strings.Contains(strings.ToLower(name), q) || (mail != "" && strings.Contains(strings.ToLower(mail), q)) {
+				hits = append(hits, u)
+			}
+		}
+		f.mu.Unlock()
+		f.json(w, hits)
+
 	case path == "/field":
 		f.json(w, []map[string]any{
 			{"id": "summary", "name": "Summary"},
@@ -176,8 +199,13 @@ func (f *fakeJira) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if data, ok := f.blobs[id]; ok {
+			var idValue any = id
+			if f.numericIDs {
+				n, _ := strconv.Atoi(id)
+				idValue = n
+			}
 			f.json(w, map[string]any{
-				"id": id, "filename": "screenshot.png", "mimeType": "image/png",
+				"id": idValue, "filename": "screenshot.png", "mimeType": "image/png",
 				"size": len(data), "content": f.srv.URL + prefix + "/attachment/" + id + "/content",
 			})
 			return
@@ -458,6 +486,93 @@ func TestAssignUsesTheDeploymentsField(t *testing.T) {
 	}
 	if dc.assigned[0]["name"] != "covey-bot" {
 		t.Errorf("data center assign = %#v", dc.assigned[0])
+	}
+}
+
+// What an agent has is the name on the ticket; what Cloud wants is an
+// accountId. Without the lookup in between the assignment fails with a 404
+// that reads like a permission problem — and the hand-off back to the reporter
+// silently does not happen.
+func TestAssignResolvesTheNameOnTheTicket(t *testing.T) {
+	f := newFakeJira(t, true)
+	f.users = []map[string]any{
+		{"accountId": "712020:1ae11c59", "displayName": "Tabea Schwarz"},
+		{"accountId": "712020:9f00aa21", "displayName": "Tomas Schwarzenegger"},
+	}
+	out, err := f.client(t).Assign(context.Background(), "ACME-17", "Tabea Schwarz")
+	if err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if f.assigned[0]["accountId"] != "712020:1ae11c59" {
+		t.Errorf("assigned = %#v, want the resolved accountId", f.assigned[0])
+	}
+	if out["assignee"] != "Tabea Schwarz" {
+		t.Errorf("label = %#v, want the display name", out["assignee"])
+	}
+	// The assignable list is the one that knows who may hold THIS issue.
+	if len(f.userQueries) == 0 || !strings.Contains(f.userQueries[0], "/user/assignable/search") {
+		t.Errorf("user queries = %v, want the assignable search first", f.userQueries)
+	}
+}
+
+// An accountId that is already an accountId is not looked up — the lookup is
+// there for names, not as a toll on every call.
+func TestAssignPassesAnAccountIDStraightThrough(t *testing.T) {
+	f := newFakeJira(t, true)
+	if _, err := f.client(t).Assign(context.Background(), "ACME-17", "712020:1ae11c59"); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if len(f.userQueries) != 0 {
+		t.Errorf("asked the site although the id was given: %v", f.userQueries)
+	}
+	if f.assigned[0]["accountId"] != "712020:1ae11c59" {
+		t.Errorf("assigned = %#v", f.assigned[0])
+	}
+}
+
+// Assigning the wrong person is quiet, and the agent is the last one to notice.
+// So an ambiguous name is an error that names the candidates.
+func TestAssignRefusesAnAmbiguousName(t *testing.T) {
+	f := newFakeJira(t, true)
+	f.users = []map[string]any{
+		{"accountId": "712020:aaa", "displayName": "Tabea Schwarz"},
+		{"accountId": "712020:bbb", "displayName": "Tabea Schwarzkopf"},
+	}
+	_, err := f.client(t).Assign(context.Background(), "ACME-17", "Tabea")
+	if err == nil {
+		t.Fatal("an ambiguous name has to be an error")
+	}
+	for _, want := range []string{"Tabea Schwarz", "Tabea Schwarzkopf", "712020:aaa"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	if len(f.assigned) != 0 {
+		t.Errorf("assigned anyway: %#v", f.assigned)
+	}
+}
+
+func TestAssignSaysSoWhenNobodyMatches(t *testing.T) {
+	f := newFakeJira(t, true)
+	_, err := f.client(t).Assign(context.Background(), "ACME-17", "Nobody Here")
+	if err == nil || !strings.Contains(err.Error(), "Nobody Here") {
+		t.Fatalf("err = %v, want one that names what was searched for", err)
+	}
+}
+
+// Jira documents the attachment id as a string and sends it as a number from
+// some endpoints. Insisting on the documented shape does not lose the id — it
+// loses the whole response, and with it the screenshot on the bug report.
+func TestAttachmentIDMayArriveAsANumber(t *testing.T) {
+	f := newFakeJira(t, true)
+	f.numericIDs = true
+	f.blobs["10412"] = []byte("PNG")
+	file, err := f.client(t).Attachment(context.Background(), "10412")
+	if err != nil {
+		t.Fatalf("Attachment: %v", err)
+	}
+	if file.ID != "10412" || file.Name != "screenshot.png" {
+		t.Errorf("file = %+v", file)
 	}
 }
 
