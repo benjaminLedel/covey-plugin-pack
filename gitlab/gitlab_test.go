@@ -3400,6 +3400,11 @@ func TestVerdraengteArbeitskopienStehenAlsFeldImErgebnis(t *testing.T) {
 	workdir := t.TempDir()
 	ctx := target.WithWorkdir(context.Background(), workdir)
 	t.Setenv("COVEY_CHECKOUT_KEEP", "2")
+	// Ohne Schonfrist: seit SDK v0.4.0 bleibt stehen, was in der letzten halben
+	// Stunde benutzt wurde, und vier Abrufe in einem Zug sind alle frisch. Hier
+	// wird das MELDEN der Verdrängung geprüft, nicht die Frist — die hat ihren
+	// eigenen Test im SDK.
+	t.Setenv("COVEY_CHECKOUT_PROTECT_MINS", "0")
 
 	var letzte CheckoutResult
 	for i := 1; i <= 4; i++ {
