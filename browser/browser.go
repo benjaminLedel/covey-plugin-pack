@@ -56,7 +56,41 @@ type manager struct {
 	allocCancel   context.CancelFunc
 	browserCtx    context.Context
 	browserCancel context.CancelFunc
+	// sicht ist die Fenstergröße, in der gerade gerendert wird. Sie gehört an
+	// die Sitzung und nicht an die einzelne Aktion: ein Szenario wird einmal
+	// durchlaufen, und was dabei gefunden wird, gilt für diese Breite.
+	sicht Sicht
 }
+
+// Sicht ist eine Fenstergröße samt der Angaben, die aus einem schmalen Fenster
+// erst ein Telefon machen. Ohne mobile/scale rendert eine Seite in 390 px
+// Breite immer noch als Schreibtisch: das responsive Verhalten hängt an
+// Media-Queries UND an den Geräteangaben.
+type Sicht struct {
+	Breite int64   `json:"width"`
+	Hoehe  int64   `json:"height"`
+	Skala  float64 `json:"scale,omitempty"`
+	Mobil  bool    `json:"mobile,omitempty"`
+	// Name ist die Voreinstellung, aus der die Zahlen stammen (phone, tablet,
+	// desktop, wide) — leer, wenn jemand eigene Zahlen gesetzt hat. Er steht im
+	// Ergebnis eines Screenshots, damit ein Befund die Breite mitbringt, bei
+	// der er entstanden ist.
+	Name string `json:"preset,omitempty"`
+}
+
+// Voreinstellungen: benannte Größen, damit zwei Läufe desselben Szenarios
+// vergleichbar sind. Rohe Zahlen sind daneben erlaubt — aber ein Bericht, in
+// dem „phone" steht, sagt mehr als einer mit 390.
+var sichten = map[string]Sicht{
+	"phone":   {Breite: 390, Hoehe: 844, Skala: 3, Mobil: true, Name: "phone"},
+	"tablet":  {Breite: 820, Hoehe: 1180, Skala: 2, Mobil: true, Name: "tablet"},
+	"desktop": {Breite: 1440, Hoehe: 900, Name: "desktop"},
+	"wide":    {Breite: 1920, Hoehe: 1080, Name: "wide"},
+}
+
+// standardSicht ist die Größe, in der ohne Zutun gerendert wird — dieselbe, die
+// hier fest verdrahtet stand.
+func standardSicht() Sicht { return sichten["desktop"] }
 
 var super = &manager{}
 
@@ -71,12 +105,19 @@ func (m *manager) ensureLocked() (context.Context, error) {
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	// The container IS the sandbox — Chromium's own setuid sandbox needs kernel
 	// caps that are missing here, so --no-sandbox is defensible. Small /dev/shm
-	// in containers → --disable-dev-shm-usage. Fixed window size for
-	// reproducible screenshots.
+	// in containers → --disable-dev-shm-usage.
+	//
+	// Die Fenstergröße kommt aus der Sitzung. Fest verdrahtet stand hier
+	// 1440x900, und damit war jeder Befund eines QA-Agenten stillschweigend
+	// „bei 1440x900" — responsives Verhalten überhaupt nicht prüfbar, und ein
+	// Screenshot am Ticket sagte die Breite nicht dazu.
+	if m.sicht.Breite == 0 {
+		m.sicht = standardSicht()
+	}
 	opts = append(opts,
 		chromedp.NoSandbox,
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.WindowSize(1440, 900),
+		chromedp.WindowSize(int(m.sicht.Breite), int(m.sicht.Hoehe)),
 	)
 	if os.Getenv("COVEY_BROWSER_HEADFUL") != "" {
 		// Visible mode (needs an X server/Xvfb) — for the later live-view/takeover
@@ -144,4 +185,40 @@ func (m *manager) shutdown() {
 		m.allocCancel()
 	}
 	m.browserCtx, m.browserCancel, m.allocCancel = nil, nil, nil
+}
+
+// setzeSicht stellt die Fenstergröße um und merkt sie sich für die Sitzung.
+//
+// Über die Emulation und nicht über das Fenster: die Fenstergröße wird beim
+// Start gesetzt und lässt sich danach nicht mehr ändern, die Emulation schon —
+// und sie ist zugleich das, was ein Telefon von einem schmalen Schreibtisch
+// unterscheidet (Gerätepixel, mobiler Modus).
+func (m *manager) setzeSicht(s Sicht) error {
+	if s.Skala <= 0 {
+		s.Skala = 1
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bctx, err := m.ensureLocked()
+	if err != nil {
+		return err
+	}
+	runCtx, cancel := context.WithTimeout(bctx, actionTimeout())
+	defer cancel()
+	if err := chromedp.Run(runCtx, chromedp.EmulateViewport(s.Breite, s.Hoehe,
+		chromedp.EmulateScale(s.Skala))); err != nil {
+		return err
+	}
+	m.sicht = s
+	return nil
+}
+
+// aktuelleSicht ist die Größe, in der gerade gerendert wird.
+func (m *manager) aktuelleSicht() Sicht {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sicht.Breite == 0 {
+		return standardSicht()
+	}
+	return m.sicht
 }

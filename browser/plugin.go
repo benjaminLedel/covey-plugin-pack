@@ -13,6 +13,7 @@ import (
 	"github.com/chromedp/chromedp"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
+	"sort"
 )
 
 // System binds the headless Chrome to the target registry. No webhook, no
@@ -28,17 +29,17 @@ func init() {
 		},
 		Name:          "browser",
 		Label:         "Browser (headless Chrome)",
-		Description:   "A full headless Chrome as the universal adapter for web applications without a plugin of their own: open pages (navigate), read visible text/DOM (content), write screenshots into the sandbox (screenshot), click (click) and type (type). Runs locally in the daemon (chromedp/DevTools protocol), needs no secrets. Which pages are reachable is gated by the egress allowlist.",
+		Description:   "A full headless Chrome as the universal adapter for web applications without a plugin of their own: open pages (navigate), read visible text/DOM (content), write screenshots into the sandbox (screenshot), click (click), type (type) and change the window size (viewport: phone/tablet/desktop/wide or your own numbers — that is what makes responsive behaviour testable). Runs locally in the daemon (chromedp/DevTools protocol), needs no secrets. Which pages are reachable is gated by the egress allowlist.",
 		Kind:          "builtin",
 		Category:      target.CategoryWeb,
-		Scopes:        []string{"navigate", "content", "screenshot", "click", "type"},
+		Scopes:        []string{"navigate", "content", "screenshot", "click", "type", "viewport"},
 		System:        System{},
 		NoCredentials: true,
 		SetupDoc: `1. Activate the plugin here — no secrets are needed, everything runs locally
    in the sandbox (nothing on the control plane).
 
 2. Enable it in the agent's ACCESS.md:
-   - system: browser scope: navigate,content,screenshot,click,type
+   - system: browser scope: navigate,content,screenshot,click,type,viewport
 
 3. Egress is decisive: the browser is the most powerful egress tool. Every
    host the agent may call must be on the org's egress allowlist — otherwise
@@ -76,6 +77,14 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		Full      bool   `json:"full"`
 		Highlight string `json:"highlight"`
 		Label     string `json:"label"`
+		// Fenstergröße: entweder eine Voreinstellung (phone/tablet/desktop/wide)
+		// oder Zahlen. Bei `viewport` gilt sie ab da für die Sitzung, bei
+		// `screenshot` nur für dieses eine Bild.
+		Preset string  `json:"preset"`
+		Width  int64   `json:"width"`
+		Height int64   `json:"height"`
+		Scale  float64 `json:"scale"`
+		Mobile *bool   `json:"mobile"`
 	}
 	if len(params) > 0 {
 		if err := json.Unmarshal(params, &in); err != nil {
@@ -84,6 +93,16 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 	}
 
 	switch action {
+	case "viewport":
+		sicht, err := leseSicht(in.Preset, in.Width, in.Height, in.Scale, in.Mobile, super.aktuelleSicht())
+		if err != nil {
+			return nil, err
+		}
+		if err := super.setzeSicht(sicht); err != nil {
+			return nil, fmt.Errorf("viewport: %w", err)
+		}
+		return map[string]any{"viewport": sicht}, nil
+
 	case "navigate":
 		u, err := cleanURL(in.URL)
 		if err != nil {
@@ -123,6 +142,21 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		return out, nil
 
 	case "screenshot":
+		// Eine Größe nur für dieses Bild: ein Szenario wird einmal durchlaufen
+		// und an mehreren Breiten festgehalten, ohne noch einmal zu navigieren.
+		// Danach steht die Sitzung wieder, wo sie stand — sonst verschöbe ein
+		// Beweisfoto stillschweigend alles, was danach kommt.
+		if in.Preset != "" || in.Width > 0 || in.Height > 0 {
+			vorher := super.aktuelleSicht()
+			sicht, err := leseSicht(in.Preset, in.Width, in.Height, in.Scale, in.Mobile, vorher)
+			if err != nil {
+				return nil, err
+			}
+			if err := super.setzeSicht(sicht); err != nil {
+				return nil, fmt.Errorf("screenshot viewport: %w", err)
+			}
+			defer func() { _ = super.setzeSicht(vorher) }()
+		}
 		dest := in.To
 		if dest == "" {
 			dest = filepath.Join("browser", nextShotName())
@@ -159,7 +193,11 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		// Additionally hand the screenshot to the recording (out-of-band as a
 		// blob) — not into the result that goes back to the runtime.
 		target.EmitArtifact(ctx, target.Artifact{MIME: "image/png", Bytes: buf})
-		return map[string]any{"path": local, "size": len(buf),
+		// Die Größe gehört ins Ergebnis: ein Beweisfoto ohne die Breite, bei
+		// der es entstand, belegt „es ist kaputt" und nicht „es ist bei 390 px
+		// kaputt" — und genau der Unterschied entscheidet, ob jemand den
+		// Befund nachstellen kann.
+		return map[string]any{"path": local, "size": len(buf), "viewport": super.aktuelleSicht(),
 			"hint": "the screenshot is local — read it directly to see the page."}, nil
 
 	case "click":
@@ -352,7 +390,12 @@ func (System) PromptDoc() string {
    frames the matched element in red (with an optional label as a caption) — that is how you mark visually WHERE a
    defect sits,
    click {"selector":"CSS selector"} clicks the element,
-   type {"selector":"CSS selector","text":"…"} types text into a field.
+   type {"selector":"CSS selector","text":"…"} types text into a field,
+   viewport {"preset":"phone|tablet|desktop|wide"} or {"width":390,"height":844,"mobile":true,"scale":3}
+   changes the window size and keeps it for the session — that is how you test responsive behaviour: walk the
+   scenario once per width instead of reporting everything at one size. screenshot takes the same parameters
+   for a SINGLE picture (afterwards the session stands where it stood), and every screenshot result names the
+   size it was taken at: a finding without its width cannot be reproduced.
    Selectors: plain CSS plus the extension :has-text("…") — it matches the innermost visible
    hit whose text contains the string (e.g. button:has-text("Sign in"), a:has-text("Next")).
    Useful when a button has no stable id/class. Works in click, type and content.
@@ -361,4 +404,44 @@ func (System) PromptDoc() string {
    selector. WAITING: the browser has no webhook — do NOT use the blocked status; end your run with done.
    Reachability: pages only load when their host is on the egress allowlist — if a navigation
    fails, that is often the cause.`
+}
+
+// leseSicht baut aus den Angaben einer Aktion eine Fenstergröße: eine
+// Voreinstellung, eigene Zahlen, oder beides (die Zahlen gewinnen).
+//
+// Was fehlt, bleibt, wie es war — wer nur die Breite ändert, will die Höhe
+// behalten, und eine 0 an dieser Stelle wäre ein Fenster ohne Fläche.
+func leseSicht(preset string, breite, hoehe int64, skala float64, mobil *bool, jetzt Sicht) (Sicht, error) {
+	s := jetzt
+	if p := strings.ToLower(strings.TrimSpace(preset)); p != "" {
+		v, ok := sichten[p]
+		if !ok {
+			namen := make([]string, 0, len(sichten))
+			for k := range sichten {
+				namen = append(namen, k)
+			}
+			sort.Strings(namen)
+			return Sicht{}, fmt.Errorf("unknown preset %q — known: %s", preset, strings.Join(namen, ", "))
+		}
+		s = v
+	}
+	if breite > 0 {
+		s.Breite, s.Name = breite, ""
+	}
+	if hoehe > 0 {
+		s.Hoehe, s.Name = hoehe, ""
+	}
+	if skala > 0 {
+		s.Skala = skala
+	}
+	if mobil != nil {
+		s.Mobil = *mobil
+	}
+	// Grenzen, damit ein Tippfehler nicht den Browser aufhält: unter 200 px
+	// rendert kaum eine Seite noch etwas Lesbares, über 4000 px wird das Bild
+	// größer als jeder Bildschirm, auf dem es angesehen wird.
+	if s.Breite < 200 || s.Breite > 4000 || s.Hoehe < 200 || s.Hoehe > 4000 {
+		return Sicht{}, fmt.Errorf("viewport %dx%d is outside 200..4000", s.Breite, s.Hoehe)
+	}
+	return s, nil
 }

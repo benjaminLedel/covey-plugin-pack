@@ -220,3 +220,89 @@ func TestBrowserEndToEnd(t *testing.T) {
 		t.Error("unknown action: expected an error")
 	}
 }
+
+/* Chrome startete mit fest verdrahteten 1440x900, und keine Aktion änderte das
+   danach. Jeder Befund eines QA-Agenten war damit stillschweigend „bei
+   1440x900" — responsives Verhalten gar nicht prüfbar, und ein Screenshot am
+   Ticket sagte die Breite nicht dazu (#2). */
+
+func TestLeseSichtNimmtVoreinstellungenUndZahlen(t *testing.T) {
+	jetzt := standardSicht()
+	wahr := true
+
+	s, err := leseSicht("phone", 0, 0, 0, nil, jetzt)
+	if err != nil || s.Breite != 390 || !s.Mobil || s.Name != "phone" {
+		t.Fatalf("phone = %+v, %v", s, err)
+	}
+
+	// Eigene Zahlen schlagen die Voreinstellung — und nehmen ihr den Namen,
+	// denn „phone" mit 1200 px wäre eine Angabe, die im Bericht lügt.
+	s, err = leseSicht("phone", 1200, 0, 0, nil, jetzt)
+	if err != nil || s.Breite != 1200 || s.Hoehe != 844 || s.Name != "" {
+		t.Fatalf("phone+Breite = %+v, %v", s, err)
+	}
+
+	// Was fehlt, bleibt stehen: wer nur die Breite ändert, will die Höhe behalten.
+	s, err = leseSicht("", 800, 0, 0, &wahr, Sicht{Breite: 1440, Hoehe: 900})
+	if err != nil || s.Hoehe != 900 || !s.Mobil {
+		t.Fatalf("nur Breite = %+v, %v", s, err)
+	}
+
+	if _, err := leseSicht("phablet", 0, 0, 0, nil, jetzt); err == nil {
+		t.Fatal("eine unbekannte Voreinstellung muss die bekannten nennen")
+	} else if !strings.Contains(err.Error(), "tablet") {
+		t.Fatalf("die Fehlermeldung nennt die bekannten nicht: %v", err)
+	}
+
+	// Grenzen, damit ein Tippfehler nicht den Browser aufhält.
+	for _, f := range [][2]int64{{10, 900}, {1440, 99999}} {
+		if _, err := leseSicht("", f[0], f[1], 0, nil, jetzt); err == nil {
+			t.Fatalf("%dx%d muss abgelehnt werden", f[0], f[1])
+		}
+	}
+}
+
+func TestBrowserRendertInDerGesetztenGroesse(t *testing.T) {
+	chrome := findChromium(t)
+	t.Setenv("COVEY_BROWSER_CHROME_PATH", chrome)
+	t.Cleanup(super.shutdown)
+
+	// Die Seite schreibt ihre eigene Breite hin — so misst der Test, was der
+	// Browser wirklich rendert, statt zu glauben, was er gesetzt hat.
+	seite := `<!doctype html><html><head><title>Breite</title></head><body>
+<div id="w"></div>
+<script>document.getElementById('w').innerText = 'BREITE=' + document.documentElement.clientWidth;</script>
+</body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(seite))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+	if _, err := exec2(t, ctx, "viewport", `{"preset":"phone"}`); err != nil {
+		t.Fatalf("viewport: %v", err)
+	}
+	if _, err := exec2(t, ctx, "navigate", `{"url":"`+srv.URL+`"}`); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	out, err := exec2(t, ctx, "content", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := out.(map[string]any)["text"].(string); !strings.Contains(text, "BREITE=390") {
+		t.Fatalf("die Seite rendert nicht in 390 px: %q", text)
+	}
+
+	// Ein Bild in einer anderen Breite lässt die Sitzung, wo sie war.
+	out, err = exec2(t, ctx, "screenshot", `{"to":"wide.png","preset":"wide"}`)
+	if err != nil {
+		t.Fatalf("screenshot: %v", err)
+	}
+	if v := out.(map[string]any)["viewport"].(Sicht); v.Breite != 1920 {
+		t.Fatalf("das Bild nennt seine Breite nicht: %+v", v)
+	}
+	if v := super.aktuelleSicht(); v.Breite != 390 {
+		t.Fatalf("die Sitzung steht nach dem Bild bei %d statt wieder bei 390", v.Breite)
+	}
+}

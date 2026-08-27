@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
+	"time"
 )
 
 // serveNotes answers a notes request the way GitLab does: sort=desc delivers
@@ -953,10 +954,17 @@ func TestCheckoutSubPathAndLimit(t *testing.T) {
 		"support-main-abc123/":                   "",
 		"support-main-abc123/web/upload/form.js": "const maxSize = 5", // the partial-checkout content
 	})
+	// Nur die Archiv-Anfrage zählt. Ein Teil-Abruf holt seit #1 zusätzlich die
+	// Dateien über dem Unterbaum (tree + raw), und „die letzte Anfrage" wäre
+	// damit eine andere geworden.
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
-		w.Write(archive)
+		if strings.Contains(r.URL.Path, "/repository/archive") {
+			gotQuery = r.URL.RawQuery
+			w.Write(archive)
+			return
+		}
+		w.Write([]byte("[]"))
 	}))
 	defer srv.Close()
 
@@ -1496,7 +1504,7 @@ func TestExtractTarGzRejectsTraversal(t *testing.T) {
 		"repo-main/":          "",
 		"../../etc/evil.conf": "böse",
 	})
-	if _, err := extractTarGzInto(bytes.NewReader(archive), t.TempDir()); err == nil {
+	if _, err := extractTarGzInto(bytes.NewReader(archive), t.TempDir(), ""); err == nil {
 		t.Fatal("path traversal in the archive must be refused")
 	}
 }
@@ -3254,5 +3262,341 @@ func TestAbridgeIssueMarksTruncation(t *testing.T) {
 	}
 	if runes := []rune(got); len(runes) <= issueDescriptionSnippet {
 		t.Errorf("expected snippet plus marker, got %d runes", len(runes))
+	}
+}
+
+/*
+Ein Teil-Abruf legte den Unterbaum ein zweites Mal in sich selbst ab:
+
+	stupla/public/stupla/public/… Gemerkt hat es ein Agent daran, dass
+	public/index.php fehlte — nach zwei Abrufen von je 5703 Dateien (#1).
+
+	Die Ursache ist die Form des Archivs: bei ?path=… trägt GitLab den VOLLEN
+	Repository-Pfad, abgestreift wurde aber nur die Hülle (projname-ref-sha), und
+	ausgepackt wurde in das Unterverzeichnis. Der alte Test hier hat es nicht
+	gefangen, weil sein Archiv den Pfad schon zugeschnitten enthielt — er prüfte
+	den Fall, den der Server nicht liefert.
+*/
+func TestTeilAbrufVerschachteltDenUnterbaumNicht(t *testing.T) {
+	// So sieht das echte Archiv aus: Hülle, darin der volle Pfad.
+	archiv := tarGz(t, map[string]string{
+		"stupla-abc123/":                        "",
+		"stupla-abc123/stupla/public/index.php": "<?php // Einstieg",
+		"stupla-abc123/stupla/public/js/app.js": "// js",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(archiv)
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+
+	res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":237,"ref":"demo","path":"stupla/public"}`), cred)
+	if err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+	r := res.(CheckoutResult)
+
+	// Da, wo die Datei upstream liegt.
+	if _, err := os.Stat(filepath.Join(r.Path, "stupla", "public", "index.php")); err != nil {
+		t.Fatalf("index.php liegt nicht an seinem Platz: %v", err)
+	}
+	// Und NICHT eine Ebene tiefer noch einmal.
+	doppelt := filepath.Join(r.Path, "stupla", "public", "stupla")
+	if _, err := os.Stat(doppelt); err == nil {
+		t.Fatalf("der Unterbaum steht ein zweites Mal in sich selbst: %s", doppelt)
+	}
+}
+
+// Die Gegenprobe: liefert ein Server das Archiv schon zugeschnitten (ohne den
+// Pfad-Präfix), muss dasselbe herauskommen. Der Abruf darf nicht davon
+// abhängen, welche Form die Gegenseite wählt.
+func TestTeilAbrufVertraegtBeideArchivFormen(t *testing.T) {
+	zugeschnitten := tarGz(t, map[string]string{
+		"stupla-abc123/":          "",
+		"stupla-abc123/index.php": "<?php // Einstieg",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(zugeschnitten)
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+
+	res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":237,"ref":"demo","path":"stupla/public"}`), cred)
+	if err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+	r := res.(CheckoutResult)
+	if _, err := os.Stat(filepath.Join(r.Path, "stupla", "public", "index.php")); err != nil {
+		t.Fatalf("auch das zugeschnittene Archiv gehört an seinen Platz: %v", err)
+	}
+}
+
+/*
+Die Verdrängung misst die mtime des obersten Verzeichnisses — und ein Baum
+
+	aus dreizehn Teil-Abrufen bekommt seine Dateien INNEN geschrieben. Er sah so
+	alt aus wie sein erster Abruf, während er der einzige war, in dem gearbeitet
+	wurde (#1).
+*/
+func TestEinTeilAbrufFrischtDenBaumAuf(t *testing.T) {
+	archiv := tarGz(t, map[string]string{
+		"stupla-abc123/":                      "",
+		"stupla-abc123/stupla/app/Kernel.php": "<?php",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(archiv)
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	workdir := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), workdir)
+
+	res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":237,"ref":"demo","path":"stupla/app"}`), cred)
+	if err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+	wurzel := res.(CheckoutResult).Path
+
+	// Den Baum künstlich altern lassen — so sah er nach dreizehn Teil-Abrufen
+	// aus: innen frisch, oben alt.
+	alt := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(wurzel, alt, alt); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":237,"ref":"demo","path":"stupla/tests"}`), cred); err != nil {
+		t.Fatalf("zweiter checkout: %v", err)
+	}
+	info, err := os.Stat(wurzel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(info.ModTime()) > time.Minute {
+		t.Fatalf("die Wurzel gilt weiter als %s alt — genau die Fehlmessung aus #1",
+			time.Since(info.ModTime()).Round(time.Hour))
+	}
+}
+
+// Und was verdrängt wurde, steht als Liste im Ergebnis. Der Satz im Hinweis
+// bleibt daneben, aber ein Agent, der Felder liest, soll es nicht aus einem
+// Absatz herausklauben müssen.
+func TestVerdraengteArbeitskopienStehenAlsFeldImErgebnis(t *testing.T) {
+	archiv := tarGz(t, map[string]string{"p-abc/": "", "p-abc/README.md": "x"})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(archiv)
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	workdir := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), workdir)
+	t.Setenv("COVEY_CHECKOUT_KEEP", "2")
+	// Ohne Schonfrist: seit SDK v0.4.0 bleibt stehen, was in der letzten halben
+	// Stunde benutzt wurde, und vier Abrufe in einem Zug sind alle frisch. Hier
+	// wird das MELDEN der Verdrängung geprüft, nicht die Frist — die hat ihren
+	// eigenen Test im SDK.
+	t.Setenv("COVEY_CHECKOUT_PROTECT_MINS", "0")
+
+	var letzte CheckoutResult
+	for i := 1; i <= 4; i++ {
+		res, err := sys.Execute(ctx, "checkout",
+			[]byte(fmt.Sprintf(`{"project_id":%d,"ref":"main"}`, i)), cred)
+		if err != nil {
+			t.Fatalf("checkout %d: %v", i, err)
+		}
+		letzte = res.(CheckoutResult)
+		// Ohne Abstand tragen zwei Abrufe dieselbe mtime, und „am längsten
+		// nicht benutzt" wäre Zufall.
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(letzte.Evicted) == 0 {
+		t.Fatal("es wurde verdrängt, und das Ergebnis schweigt darüber")
+	}
+	if !strings.Contains(letzte.Hint, "working copies were removed") {
+		t.Fatal("der Satz im Hinweis fehlt — beide Wege sollen es sagen")
+	}
+}
+
+/*
+`checkout {"path":"stupla/app"}` lieferte den Unterbaum und keine einzige
+
+	Datei aus stupla/ — kein artisan, kein composer.json, kein composer.lock. Ein
+	PHP-Projekt lässt sich daraus nicht bauen, und man merkt es beim ersten
+	`composer install`. Der Ausweg, den ein Agent fand, ist der unangenehme Teil:
+	er rief den vollen Abruf auf, WISSEND dass er am Größenlimit scheitert, weil
+	der abgebrochene Abruf die Wurzeldateien liegen ließ (#1).
+*/
+func TestTeilAbrufBringtDieDateienUeberDemUnterbaumMit(t *testing.T) {
+	archiv := tarGz(t, map[string]string{
+		"stupla-abc123/":                      "",
+		"stupla-abc123/stupla/app/Kernel.php": "<?php",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repository/archive"):
+			w.Write(archiv)
+		case strings.Contains(r.URL.Path, "/repository/tree"):
+			switch r.URL.Query().Get("path") {
+			case "":
+				w.Write([]byte(`[{"name":"stupla","type":"tree","path":"stupla"},
+				                 {"name":"README.md","type":"blob","path":"README.md"}]`))
+			case "stupla":
+				w.Write([]byte(`[{"name":"app","type":"tree","path":"stupla/app"},
+				                 {"name":"artisan","type":"blob","path":"stupla/artisan"},
+				                 {"name":"composer.json","type":"blob","path":"stupla/composer.json"}]`))
+			default:
+				w.Write([]byte(`[]`))
+			}
+		case strings.Contains(r.URL.Path, "/repository/files/"):
+			w.Write([]byte("Inhalt von " + r.URL.Path))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+
+	res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":237,"ref":"demo","path":"stupla/app"}`), cred)
+	if err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+	r := res.(CheckoutResult)
+
+	// Die Bau-Dateien der Ebene darüber — ohne sie kein composer install.
+	for _, rel := range []string{"stupla/artisan", "stupla/composer.json", "README.md"} {
+		if _, err := os.Stat(filepath.Join(r.Path, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("%s fehlt im Baum: %v", rel, err)
+		}
+	}
+	// Und der Unterbaum ist weiterhin da, wo er hingehört.
+	if _, err := os.Stat(filepath.Join(r.Path, "stupla", "app", "Kernel.php")); err != nil {
+		t.Fatalf("der eigentliche Unterbaum fehlt: %v", err)
+	}
+	// Die Verzeichnisse der Ebene darüber werden NICHT mitgezogen — sonst wäre
+	// das ein zweiter Weg, ein ganzes Repository zu holen.
+	if _, err := os.Stat(filepath.Join(r.Path, "stupla", "app", "app")); err == nil {
+		t.Fatal("Unterverzeichnisse der Elternebene gehören nicht dazu")
+	}
+	if r.Files < 4 {
+		t.Fatalf("die Zahl der Dateien zählt die mitgeholten nicht mit: %d", r.Files)
+	}
+}
+
+// Ein voller Abruf holt ohnehin alles — dort darf kein zusätzlicher Verkehr
+// entstehen.
+func TestVollerAbrufHoltKeineElternDateien(t *testing.T) {
+	archiv := tarGz(t, map[string]string{"p-abc/": "", "p-abc/README.md": "x"})
+	var baum int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repository/tree") {
+			baum++
+		}
+		w.Write(archiv)
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := target.WithWorkdir(context.Background(), t.TempDir())
+	if _, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":1,"ref":"main"}`), cred); err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
+	if baum != 0 {
+		t.Fatalf("%d Baum-Anfragen bei einem vollen Abruf", baum)
+	}
+}
+
+/*
+read_file schneidet bei 512 kB ab und sagt es auch ("truncated": true) — und
+
+	ließ trotzdem keinen Weg, den Rest zu holen. composer.lock mit 598.917 Bytes
+	kam unbrauchbar an, und wer das Feld nicht prüft, baut mit einer halben
+	Sperrdatei (#1).
+*/
+func TestReadFileHoltDenRestUeberOffset(t *testing.T) {
+	inhalt := strings.Repeat("a", maxReadFileBytes) + "ENDE"
+	var sahRange bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		von := 0
+		if rng := r.Header.Get("Range"); rng != "" {
+			sahRange = true
+			fmt.Sscanf(rng, "bytes=%d-", &von)
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		if von < len(inhalt) {
+			w.Write([]byte(inhalt[von:]))
+		}
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := context.Background()
+
+	res, err := sys.Execute(ctx, "read_file", []byte(`{"project_id":1,"file_path":"composer.lock"}`), cred)
+	if err != nil {
+		t.Fatalf("read_file: %v", err)
+	}
+	erste := res.(map[string]any)
+	if erste["truncated"] != true {
+		t.Fatal("das Abschneiden wird nicht gemeldet")
+	}
+	weiter, ok := erste["next_offset"].(int)
+	if !ok || weiter != maxReadFileBytes {
+		t.Fatalf("next_offset fehlt oder stimmt nicht: %v", erste["next_offset"])
+	}
+
+	res, err = sys.Execute(ctx, "read_file",
+		[]byte(fmt.Sprintf(`{"project_id":1,"file_path":"composer.lock","offset":%d}`, weiter)), cred)
+	if err != nil {
+		t.Fatalf("read_file mit offset: %v", err)
+	}
+	zweite := res.(map[string]any)
+	if zweite["content"] != "ENDE" {
+		t.Fatalf("das zweite Stück ist nicht der Rest: %q", zweite["content"])
+	}
+	if zweite["truncated"] != false {
+		t.Fatal("das letzte Stück darf nicht als abgeschnitten gelten")
+	}
+	// Über Range geholt, nicht durch Wegwerfen des Anfangs. Der Rückfallweg
+	// (siehe der Test darunter) liefert dasselbe Ergebnis, überträgt aber die
+	// ganze Datei noch einmal — bei einer 50-MB-Sperrdatei ist das der
+	// Unterschied zwischen einem Stück und dem ganzen Repository.
+	if !sahRange {
+		t.Fatal("das zweite Stück wurde ohne Range geholt")
+	}
+}
+
+// Eine Gegenstelle ohne Range-Unterstützung liefert die Datei von vorn. Dann
+// muss der Anfang hier weg — sonst läse der Aufrufer dasselbe Stück zweimal
+// und hielte es für den Rest.
+func TestReadFileOhneRangeUnterstuetzung(t *testing.T) {
+	inhalt := strings.Repeat("b", maxReadFileBytes) + "SCHLUSS"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(inhalt)) // ignoriert Range, antwortet mit 200
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	res, err := sys.Execute(context.Background(), "read_file",
+		[]byte(fmt.Sprintf(`{"project_id":1,"file_path":"gross.lock","offset":%d}`, maxReadFileBytes)), cred)
+	if err != nil {
+		t.Fatalf("read_file: %v", err)
+	}
+	if got := res.(map[string]any)["content"]; got != "SCHLUSS" {
+		t.Fatalf("der Anfang wurde nicht abgeschnitten: %.20q", got)
 	}
 }

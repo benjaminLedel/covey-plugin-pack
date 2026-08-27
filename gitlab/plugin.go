@@ -755,12 +755,18 @@ type aktionsParams struct {
 	RemoveLabels []string `json:"remove_labels"`
 	Path         string   `json:"path"`
 	FilePath     string   `json:"file_path"`
-	URL          string   `json:"url"`
-	Recursive    bool     `json:"recursive"`
-	Sha          string   `json:"sha"`
-	Since        string   `json:"since"`
-	Target       string   `json:"target_branch"`
-	Username     string   `json:"username"`
+	// Offset ist die Stelle, ab der read_file liest. Es gibt ihn, weil das
+	// Abschneiden bei 512 kB zwar sauber gemeldet wird ("truncated": true),
+	// aber keinen Weg ließ, den Rest zu holen: composer.lock mit 598.917 Bytes
+	// kam unbrauchbar an, und wer "truncated" nicht prüft, baut mit einer
+	// halben Sperrdatei.
+	Offset    int    `json:"offset"`
+	URL       string `json:"url"`
+	Recursive bool   `json:"recursive"`
+	Sha       string `json:"sha"`
+	Since     string `json:"since"`
+	Target    string `json:"target_branch"`
+	Username  string `json:"username"`
 	// The developer workflow: commit + create_merge_request.
 	Branch       string   `json:"branch"`
 	StartBranch  string   `json:"start_branch"`
@@ -847,12 +853,25 @@ var aktionen = map[string]aktion{
 		if in.ProjectID == 0 || in.FilePath == "" {
 			return nil, fmt.Errorf("project_id or file_path missing")
 		}
-		content, truncated, err := gc.ReadFile(ctx, in.ProjectID, in.FilePath, in.Ref)
+		if in.Offset < 0 {
+			return nil, fmt.Errorf("offset must not be negative")
+		}
+		content, truncated, err := gc.ReadFileFrom(ctx, in.ProjectID, in.FilePath, in.Ref, in.Offset)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"file_path": in.FilePath, "ref": in.Ref,
-			"content": content, "truncated": truncated}, nil
+		out := map[string]any{"file_path": in.FilePath, "ref": in.Ref,
+			"content": content, "truncated": truncated}
+		if in.Offset > 0 {
+			out["offset"] = in.Offset
+		}
+		// Die Stelle, an der das nächste Stück beginnt. Ohne sie müsste der
+		// Agent die Länge selbst zusammenzählen — und genau dabei entsteht die
+		// halbe Datei, gegen die das hier antritt.
+		if truncated {
+			out["next_offset"] = in.Offset + len(content)
+		}
+		return out, nil
 	},
 	"list_commits": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
 		if in.ProjectID == 0 {
@@ -1246,7 +1265,9 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    costs you a turn, and half a project builds and tests as badly as none. If you only want to READ, do without
    a checkout entirely:
    list_tree {"project_id":N,"path":"...","ref":"...","recursive":true|false} lists the repository tree (max. 100 entries —
-   narrow it with path), read_file {"project_id":N,"file_path":"path/to/file","ref":"..."} reads a single file,
+   narrow it with path), read_file {"project_id":N,"file_path":"path/to/file","ref":"...","offset":0} reads a single file
+   (512 kB at a time; if "truncated" is true, fetch the rest with "offset": <next_offset> — a lock file read
+   only halfway builds a project that nobody can reproduce),
    create_issue {"project_id":N,"title":"...","description":"... (Markdown)","labels":"bug,intake (optional)","assignee":"gitlab-username (optional)"} —
    files a NEW ticket; use it to turn a bug report that does NOT come from GitLab (reported by email, say) into a
    traceable issue. It needs a project_id — if you do not know the target project for certain, DO NOT GUESS:
