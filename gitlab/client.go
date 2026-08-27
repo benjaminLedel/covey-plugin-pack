@@ -622,6 +622,15 @@ const maxReadFileBytes = 512 << 10 // 512 KB
 // file without a checkout. The file path is URL-encoded completely (including
 // "/"), as the GitLab API demands.
 func (c *Client) ReadFile(ctx context.Context, projectID int, filePath, ref string) (content string, truncated bool, err error) {
+	return c.ReadFileFrom(ctx, projectID, filePath, ref, 0)
+}
+
+// ReadFileFrom liest ab einer Stelle. Das Abschneiden bei maxReadFileBytes war
+// sauber gemeldet und trotzdem eine Falle: eine große Datei kam unbrauchbar an,
+// und es gab keinen Weg, den Rest zu holen. Gelesen wird über einen
+// Range-Header; kann die Gegenstelle das nicht (kein 206), wird der Anfang
+// verworfen — dieselbe Auskunft, nur teurer.
+func (c *Client) ReadFileFrom(ctx context.Context, projectID int, filePath, ref string, offset int) (content string, truncated bool, err error) {
 	path := fmt.Sprintf("/projects/%d/repository/files/%s/raw", projectID, url.QueryEscape(filePath))
 	if ref != "" {
 		path += "?ref=" + url.QueryEscape(ref)
@@ -631,17 +640,35 @@ func (c *Client) ReadFile(ctx context.Context, projectID int, filePath, ref stri
 		return "", false, err
 	}
 	req.Header.Set("PRIVATE-TOKEN", c.Token)
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return "", false, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxReadFileBytes+1))
+	// Ein Stück mehr lesen als das Limit: nur so ist „genau voll" von
+	// „abgeschnitten" zu unterscheiden.
+	grenze := maxReadFileBytes
+	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
+		// Die Gegenstelle kennt keinen Range. Dann kommt die Datei von vorn,
+		// und der Anfang muss hier weg — sonst läse der Aufrufer dasselbe
+		// Stück ein zweites Mal und hielte es für den Rest.
+		grenze = offset + maxReadFileBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(grenze)+1))
 	if err != nil {
 		return "", false, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", false, fmt.Errorf("gitlab GET %s: HTTP %d: %.300s", path, resp.StatusCode, data)
+	}
+	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
+		if offset >= len(data) {
+			return "", false, nil
+		}
+		data = data[offset:]
 	}
 	if len(data) > maxReadFileBytes {
 		return string(data[:maxReadFileBytes]), true, nil

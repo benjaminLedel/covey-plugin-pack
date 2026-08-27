@@ -3512,3 +3512,86 @@ func TestVollerAbrufHoltKeineElternDateien(t *testing.T) {
 		t.Fatalf("%d Baum-Anfragen bei einem vollen Abruf", baum)
 	}
 }
+
+/*
+read_file schneidet bei 512 kB ab und sagt es auch ("truncated": true) — und
+
+	ließ trotzdem keinen Weg, den Rest zu holen. composer.lock mit 598.917 Bytes
+	kam unbrauchbar an, und wer das Feld nicht prüft, baut mit einer halben
+	Sperrdatei (#1).
+*/
+func TestReadFileHoltDenRestUeberOffset(t *testing.T) {
+	inhalt := strings.Repeat("a", maxReadFileBytes) + "ENDE"
+	var sahRange bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		von := 0
+		if rng := r.Header.Get("Range"); rng != "" {
+			sahRange = true
+			fmt.Sscanf(rng, "bytes=%d-", &von)
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		if von < len(inhalt) {
+			w.Write([]byte(inhalt[von:]))
+		}
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	ctx := context.Background()
+
+	res, err := sys.Execute(ctx, "read_file", []byte(`{"project_id":1,"file_path":"composer.lock"}`), cred)
+	if err != nil {
+		t.Fatalf("read_file: %v", err)
+	}
+	erste := res.(map[string]any)
+	if erste["truncated"] != true {
+		t.Fatal("das Abschneiden wird nicht gemeldet")
+	}
+	weiter, ok := erste["next_offset"].(int)
+	if !ok || weiter != maxReadFileBytes {
+		t.Fatalf("next_offset fehlt oder stimmt nicht: %v", erste["next_offset"])
+	}
+
+	res, err = sys.Execute(ctx, "read_file",
+		[]byte(fmt.Sprintf(`{"project_id":1,"file_path":"composer.lock","offset":%d}`, weiter)), cred)
+	if err != nil {
+		t.Fatalf("read_file mit offset: %v", err)
+	}
+	zweite := res.(map[string]any)
+	if zweite["content"] != "ENDE" {
+		t.Fatalf("das zweite Stück ist nicht der Rest: %q", zweite["content"])
+	}
+	if zweite["truncated"] != false {
+		t.Fatal("das letzte Stück darf nicht als abgeschnitten gelten")
+	}
+	// Über Range geholt, nicht durch Wegwerfen des Anfangs. Der Rückfallweg
+	// (siehe der Test darunter) liefert dasselbe Ergebnis, überträgt aber die
+	// ganze Datei noch einmal — bei einer 50-MB-Sperrdatei ist das der
+	// Unterschied zwischen einem Stück und dem ganzen Repository.
+	if !sahRange {
+		t.Fatal("das zweite Stück wurde ohne Range geholt")
+	}
+}
+
+// Eine Gegenstelle ohne Range-Unterstützung liefert die Datei von vorn. Dann
+// muss der Anfang hier weg — sonst läse der Aufrufer dasselbe Stück zweimal
+// und hielte es für den Rest.
+func TestReadFileOhneRangeUnterstuetzung(t *testing.T) {
+	inhalt := strings.Repeat("b", maxReadFileBytes) + "SCHLUSS"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(inhalt)) // ignoriert Range, antwortet mit 200
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "t"}
+	res, err := sys.Execute(context.Background(), "read_file",
+		[]byte(fmt.Sprintf(`{"project_id":1,"file_path":"gross.lock","offset":%d}`, maxReadFileBytes)), cred)
+	if err != nil {
+		t.Fatalf("read_file: %v", err)
+	}
+	if got := res.(map[string]any)["content"]; got != "SCHLUSS" {
+		t.Fatalf("der Anfang wurde nicht abgeschnitten: %.20q", got)
+	}
+}
