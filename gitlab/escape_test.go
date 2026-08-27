@@ -69,7 +69,7 @@ func TestExtractDoesNotFollowASymlinkOutOfTheDestination(t *testing.T) {
 	}
 
 	archive := escapeArchive(t, map[string]string{"node_modules/pwned.txt": "escaped"})
-	_, err := extractTarGzInto(bytes.NewReader(archive), dest)
+	_, err := extractTarGzInto(bytes.NewReader(archive), dest, "")
 
 	if _, statErr := os.Stat(filepath.Join(outside, "pwned.txt")); statErr == nil {
 		t.Fatalf("the archive wrote THROUGH the symlink to %s — extraction escaped the destination (extract error was %v)", outside, err)
@@ -93,7 +93,7 @@ func TestExtractDoesNotFollowASymlinkedParent(t *testing.T) {
 	}
 
 	archive := escapeArchive(t, map[string]string{"vendor/escape/pwned.txt": "escaped"})
-	_, err := extractTarGzInto(bytes.NewReader(archive), dest)
+	_, err := extractTarGzInto(bytes.NewReader(archive), dest, "")
 
 	if _, statErr := os.Stat(filepath.Join(outside, "pwned.txt")); statErr == nil {
 		t.Fatalf("the archive wrote through a symlinked parent to %s (extract error was %v)", outside, err)
@@ -118,7 +118,7 @@ func TestExtractDoesNotOverwriteThroughASymlink(t *testing.T) {
 	}
 
 	archive := escapeArchive(t, map[string]string{"config.conf": "overwritten"})
-	_, err := extractTarGzInto(bytes.NewReader(archive), dest)
+	_, err := extractTarGzInto(bytes.NewReader(archive), dest, "")
 
 	got, readErr := os.ReadFile(victim)
 	if readErr != nil {
@@ -145,7 +145,7 @@ func TestExtractStillUnpacksOrdinaryArchives(t *testing.T) {
 		"cmd/covey/main.go":      "package main",
 		"internal/a/b/c/deep.go": "package c",
 	})
-	files, err := extractTarGzInto(bytes.NewReader(archive), dest)
+	files, err := extractTarGzInto(bytes.NewReader(archive), dest, "")
 	if err != nil {
 		t.Fatalf("an ordinary archive must unpack: %v", err)
 	}

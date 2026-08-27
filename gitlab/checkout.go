@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
+	"time"
 )
 
 // preserveDirs survive a repeated checkout (they are not wiped away together
@@ -125,7 +126,13 @@ type CheckoutResult struct {
 	SubPath   string `json:"sub_path,omitempty"`
 	LocalPath string `json:"local_path,omitempty"`
 	Files     int    `json:"files"`
-	Hint      string `json:"hint"`
+	// Evicted nennt die Arbeitskopien, die dieser Abruf verdrängt hat. Als
+	// Feld und nicht nur als Satz im Hinweis: ein Agent hatte nach dreizehn
+	// Teil-Abrufen einen 700-MB-Baum stehen, holte fünf kleine Projekte — und
+	// sein Baum war weg. Der Hinweistext sagte es, in einem langen Absatz, und
+	// ging unter. Eine Liste geht nicht unter.
+	Evicted []string `json:"evicted,omitempty"`
+	Hint    string   `json:"hint"`
 }
 
 // Checkout materialises a project's source code in the sandbox: it downloads
@@ -177,20 +184,38 @@ func Checkout(ctx context.Context, gc *Client, projectID int, ref, subPath, work
 	if err := pruneExceptPreserved(destDir); err != nil {
 		return CheckoutResult{}, err
 	}
-	files, err := extractTarGzInto(body, destDir)
+	files, err := extractTarGzInto(body, rootDir, sub)
 	if err != nil {
 		return CheckoutResult{}, err
+	}
+	// Bei einem Teil-Abruf fehlen die Dateien ÜBER dem Unterbaum; ohne sie
+	// lässt sich kein Projekt bauen (siehe holeElternDateien).
+	if sub != "" {
+		files += holeElternDateien(ctx, gc, projectID, ref, sub, rootDir)
 	}
 	// The baseline belongs at the repository root, not into the subtree —
 	// otherwise a partial checkout would leave a nested git repository behind
 	// and commit would compare against the wrong root.
 	initGitBaseline(ctx, rootDir)
 
+	// Die Wurzel anfassen, damit „zuletzt benutzt" auch stimmt.
+	//
+	// Die Verdrängung misst die mtime des obersten Verzeichnisses. Ein Baum aus
+	// dreizehn Teil-Abrufen bekommt seine Dateien aber INNEN geschrieben; oben
+	// bewegt sich nichts. Er sah so alt aus wie sein erster Abruf, während er
+	// der einzige war, in dem gearbeitet wurde — und flog als „ältester"
+	// heraus.
+	jetzt := time.Now()
+	_ = os.Chtimes(rootDir, jetzt, jetzt)
+
+	verdraengt := target.PruneOldCheckouts(workdir, rootDir)
 	hint := "The source code is local — search and read it directly (Grep/Read/Bash). For the actual change hand the path to dev agent: the sub-agent works IN the project and gets that project's own rules there (CLAUDE.md, .claude/agents, skills) — you yourself do not see them. The directory is a git repo with the upstream state as its baseline commit; the sub-agent reports changed files back. Dependency caches (node_modules and the like) survive across runs, so npm/pip/go install then runs incrementally." +
-		target.CheckoutPruneNote(target.PruneOldCheckouts(workdir, rootDir))
+		target.CheckoutPruneNote(verdraengt)
 	if sub != "" {
 		hint = "Partial checkout: \"path\" is the repository ROOT, the fetched subtree lies under it at " +
-			filepath.ToSlash(sub) + ". Further partial checkouts of the same ref go into the same tree — fetch " +
+			filepath.ToSlash(sub) + ". The files in the directories ABOVE it came along (composer.json, " +
+			"package.json and the like) — a project cannot be built without them. Further partial checkouts " +
+			"of the same ref go into the same tree — fetch " +
 			"everything the project needs to build BEFORE you start working, because every checkout redraws the " +
 			"baseline commit and would swallow your changes. " + hint
 	}
@@ -200,6 +225,7 @@ func Checkout(ctx context.Context, gc *Client, projectID int, ref, subPath, work
 		SubPath:   sub,
 		LocalPath: destDir,
 		Files:     files,
+		Evicted:   verdraengt,
 		Hint:      hint,
 	}, nil
 }
@@ -299,14 +325,14 @@ func initGitBaseline(ctx context.Context, dir string) {
 // The textual test for ".." and absolute paths stays, but as a clear early
 // error rather than as the thing containment rests on. Same reasoning as
 // internal/sandboxfs and internal/target/github.
-func extractTarGzInto(r io.Reader, destDir string) (files int, err error) {
+func extractTarGzInto(r io.Reader, rootDir, sub string) (files int, err error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return 0, fmt.Errorf("read archive: %w", err)
 	}
 	defer gz.Close()
 
-	root, err := os.OpenRoot(destDir)
+	root, err := os.OpenRoot(rootDir)
 	if err != nil {
 		return 0, err
 	}
@@ -336,6 +362,22 @@ func extractTarGzInto(r io.Reader, destDir string) (files int, err error) {
 			continue // the shell directory itself
 		}
 		rel := parts[1]
+		// Auf den Repository-Pfad normalisieren, egal was der Server liefert.
+		//
+		// Bei ?path=stupla/public trägt GitLabs Archiv den VOLLEN Pfad:
+		// "projname-ref-sha/stupla/public/index.php". Abgestreift wurde nur die
+		// Hülle, geschrieben wurde nach rootDir/stupla/public — und die Dateien
+		// landeten unter stupla/public/stupla/public/. Gemerkt hat es ein Agent
+		// daran, dass public/index.php fehlte, nach zwei Abrufen von 5703
+		// Dateien.
+		//
+		// Andersherum kann derselbe Aufruf auch schon zugeschnitten
+		// zurückkommen. Beide Fälle enden hier gleich: der Pfad ist relativ zur
+		// Wurzel des Repositorys, und genau dorthin wird ausgepackt. Das ist
+		// zugleich, was Teil-Abrufe zu EINEM Arbeitsbaum zusammenwachsen lässt.
+		if sub != "" && rel != sub && !strings.HasPrefix(rel, sub+string(filepath.Separator)) {
+			rel = filepath.Join(sub, rel)
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := root.MkdirAll(rel, 0o755); err != nil {
@@ -379,4 +421,75 @@ func extractTarGzInto(r io.Reader, destDir string) (files int, err error) {
 // permitted" alone says nothing about which archive entry caused it.
 func unsafePath(name string, err error) error {
 	return fmt.Errorf("unsafe path in the archive: %q: %w", name, err)
+}
+
+// wurzelDateienMax begrenzt, was ein Teil-Abruf zusätzlich holt: je Ebene
+// höchstens so viele Dateien, und keine größer als das Limit. Es geht um
+// Bau-Dateien — composer.json, package.json, artisan, Makefile —, nicht um
+// einen zweiten Weg, ein Repository vollständig zu ziehen.
+const (
+	wurzelDateienJeEbene = 50
+	wurzelDateiMaxBytes  = 8 << 20
+)
+
+// holeElternDateien holt die Dateien, die ÜBER dem abgerufenen Unterbaum
+// liegen — je Ebene die Blobs, nicht die Unterverzeichnisse.
+//
+// Der Anlass: `checkout {"path":"stupla/app"}` lieferte den Unterbaum und keine
+// einzige Datei aus `stupla/` — kein artisan, kein composer.json, kein
+// composer.lock. Ein PHP-Projekt lässt sich daraus nicht bauen, und man merkt
+// es beim ersten `composer install`. Der Ausweg, den ein Agent gefunden hat,
+// ist der unangenehme Teil: er rief den vollen Abruf auf, WISSEND dass er am
+// Größenlimit scheitert — das Archiv wird vorher entpackt, und der Abbruch ließ
+// einen abgeschnittenen Baum zurück, der die Wurzeldateien hatte. Ein Rezept,
+// das auf einem absichtlichen Fehlschlag steht, sollte niemand aufschreiben
+// müssen.
+//
+// Fehler sind hier nicht tödlich: der Unterbaum steht bereits, und ein
+// Verzeichnis, das die API nicht hergibt, ist kein Grund, den ganzen Abruf zu
+// verwerfen.
+func holeElternDateien(ctx context.Context, gc *Client, projectID int, ref, sub, rootDir string) int {
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return 0
+	}
+	defer root.Close()
+
+	var geholt int
+	teile := strings.Split(filepath.ToSlash(sub), "/")
+	// Von der Wurzel bis zur Ebene ÜBER dem Unterbaum. Der Unterbaum selbst
+	// kam mit dem Archiv.
+	for i := 0; i < len(teile); i++ {
+		ebene := strings.Join(teile[:i], "/")
+		eintraege, err := gc.ListTree(ctx, projectID, ebene, ref, false)
+		if err != nil {
+			continue
+		}
+		var n int
+		for _, e := range eintraege {
+			if e.Type != "blob" || n >= wurzelDateienJeEbene {
+				continue
+			}
+			daten, err := gc.RawFile(ctx, projectID, e.Path, ref, wurzelDateiMaxBytes)
+			if err != nil {
+				continue
+			}
+			if ebene != "" {
+				if err := root.MkdirAll(ebene, 0o755); err != nil {
+					continue
+				}
+			}
+			f, err := root.OpenFile(filepath.FromSlash(e.Path), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+			if err != nil {
+				continue
+			}
+			_, werr := f.Write(daten)
+			cerr := f.Close()
+			if werr == nil && cerr == nil {
+				n++
+				geholt++
+			}
+		}
+	}
+	return geholt
 }

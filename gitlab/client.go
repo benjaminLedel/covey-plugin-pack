@@ -579,6 +579,42 @@ func (c *Client) ListTree(ctx context.Context, projectID int, path, ref string, 
 	return out, err
 }
 
+// RawFile holt eine Datei roh, mit einem Limit, das der Aufrufer setzt.
+//
+// Getrennt von ReadFile, weil die beiden verschiedene Fragen beantworten:
+// ReadFile liefert Text für den Agenten und schneidet bei maxReadFileBytes ab
+// (mit "truncated": true, damit niemand mit einer halben Datei weiterarbeitet).
+// RawFile schreibt in den Arbeitsbaum — da ist eine abgeschnittene Datei kein
+// Hinweis, sondern ein Schaden, und deshalb gibt es hier statt eines
+// Abschneidens einen Fehler.
+func (c *Client) RawFile(ctx context.Context, projectID int, filePath, ref string, max int64) ([]byte, error) {
+	path := fmt.Sprintf("/projects/%d/repository/files/%s/raw", projectID, url.QueryEscape(filePath))
+	if ref != "" {
+		path += "?ref=" + url.QueryEscape(ref)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/v4"+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("PRIVATE-TOKEN", c.Token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("gitlab GET %s: HTTP %d: %.300s", path, resp.StatusCode, data)
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("%s is larger than %d bytes", filePath, max)
+	}
+	return data, nil
+}
+
 // maxReadFileBytes caps a single file read via read_file.
 const maxReadFileBytes = 512 << 10 // 512 KB
 
