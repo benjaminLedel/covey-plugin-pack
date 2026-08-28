@@ -25,6 +25,10 @@ These used to live inside Covey's own repository, compiled in from `internal/`. 
 
 **Manifest plugins** (`manifests/`, JSON — no Go, no rebuild): Redmine, Gitea/Forgejo, OpenProject. These are listed in the [catalogue](https://github.com/benjaminLedel/covey-plugins) and installed at runtime.
 
+**WebAssembly modules** (`wasm/`): `zammad`, `vulndb` and `k8s` exist a second time, as modules published through the [catalogue](https://github.com/benjaminLedel/covey-plugins) and installed at runtime like a manifest. The same three systems, in the form that carries the strongest promise: a module has no socket, no filesystem and never sees the credential. It says `GET /tickets/7`, and the host adds the base URL and the token the organisation stored — which is why a module cannot leak one. It has none, and nothing to leak it through.
+
+`wasm/covey/plugin.go` is the guest side of that protocol. It is vendored rather than imported, on purpose: a plugin must not depend on Covey in order to be built. [covey-plugin-template](https://github.com/benjaminLedel/covey-plugin-template) carries the same file and is where a module of your own starts.
+
 ## Using it
 
 The default Covey build already includes the compiled ones. To build a Covey with a different set, blank-import what you want:
