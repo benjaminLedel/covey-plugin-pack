@@ -159,11 +159,7 @@ type Issue struct {
 	// sprint). An agent running a whole undertaking needs the title to recognise
 	// what belongs to its assignment; GitLab returns null when the issue is
 	// attached to no milestone.
-	Milestone *struct {
-		Title   string `json:"title"`
-		DueDate string `json:"due_date"`
-		State   string `json:"state"`
-	} `json:"milestone"`
+	Milestone *MilestoneRef `json:"milestone"`
 	// Author is the reporter: whoever wrote the need down is the natural
 	// recipient of the merge request that settles it.
 	Author struct {
@@ -174,6 +170,18 @@ type Issue struct {
 	References struct {
 		Full string `json:"full"`
 	} `json:"references"`
+}
+
+// MilestoneRef is the milestone as it hangs off an issue or a merge request:
+// the few fields that say which undertaking the item belongs to and how it
+// stands. The full record is Milestone (milestone.go) — this is what GitLab
+// nests into the item itself, and ID is carried because it is the handle every
+// re-attachment needs.
+type MilestoneRef struct {
+	ID      int    `json:"id"`
+	Title   string `json:"title"`
+	DueDate string `json:"due_date"`
+	State   string `json:"state"`
 }
 
 type Project struct {
@@ -284,9 +292,15 @@ func (c *Client) GetIssue(ctx context.Context, projectID, issueIID int) (Issue, 
 // CreateIssue — POST /projects/{id}/issues: files a new issue (ticket). For the
 // intake of bug reports that do NOT come from GitLab itself (reported by email,
 // say) — the agent turns the report into a traceable ticket. title is
-// mandatory; description (Markdown), labels (comma-separated) and assignee (a
-// user id, 0 = no assignment) are optional.
-func (c *Client) CreateIssue(ctx context.Context, projectID int, title, description, labels string, assigneeID int) (Issue, error) {
+// mandatory; description (Markdown), labels (comma-separated), assignee (a
+// user id, 0 = no assignment) and milestoneID (0 = no milestone) are optional.
+//
+// The milestone is filed WITH the issue rather than attached afterwards
+// because the two-step version has a gap in the middle: between creating and
+// attaching, the new ticket is in nobody's undertaking, and a delivery agent
+// whose run ends in that gap leaves work that no milestone report will ever
+// count.
+func (c *Client) CreateIssue(ctx context.Context, projectID int, title, description, labels string, assigneeID, milestoneID int) (Issue, error) {
 	body := map[string]any{"title": title}
 	if description != "" {
 		body["description"] = description
@@ -296,6 +310,9 @@ func (c *Client) CreateIssue(ctx context.Context, projectID int, title, descript
 	}
 	if assigneeID != 0 {
 		body["assignee_ids"] = []int{assigneeID}
+	}
+	if milestoneID != 0 {
+		body["milestone_id"] = milestoneID
 	}
 	var out Issue
 	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/projects/%d/issues", projectID), body, &out)
@@ -751,7 +768,11 @@ type MergeRequest struct {
 	UpdatedAt    string   `json:"updated_at"`
 	WebURL       string   `json:"web_url"`
 	Labels       []string `json:"labels"`
-	Author       struct {
+	// Milestone as on Issue: a merge request belongs to an undertaking too, and
+	// a delivery agent reading the state of a milestone needs to see the change
+	// it just made instead of asking again.
+	Milestone *MilestoneRef `json:"milestone"`
+	Author    struct {
 		Username string `json:"username"`
 	} `json:"author"`
 	// References.Full is the full reference "group/project!iid" — the project
@@ -763,8 +784,11 @@ type MergeRequest struct {
 
 // ListMergeRequests — GET /projects/{id}/merge_requests. state is "opened",
 // "merged", "closed" or "all" (default: all); search filters on title and
-// description, targetBranch on the target branch.
-func (c *Client) ListMergeRequests(ctx context.Context, projectID int, state, search, targetBranch string) ([]MergeRequest, error) {
+// description, targetBranch on the target branch, milestone on the milestone
+// TITLE (as with ListIssues — that is the filter with which an agent grasps a
+// whole undertaking, and without it the merge requests of a milestone could
+// only be found by listing everything and matching by hand).
+func (c *Client) ListMergeRequests(ctx context.Context, projectID int, state, search, targetBranch, milestone string) ([]MergeRequest, error) {
 	q := url.Values{}
 	if state != "" && state != "all" {
 		q.Set("state", state)
@@ -774,6 +798,9 @@ func (c *Client) ListMergeRequests(ctx context.Context, projectID int, state, se
 	}
 	if targetBranch != "" {
 		q.Set("target_branch", targetBranch)
+	}
+	if milestone != "" {
+		q.Set("milestone", milestone)
 	}
 	q.Set("order_by", "updated_at")
 	q.Set("per_page", "50")
