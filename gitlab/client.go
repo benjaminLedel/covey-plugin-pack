@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -95,6 +96,34 @@ func (c *Client) doHeaders(ctx context.Context, method, path string, body any, o
 //
 // Only the interpretation is added; the original text stays, because it is the
 // evidence.
+// APIError is a non-2xx answer from GitLab with the status kept separate from
+// the message. It exists because one caller has to REACT to a status rather
+// than report it: a 404 from the project-scoped milestone endpoint does not
+// mean "no such milestone", it means "not one of this project's own" — and an
+// ancestor group's milestone, which is a perfectly legal value to attach, is
+// found only by looking somewhere else (see MilestoneByID). Matching that on
+// the message text would break the moment GitLab rewords it.
+//
+// Error() reproduces the previous wording unchanged; nothing that only prints
+// the error notices the difference.
+type APIError struct {
+	Method string
+	Path   string
+	Status int
+	Hint   string
+	Body   string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("gitlab %s %s: HTTP %d%s: %.300s", e.Method, e.Path, e.Status, e.Hint, e.Body)
+}
+
+// notFound reports whether an error is GitLab's 404.
+func notFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+}
+
 func httpErr(method, path string, status int, data []byte) error {
 	hint := ""
 	switch {
@@ -108,7 +137,7 @@ func httpErr(method, path string, status int, data []byte) error {
 	case status == http.StatusForbidden:
 		hint = " — the token is valid, but its scope does not cover this action"
 	}
-	return fmt.Errorf("gitlab %s %s: HTTP %d%s: %.300s", method, path, status, hint, data)
+	return &APIError{Method: method, Path: path, Status: status, Hint: hint, Body: string(data)}
 }
 
 // isMergeRequestDecision spots the endpoints on which GitLab uses 401 as "not
@@ -799,8 +828,12 @@ func (c *Client) ListMergeRequests(ctx context.Context, projectID int, state, se
 	if targetBranch != "" {
 		q.Set("target_branch", targetBranch)
 	}
-	if milestone != "" {
-		q.Set("milestone", milestone)
+	// Trimmed, unlike the other filters here: this one is matched by GitLab as
+	// an EXACT title, so a stray leading space does not narrow the result, it
+	// empties it — and an empty list reads to an agent as "this milestone has
+	// no merge requests" rather than as a typo.
+	if m := strings.TrimSpace(milestone); m != "" {
+		q.Set("milestone", m)
 	}
 	q.Set("order_by", "updated_at")
 	q.Set("per_page", "50")

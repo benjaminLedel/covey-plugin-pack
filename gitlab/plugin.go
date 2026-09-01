@@ -222,14 +222,20 @@ var sigWritingActions = map[string]bool{
 	"approve_mr":           true,
 	"merge_mr":             true,
 	"escalate":             true,
-	// The milestone actions write system notes onto the item ("changed
-	// milestone to %X") — set_milestone on an issue or an MR is therefore just
-	// as much the agent's own activity as set_labels next door.
-	// create_milestone/update_milestone touch the milestone rather than an
-	// item, but they land in the same activity feed the signature reads.
-	"create_milestone": true,
-	"update_milestone": true,
-	"set_milestone":    true,
+	// set_milestone writes a system note onto the item ("changed milestone to
+	// %X") and moves its updated_at — the agent's own activity, exactly like
+	// set_labels next door.
+	//
+	// create_milestone and update_milestone are deliberately NOT in here. The
+	// signature is read per ITEM (project + iid + highest note id, and the
+	// issue's updated_at); cutting a milestone or moving its due date writes
+	// on no issue and on no merge request, so it changes nothing the signature
+	// looks at. Listing them would be worse than the omission this list warns
+	// about above: a run that only touched a milestone would advance the
+	// watermark, and everything that arrived from outside during that run
+	// counts as handled and wakes nobody again. An action missing here costs a
+	// superfluous wake-up; an action wrongly here loses one.
+	"set_milestone": true,
 }
 
 // WritesWorkSignature (target.SignatureWriter) answers whether an executed
@@ -1276,7 +1282,14 @@ var aktionen = map[string]aktion{
 			return nil, fmt.Errorf("give issue_iid OR mr_iid, not both")
 		}
 		// 0 is GitLab's "no milestone" — reached only through detach, never by
-		// leaving the field out.
+		// leaving the field out. Detach TOGETHER with a milestone is refused
+		// rather than resolved one way: the two say opposite things, and
+		// letting detach win would hand the agent the destructive one of the
+		// two silently — the very thing the flag exists to prevent.
+		if in.Detach && (in.MilestoneID != 0 || strings.TrimSpace(in.Milestone) != "") {
+			return nil, fmt.Errorf("detach removes the milestone — do not give one as well; " +
+				"drop detach to attach, drop the milestone to remove it")
+		}
 		milestoneID := 0
 		if !in.Detach {
 			m, err := resolveMilestone(ctx, gc, in)
@@ -1296,15 +1309,25 @@ var aktionen = map[string]aktion{
 // title — into the milestone. Both are accepted because the two halves of an
 // agent's world disagree: its brief and list_issues speak titles, while
 // everything GitLab writes needs the id.
+//
+// Giving BOTH is refused rather than silently ranked. A precedence rule would
+// mean that update_milestone {"milestone_id":77,"milestone":"Altlasten"}
+// quietly edits milestone 77 while the agent believes it named "Altlasten" —
+// and nothing in the answer would tell it otherwise, because an agent that
+// thinks it acted on a title has no reason to read the title back.
 func resolveMilestone(ctx context.Context, gc *Client, in aktionsParams) (Milestone, error) {
 	if in.ProjectID == 0 {
 		return Milestone{}, fmt.Errorf("project_id missing")
 	}
-	if in.MilestoneID != 0 {
-		return gc.GetMilestone(ctx, in.ProjectID, in.MilestoneID)
-	}
-	if strings.TrimSpace(in.Milestone) != "" {
-		return gc.FindMilestone(ctx, in.ProjectID, in.Milestone)
+	title := strings.TrimSpace(in.Milestone)
+	switch {
+	case in.MilestoneID != 0 && title != "":
+		return Milestone{}, fmt.Errorf("give milestone (the title) OR milestone_id, not both — "+
+			"milestone_id %d and title %q may name different milestones", in.MilestoneID, title)
+	case in.MilestoneID != 0:
+		return gc.MilestoneByID(ctx, in.ProjectID, in.MilestoneID)
+	case title != "":
+		return gc.FindMilestone(ctx, in.ProjectID, title)
 	}
 	return Milestone{}, fmt.Errorf("milestone (the title) or milestone_id missing")
 }
@@ -1387,7 +1410,7 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    narrow it with path), read_file {"project_id":N,"file_path":"path/to/file","ref":"...","offset":0} reads a single file
    (512 kB at a time; if "truncated" is true, fetch the rest with "offset": <next_offset> — a lock file read
    only halfway builds a project that nobody can reproduce),
-   create_issue {"project_id":N,"title":"...","description":"... (Markdown)","labels":"bug,intake (optional)","assignee":"gitlab-username (optional)"} —
+   create_issue {"project_id":N,"title":"...","description":"... (Markdown)","labels":"bug,intake (optional)","assignee":"gitlab-username (optional)","milestone":"Title (optional, or milestone_id:N)"} —
    files a NEW ticket; use it to turn a bug report that does NOT come from GitLab (reported by email, say) into a
    traceable issue. It needs a project_id — if you do not know the target project for certain, DO NOT GUESS:
    ask the reporter which project the fault belongs to (list_projects shows you the projects available to you),
@@ -1524,16 +1547,21 @@ const promptDocMilestones = `   Milestone actions (planning an undertaking):
    set_milestone {"project_id":N,"issue_iid":N,"milestone":"Title"} puts an EXISTING issue into a milestone —
    this is how work gets into an undertaking. Give "mr_iid" instead of "issue_iid" to do the same to a merge
    request (exactly one of the two, never both). Instead of the title you may give {"milestone_id":N} — the "id"
-   from list_milestones, never the "iid". To take an item OUT of its milestone, give {"detach":true} and no
-   milestone; leaving the field out is an error, not a removal, so that a forgotten field cannot silently unfile
-   a ticket. The answer is the updated issue/MR, so you see the state reached instead of asking again.
+   from list_milestones, never the "iid"; both forms reach the same milestones, group ones included. Give the
+   title OR the id, never both: they can name different milestones, and guessing which you meant is not this
+   action's job. To take an item OUT of its milestone, give {"detach":true} and no milestone; leaving the field
+   out is an error, not a removal, so that a forgotten field cannot silently unfile a ticket, and detach together
+   WITH a milestone is refused for the same reason. The answer is the updated issue/MR, so you see the state
+   reached instead of asking again.
    create_milestone {"project_id":N,"title":"...","description":"... (optional)","due_date":"YYYY-MM-DD (optional)",
-   "start_date":"YYYY-MM-DD (optional)"} creates a new milestone,
+   "start_date":"YYYY-MM-DD (optional)"} creates a new milestone. Titles are unique per project, so a second call
+   with the same title FAILS instead of returning the existing one — this action is not idempotent. On a
+   recurring run, check with list_milestones first whether the milestone is already there.
    update_milestone {"project_id":N,"milestone":"Title","description":"...","due_date":"YYYY-MM-DD",
-   "state":"close"|"activate"} changes an existing one. Every field is optional and what you leave out stays as
-   it is — so a date correction does not cost the description. A consequence worth knowing: you can MOVE a due
-   date but not clear it from here. Renaming needs {"milestone_id":N,"title":"new name"} — with only a title given
-   there would be no way to tell which milestone you mean from what you want it called.
+   "start_date":"YYYY-MM-DD","state":"close"|"activate"} changes an existing one. Every field is optional and what
+   you leave out stays as it is — so a date correction does not cost the description. A consequence worth knowing:
+   you can MOVE a due date but not clear it from here. Renaming needs {"milestone_id":N,"title":"new name"} — with
+   only a title given there would be no way to tell which milestone you mean from what you want it called.
    There is no delete: a milestone that is over gets state "close", which keeps its issues and its history.
    You can also file a new issue straight into an undertaking — create_issue takes "milestone":"Title"
    (or "milestone_id":N) along. Prefer that to creating and attaching in two steps: between the two the ticket

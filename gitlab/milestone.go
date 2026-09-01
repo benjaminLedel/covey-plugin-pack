@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -86,15 +87,44 @@ func checkMilestoneDate(field, value string) error {
 	return nil
 }
 
+const (
+	// milestonePageSize is GitLab's maximum for per_page.
+	milestonePageSize = 100
+	// milestoneMaxPages bounds the walk at 1000 milestones — far past any real
+	// project, and a stop so a broken pagination cannot loop.
+	milestoneMaxPages = 10
+)
+
 // ListMilestones — GET /projects/{id}/milestones. state is "active", "closed"
 // or "all" (default: all), search narrows by title/description.
 //
-// includeParent takes the milestones of the parent GROUP along. It is off by
-// default because it costs the caller nothing to ask for and changes what
-// "belongs to this project" means; it is on wherever a title has to be
-// resolved (FindMilestone), because a group milestone attached to a project's
-// issues is otherwise invisible from here and the resolution would report a
-// milestone as missing that is plainly there in the UI.
+// includeParent takes the milestones of the ancestor GROUPS along. It is off
+// by default because it changes what "belongs to this project" means; it is on
+// wherever a milestone has to be resolved (FindMilestone, MilestoneByID),
+// because a group milestone attached to a project's issues is otherwise
+// invisible from here and the resolution would report a milestone as missing
+// that is plainly there in the UI.
+//
+// The parameter is spelled include_parent_milestones, which GitLab deprecated
+// in 16.7 in favour of include_ancestors. The old name is deliberate: it works
+// from 13.4 to today, while the new one is ignored by every self-hosted
+// instance older than 16.7 — and an ignored parameter here does not fail, it
+// makes group milestones silently vanish. The two are not documented as
+// combinable, so they are not sent together. Swap the name over once the
+// oldest GitLab this plugin has to serve is 16.7.
+//
+// PAGINATED, unlike the first version of this function. Its neighbour
+// ListIssues carries the incident report for the one-page mistake (74 of 174
+// issues missing, invisible); a project with more than 100 milestones is rarer
+// but include_parent in a deep group hierarchy reaches the cap, and the
+// failure mode is worse here: FindMilestone would report "no milestone titled
+// X" for one that plainly exists.
+//
+// A failure mid-walk returns the error rather than the pages already
+// collected — ListIssues does the opposite on purpose (a triage run wants 100
+// of 174 issues rather than none), but a partial list here would let a
+// resolution answer "does not exist" about a milestone that was merely on the
+// page that failed. That is the one answer this function must never invent.
 func (c *Client) ListMilestones(ctx context.Context, projectID int, state, search string, includeParent bool) ([]Milestone, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("project_id missing")
@@ -113,11 +143,61 @@ func (c *Client) ListMilestones(ctx context.Context, projectID int, state, searc
 	if includeParent {
 		q.Set("include_parent_milestones", "true")
 	}
-	q.Set("per_page", "100")
-	var out []Milestone
-	err = c.do(ctx, http.MethodGet,
-		fmt.Sprintf("/projects/%d/milestones?%s", projectID, q.Encode()), nil, &out)
-	return out, err
+	q.Set("per_page", strconv.Itoa(milestonePageSize))
+
+	out := []Milestone{}
+	for page := 1; page <= milestoneMaxPages; page++ {
+		q.Set("page", strconv.Itoa(page))
+		var pageItems []Milestone
+		if err := c.do(ctx, http.MethodGet,
+			fmt.Sprintf("/projects/%d/milestones?%s", projectID, q.Encode()), nil, &pageItems); err != nil {
+			return nil, err
+		}
+		out = append(out, pageItems...)
+		// A short page is the last page — GitLab has no more to give.
+		if len(pageItems) < milestonePageSize {
+			break
+		}
+	}
+	return out, nil
+}
+
+// MilestoneByID resolves a milestone by its GLOBAL id — including one that
+// belongs to an ancestor group.
+//
+// The direct endpoint is not enough on its own. GET /projects/{id}/milestones/
+// {milestone_id} is project-scoped and answers 404 for a group milestone,
+// while GitLab's WRITING side accepts exactly that id: attaching resolves
+// milestone_id against the project's milestones plus those of its ancestor
+// groups. Without the fallback the plugin refuses an operation GitLab supports,
+// and — worse — refuses it only in the by-id form while the by-title form of
+// the same operation succeeds, though the two are documented as
+// interchangeable.
+//
+// The direct call stays first because it is one request and covers the normal
+// case; the list is only walked when it comes back 404.
+func (c *Client) MilestoneByID(ctx context.Context, projectID, milestoneID int) (Milestone, error) {
+	m, err := c.GetMilestone(ctx, projectID, milestoneID)
+	if err == nil {
+		return m, nil
+	}
+	if !notFound(err) {
+		return Milestone{}, err
+	}
+	all, listErr := c.ListMilestones(ctx, projectID, "all", "", true)
+	if listErr != nil {
+		// The 404 is the more informative of the two here — the fallback
+		// failing says nothing about the milestone that was asked for.
+		return Milestone{}, err
+	}
+	for _, cand := range all {
+		if cand.ID == milestoneID {
+			return cand, nil
+		}
+	}
+	return Milestone{}, fmt.Errorf("no milestone with id %d reachable from project %d — "+
+		"neither its own nor an ancestor group's. NOTE that milestone_id is the \"id\" "+
+		"from list_milestones, not the \"iid\"%s", milestoneID, projectID, milestoneCandidates(all))
 }
 
 // GetMilestone — GET /projects/{id}/milestones/{milestone_id}.

@@ -55,15 +55,21 @@ func newMilestoneServer(t *testing.T, ms []Milestone) *milestoneServer {
 				out = append(out, m)
 			}
 			json.NewEncoder(w).Encode(out)
-		// A single milestone by id.
+		// A single milestone by id. PROJECT-SCOPED, like the real endpoint: a
+		// group milestone is answered with 404 here even though it is a legal
+		// value for milestone_id when attaching. The first version of this
+		// double served group milestones from this path too, and that is
+		// exactly why the missing fallback shipped — a fake more generous than
+		// production cannot fail the test that would have caught it.
 		case r.Method == http.MethodGet:
 			for _, m := range s.Milestones {
-				if strings.HasSuffix(r.URL.Path, "/milestones/"+strconv.Itoa(m.ID)) {
+				if strings.HasSuffix(r.URL.Path, "/milestones/"+strconv.Itoa(m.ID)) && m.GroupID == 0 {
 					json.NewEncoder(w).Encode(m)
 					return
 				}
 			}
 			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "404 Not found"})
 		// Writing: the milestone endpoints answer with a milestone, the
 		// issue/MR endpoints with the updated item.
 		case strings.Contains(r.URL.Path, "/milestones"):
@@ -175,6 +181,138 @@ func TestSetMilestoneRejectsAmbiguousTargets(t *testing.T) {
 	}
 }
 
+// TestMilestoneByIDReachesGroupMilestones: the project-scoped GET answers 404
+// for an ancestor group's milestone, but GitLab's writing side accepts that
+// same id when attaching. Without the fallback the plugin refused an operation
+// GitLab supports — and refused it only in the by-id form, while by title the
+// identical call went through, though the doc calls the two interchangeable.
+func TestMilestoneByIDReachesGroupMilestones(t *testing.T) {
+	s := newMilestoneServer(t, testMilestones())
+
+	// 91 is the group milestone. The direct endpoint 404s, the list finds it.
+	execMilestone(t, s, "set_milestone", `{"project_id":40,"issue_iid":1,"milestone_id":91}`)
+	if got := int(s.Body["milestone_id"].(float64)); got != 91 {
+		t.Fatalf("a group milestone must be attachable by id: %d", got)
+	}
+	// By title the same milestone, so the two addressing modes agree.
+	execMilestone(t, s, "set_milestone", `{"project_id":40,"issue_iid":1,"milestone":"Bundesdruckerei"}`)
+	if got := int(s.Body["milestone_id"].(float64)); got != 91 {
+		t.Fatalf("by title and by id must reach the same milestone: %d", got)
+	}
+
+	// An id that exists nowhere still fails — and the message points at the
+	// iid, because that is the mistake actually being made.
+	err := execMilestoneErr(t, s, "set_milestone", `{"project_id":40,"issue_iid":1,"milestone_id":4}`)
+	if !strings.Contains(err.Error(), "iid") {
+		t.Fatalf("an unreachable id should name the id/iid trap: %v", err)
+	}
+}
+
+// TestResolveMilestoneRefusesBothForms: milestone_id and a title together used
+// to be ranked silently, so update_milestone {"milestone_id":77,
+// "milestone":"Altlasten"} edited 77 while the agent believed it had named
+// "Altlasten". Nothing in the answer would have told it.
+func TestResolveMilestoneRefusesBothForms(t *testing.T) {
+	s := newMilestoneServer(t, testMilestones())
+	for _, action := range []string{"set_milestone", "update_milestone", "get_milestone"} {
+		params := `{"project_id":40,"issue_iid":1,"milestone_id":77,"milestone":"Altlasten","state":"close"}`
+		err := execMilestoneErr(t, s, action, params)
+		if !strings.Contains(err.Error(), "not both") {
+			t.Fatalf("%s must refuse both forms at once: %v", action, err)
+		}
+	}
+	// create_issue takes the same route.
+	execMilestoneErr(t, s, "create_issue",
+		`{"project_id":40,"title":"X","milestone_id":77,"milestone":"Altlasten"}`)
+}
+
+// TestSetMilestoneDetachWithMilestoneRefused: detach and a named milestone say
+// opposite things. Letting detach win handed the agent the destructive one of
+// the two silently — the very thing the flag exists to prevent.
+func TestSetMilestoneDetachWithMilestoneRefused(t *testing.T) {
+	s := newMilestoneServer(t, testMilestones())
+	for _, params := range []string{
+		`{"project_id":40,"issue_iid":819,"detach":true,"milestone":"NLC App"}`,
+		`{"project_id":40,"issue_iid":819,"detach":true,"milestone_id":77}`,
+	} {
+		err := execMilestoneErr(t, s, "set_milestone", params)
+		if !strings.Contains(err.Error(), "detach") {
+			t.Fatalf("the error must name the contradiction: %v", err)
+		}
+	}
+}
+
+// TestListMilestonesPaginates: the one-page mistake its neighbour ListIssues
+// carries an incident report for (74 of 174 issues missing, invisible). Here
+// the failure would be worse than a short list: FindMilestone would report a
+// milestone that plainly exists as non-existent.
+func TestListMilestonesPaginates(t *testing.T) {
+	var pages []string
+	many := make([]Milestone, 0, 250)
+	for i := 1; i <= 250; i++ {
+		many = append(many, Milestone{ID: i, Title: "M" + strconv.Itoa(i), State: "active"})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		pages = append(pages, q.Get("page"))
+		if q.Get("per_page") != "100" {
+			t.Errorf("per_page must be GitLab's maximum: %s", q.Get("per_page"))
+		}
+		page, _ := strconv.Atoi(q.Get("page"))
+		if page <= 0 {
+			page = 1
+		}
+		from := (page - 1) * 100
+		if from > len(many) {
+			from = len(many)
+		}
+		to := from + 100
+		if to > len(many) {
+			to = len(many)
+		}
+		json.NewEncoder(w).Encode(many[from:to])
+	}))
+	defer srv.Close()
+
+	res, err := System{}.Execute(context.Background(), "list_milestones",
+		[]byte(`{"project_id":40}`), target.Credential{BaseURL: srv.URL, Token: "t"})
+	if err != nil {
+		t.Fatalf("list_milestones: %v", err)
+	}
+	if ms := res.([]Milestone); len(ms) != 250 {
+		t.Fatalf("all 250 milestones have to come back, got %d", len(ms))
+	}
+	if len(pages) != 3 || pages[0] != "1" || pages[2] != "3" {
+		t.Fatalf("the walk must ask page by page and stop on the short page: %v", pages)
+	}
+}
+
+// TestListMilestonesFailureIsNotAPartialList: a partial list would let a
+// resolution answer "does not exist" about a milestone that was merely on the
+// page that failed — the one answer this must never invent. Deliberately the
+// opposite of ListIssues, which prefers 100 of 174 issues to none.
+func TestListMilestonesFailureIsNotAPartialList(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls > 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		full := make([]Milestone, 100)
+		for i := range full {
+			full[i] = Milestone{ID: i + 1, Title: "M" + strconv.Itoa(i+1)}
+		}
+		json.NewEncoder(w).Encode(full)
+	}))
+	defer srv.Close()
+
+	if _, err := (System{}).Execute(context.Background(), "list_milestones",
+		[]byte(`{"project_id":40}`), target.Credential{BaseURL: srv.URL, Token: "t"}); err == nil {
+		t.Fatal("a failure on page 2 must be an error, not a silently short list")
+	}
+}
+
 // TestFindMilestoneErrors: a title that does not exist and a title that is
 // ambiguous both have to fail loudly. Picking one of two candidates would
 // attach work to the wrong undertaking, and nothing afterwards shows it.
@@ -236,6 +374,9 @@ func TestCreateMilestone(t *testing.T) {
 	}
 	if s.Body["title"] != "NLC App 2" || s.Body["due_date"] != "2026-12-31" || s.Body["start_date"] != "2026-10-01" {
 		t.Fatalf("the fields do not arrive (struct tags?): %+v", s.Body)
+	}
+	if s.Body["description"] != "Zweite Ausbaustufe" {
+		t.Fatalf("the description does not arrive: %+v", s.Body)
 	}
 
 	err := execMilestoneErr(t, s, "create_milestone", `{"project_id":40,"title":"X","due_date":"31.12.2026"}`)
@@ -332,6 +473,27 @@ func TestListMilestones(t *testing.T) {
 	}
 	execMilestoneErr(t, s, "list_milestones", `{"project_id":40,"state":"merged"}`)
 	execMilestoneErr(t, s, "list_milestones", `{}`)
+
+	// search has to reach GitLab under its own name — it is what keeps
+	// FindMilestone's lookup narrow, and a dropped or renamed parameter would
+	// only show up as a mysteriously slow, occasionally wrong resolution.
+	execMilestone(t, s, "list_milestones", `{"project_id":40,"search":"NLC"}`)
+	if !strings.Contains(s.Query, "search=NLC") {
+		t.Fatalf("search must reach the query: %s", s.Query)
+	}
+}
+
+// TestGetMilestoneRequiresBothIDs: the zero-id guard. Without it a missing
+// milestone_id would build the path /projects/40/milestones/0 and ask GitLab
+// about a milestone that cannot exist.
+func TestGetMilestoneRequiresBothIDs(t *testing.T) {
+	s := newMilestoneServer(t, testMilestones())
+	if _, err := NewClient(s.URL, "t").GetMilestone(context.Background(), 40, 0); err == nil {
+		t.Fatal("milestone_id 0 must be refused before the request")
+	}
+	if _, err := NewClient(s.URL, "t").GetMilestone(context.Background(), 0, 77); err == nil {
+		t.Fatal("project_id 0 must be refused before the request")
+	}
 }
 
 // TestCreateIssueWithMilestone: filing straight into an undertaking, so there
@@ -383,19 +545,28 @@ func TestListMergeRequestsByMilestone(t *testing.T) {
 }
 
 // TestMilestoneActionsCountAsWriting: the control plane reads this to tell an
-// agent's own activity from someone else's. A writing action missing here
-// makes the agent take its own milestone change for foreign activity and wake
-// itself once more for it.
+// agent's own activity from someone else's.
+//
+// The line runs between actions that touch an ITEM and actions that touch the
+// milestone. The signature is per item (project + iid + highest note id, plus
+// the issue's updated_at), so set_milestone counts — it leaves a system note
+// on the issue or MR — while create_milestone and update_milestone do not:
+// they write on no item at all.
+//
+// The asymmetry is deliberate and the reason is in the cost. An action missing
+// from the list costs a superfluous wake-up ("noisy, not endless"). An action
+// wrongly IN it advances the watermark, and everything that arrived from
+// outside during that run is thereby marked as handled and wakes nobody again
+// — a lost wake-up. So when in doubt, out.
 func TestMilestoneActionsCountAsWriting(t *testing.T) {
 	sys := System{}
-	for _, a := range []string{"create_milestone", "update_milestone", "set_milestone"} {
-		if !sys.WritesWorkSignature("gitlab:" + a) {
-			t.Errorf("%s writes the work signature and has to be registered as such", a)
-		}
+	if !sys.WritesWorkSignature("gitlab:set_milestone") {
+		t.Error("set_milestone writes a system note on the item and has to be registered as writing")
 	}
-	for _, a := range []string{"list_milestones", "get_milestone"} {
+	for _, a := range []string{"create_milestone", "update_milestone", "list_milestones", "get_milestone"} {
 		if sys.WritesWorkSignature("gitlab:" + a) {
-			t.Errorf("%s only reads and must not count as writing", a)
+			t.Errorf("%s touches no issue and no merge request — counting it as writing "+
+				"advances the watermark and swallows foreign comments from the same run", a)
 		}
 	}
 }
