@@ -24,7 +24,7 @@ func init() {
 		},
 		Name:        "gitlab",
 		Label:       "GitLab",
-		Description: "GitLab issues as the working set: find issues (list_projects/list_issues, by milestone too), file externally reported bugs as a ticket (create_issue), maintain the working state on the board (set_labels/assign), check out source code, set the project up and verify bugs against the code (checkout + sandbox shell), read screenshots/images attached to issues (download_upload + vision), attach your own screenshots to an MR/an issue (upload + comment_mr), develop fixes — commit onto a feature branch (commit), open a merge request to your manager (create_merge_request, optionally with a QA agent as reviewer) and live the review loop: on every heartbeat run check open MRs for new review feedback (list_merge_requests/list_mr_notes/comment_mr), diagnose red CI yourself (list_pipelines/list_pipeline_jobs/get_job_log) and react to the merge. Usable as a QA/test agent too: test others' MRs in which you are entered as reviewer end to end, give feedback and, where assigned, close the acceptance with the merge (set_reviewer/approve_mr/merge_mr, nur-wenn: gitlab:review). Intake through HEARTBEAT.md (polling), auth by API token (the secrets gitlab_token + gitlab_url).",
+		Description: "GitLab issues as the working set: find issues (list_projects/list_issues, by milestone too), file externally reported bugs as a ticket (create_issue), maintain the working state on the board (set_labels/assign), plan an undertaking as a delivery lead — cut a milestone, move its date, close it and above all put tickets and merge requests into it (list_milestones/create_milestone/update_milestone/set_milestone), check out source code, set the project up and verify bugs against the code (checkout + sandbox shell), read screenshots/images attached to issues (download_upload + vision), attach your own screenshots to an MR/an issue (upload + comment_mr), develop fixes — commit onto a feature branch (commit), open a merge request to your manager (create_merge_request, optionally with a QA agent as reviewer) and live the review loop: on every heartbeat run check open MRs for new review feedback (list_merge_requests/list_mr_notes/comment_mr), diagnose red CI yourself (list_pipelines/list_pipeline_jobs/get_job_log) and react to the merge. Usable as a QA/test agent too: test others' MRs in which you are entered as reviewer end to end, give feedback and, where assigned, close the acceptance with the merge (set_reviewer/approve_mr/merge_mr, nur-wenn: gitlab:review). Intake through HEARTBEAT.md (polling), auth by API token (the secrets gitlab_token + gitlab_url).",
 		Kind:        "builtin",
 		Category:    target.CategoryCode,
 		Scopes:      []string{"read", "write", "comment", "merge"},
@@ -48,6 +48,17 @@ func init() {
    tools explicitly in ACCESS.md (tools: without merge_mr) or rules the subject
    gitlab:merge_mr by a guard rail — with "ask" every merge goes through the
    Approvals page.
+   The milestone actions (create_milestone, update_milestone, set_milestone)
+   sit under the same scope write. A DELIVERY LEAD that plans but does not
+   develop therefore needs write — and should be cut down to what it actually
+   does with the tool list, because otherwise the same scope also opens
+   commit and create_merge_request to it:
+   - system: gitlab scope: read,write,comment
+     tools: list_projects, list_issues, get_issue, list_notes, get_note,
+            comment, set_labels, assign, list_milestones, get_milestone,
+            create_milestone, update_milestone, set_milestone
+   In GitLab itself reporter is enough for this — managing milestones does
+   not need developer. So a planning agent gets a token that cannot push.
 
 4. Intake by heartbeat (GitLab has no webhook — the agent takes up work
    exclusively by polling) — two separate entries in the agent's
@@ -211,6 +222,20 @@ var sigWritingActions = map[string]bool{
 	"approve_mr":           true,
 	"merge_mr":             true,
 	"escalate":             true,
+	// set_milestone writes a system note onto the item ("changed milestone to
+	// %X") and moves its updated_at — the agent's own activity, exactly like
+	// set_labels next door.
+	//
+	// create_milestone and update_milestone are deliberately NOT in here. The
+	// signature is read per ITEM (project + iid + highest note id, and the
+	// issue's updated_at); cutting a milestone or moving its due date writes
+	// on no issue and on no merge request, so it changes nothing the signature
+	// looks at. Listing them would be worse than the omission this list warns
+	// about above: a run that only touched a milestone would advance the
+	// watermark, and everything that arrived from outside during that run
+	// counts as handled and wakes nobody again. An action missing here costs a
+	// superfluous wake-up; an action wrongly here loses one.
+	"set_milestone": true,
 }
 
 // WritesWorkSignature (target.SignatureWriter) answers whether an executed
@@ -748,6 +773,17 @@ type aktionsParams struct {
 	Milestone  string `json:"milestone"`
 	Ref        string `json:"ref"`
 	Assigned   bool   `json:"assigned"`
+	// The milestone actions. MilestoneID is the GLOBAL id (the "id" field of a
+	// milestone, not its "iid" — see the note on the Milestone type); Milestone
+	// above doubles as the title, which is what an agent usually has to hand.
+	// Detach is the explicit "into no milestone": without it, an omitted
+	// milestone would have to mean both "leave it alone" and "take it off",
+	// and an agent that simply forgot the field would silently unfile a ticket.
+	MilestoneID   int    `json:"milestone_id"`
+	Detach        bool   `json:"detach"`
+	DueDate       string `json:"due_date"`
+	StartDate     string `json:"start_date"`
+	IncludeParent bool   `json:"include_parent"`
 	// set_labels works additively/subtractively instead of overwriting the
 	// whole list — otherwise every state change takes the subject-matter labels
 	// along with it.
@@ -889,7 +925,7 @@ var aktionen = map[string]aktion{
 		if in.ProjectID == 0 {
 			return nil, fmt.Errorf("project_id missing")
 		}
-		return gc.ListMergeRequests(ctx, in.ProjectID, in.State, in.Search, in.Target)
+		return gc.ListMergeRequests(ctx, in.ProjectID, in.State, in.Search, in.Target, in.Milestone)
 	},
 	"get_merge_request": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
 		if in.ProjectID == 0 || in.MRIID == 0 {
@@ -1095,7 +1131,15 @@ var aktionen = map[string]aktion{
 			}
 			assigneeID = u.ID
 		}
-		return gc.CreateIssue(ctx, in.ProjectID, in.Title, in.Description, in.Labels, assigneeID)
+		milestoneID := 0
+		if in.MilestoneID != 0 || strings.TrimSpace(in.Milestone) != "" {
+			m, err := resolveMilestone(ctx, gc, in)
+			if err != nil {
+				return nil, err
+			}
+			milestoneID = m.ID
+		}
+		return gc.CreateIssue(ctx, in.ProjectID, in.Title, in.Description, in.Labels, assigneeID, milestoneID)
 	},
 	"list_notes": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
 		if in.ProjectID == 0 || in.IssueIID == 0 {
@@ -1188,6 +1232,104 @@ var aktionen = map[string]aktion{
 		}
 		return nil, gc.Escalate(ctx, in.ProjectID, in.IssueIID, note)
 	},
+	"list_milestones": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
+		ms, err := gc.ListMilestones(ctx, in.ProjectID, in.State, in.Search, in.IncludeParent)
+		if err != nil {
+			return nil, err
+		}
+		if ms == nil {
+			ms = []Milestone{}
+		}
+		return ms, nil
+	},
+	"get_milestone": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
+		return resolveMilestone(ctx, gc, in)
+	},
+	"create_milestone": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
+		return gc.CreateMilestone(ctx, in.ProjectID, in.Title, in.Description, in.DueDate, in.StartDate)
+	},
+	"update_milestone": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
+		m, err := resolveMilestone(ctx, gc, in)
+		if err != nil {
+			return nil, err
+		}
+		if m.GroupID != 0 {
+			return nil, fmt.Errorf("milestone %q (id %d) belongs to a group, not to project %d — "+
+				"a group milestone can only be changed in the group; from here you can attach items to it, not edit it",
+				m.Title, m.ID, in.ProjectID)
+		}
+		// The title is the identifier the agent resolved by, so it must not
+		// double as the new title: update_milestone {"milestone":"X"} would
+		// otherwise mean "rename X to X". Renaming goes through milestone_id.
+		edit := MilestoneEdit{Description: in.Description, DueDate: in.DueDate,
+			StartDate: in.StartDate, State: in.State}
+		if in.MilestoneID != 0 {
+			edit.Title = in.Title
+		} else if strings.TrimSpace(in.Title) != "" {
+			return nil, fmt.Errorf("renaming needs milestone_id — with only a title given, " +
+				"the plugin cannot tell which milestone you mean and what you want it called")
+		}
+		return gc.UpdateMilestone(ctx, in.ProjectID, m.ID, edit)
+	},
+	"set_milestone": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
+		if in.ProjectID == 0 {
+			return nil, fmt.Errorf("project_id missing")
+		}
+		if in.IssueIID == 0 && in.MRIID == 0 {
+			return nil, fmt.Errorf("issue_iid or mr_iid missing")
+		}
+		if in.IssueIID != 0 && in.MRIID != 0 {
+			return nil, fmt.Errorf("give issue_iid OR mr_iid, not both")
+		}
+		// 0 is GitLab's "no milestone" — reached only through detach, never by
+		// leaving the field out. Detach TOGETHER with a milestone is refused
+		// rather than resolved one way: the two say opposite things, and
+		// letting detach win would hand the agent the destructive one of the
+		// two silently — the very thing the flag exists to prevent.
+		if in.Detach && (in.MilestoneID != 0 || strings.TrimSpace(in.Milestone) != "") {
+			return nil, fmt.Errorf("detach removes the milestone — do not give one as well; " +
+				"drop detach to attach, drop the milestone to remove it")
+		}
+		milestoneID := 0
+		if !in.Detach {
+			m, err := resolveMilestone(ctx, gc, in)
+			if err != nil {
+				return nil, err
+			}
+			milestoneID = m.ID
+		}
+		if in.MRIID != 0 {
+			return gc.SetMRMilestone(ctx, in.ProjectID, in.MRIID, milestoneID)
+		}
+		return gc.SetIssueMilestone(ctx, in.ProjectID, in.IssueIID, milestoneID)
+	},
+}
+
+// resolveMilestone turns whatever the agent gave — a numeric milestone_id or a
+// title — into the milestone. Both are accepted because the two halves of an
+// agent's world disagree: its brief and list_issues speak titles, while
+// everything GitLab writes needs the id.
+//
+// Giving BOTH is refused rather than silently ranked. A precedence rule would
+// mean that update_milestone {"milestone_id":77,"milestone":"Altlasten"}
+// quietly edits milestone 77 while the agent believes it named "Altlasten" —
+// and nothing in the answer would tell it otherwise, because an agent that
+// thinks it acted on a title has no reason to read the title back.
+func resolveMilestone(ctx context.Context, gc *Client, in aktionsParams) (Milestone, error) {
+	if in.ProjectID == 0 {
+		return Milestone{}, fmt.Errorf("project_id missing")
+	}
+	title := strings.TrimSpace(in.Milestone)
+	switch {
+	case in.MilestoneID != 0 && title != "":
+		return Milestone{}, fmt.Errorf("give milestone (the title) OR milestone_id, not both — "+
+			"milestone_id %d and title %q may name different milestones", in.MilestoneID, title)
+	case in.MilestoneID != 0:
+		return gc.MilestoneByID(ctx, in.ProjectID, in.MilestoneID)
+	case title != "":
+		return gc.FindMilestone(ctx, in.ProjectID, title)
+	}
+	return Milestone{}, fmt.Errorf("milestone (the title) or milestone_id missing")
 }
 
 func (System) Execute(ctx context.Context, action string, params json.RawMessage, cred target.Credential) (any, error) {
@@ -1213,7 +1355,7 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 // the developer playbook need write, the QA/reviewer playbook needs merge. The
 // action catalogue and the rules for bug reports apply to everyone.
 func (System) PromptDoc() string {
-	return promptDocActions + promptDocDeveloper + promptDocIssues + promptDocReviewer
+	return promptDocActions + promptDocDeveloper + promptDocMilestones + promptDocIssues + promptDocReviewer
 }
 
 // PromptDocForScopes (target.ScopedDocSystem) narrows the doc to the scopes
@@ -1229,7 +1371,7 @@ func (System) PromptDocForScopes(scopes []string) string {
 	}
 	doc := promptDocActions
 	if granted["write"] {
-		doc += promptDocDeveloper
+		doc += promptDocDeveloper + promptDocMilestones
 	}
 	doc += promptDocIssues
 	if granted["merge"] {
@@ -1268,7 +1410,7 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    narrow it with path), read_file {"project_id":N,"file_path":"path/to/file","ref":"...","offset":0} reads a single file
    (512 kB at a time; if "truncated" is true, fetch the rest with "offset": <next_offset> — a lock file read
    only halfway builds a project that nobody can reproduce),
-   create_issue {"project_id":N,"title":"...","description":"... (Markdown)","labels":"bug,intake (optional)","assignee":"gitlab-username (optional)"} —
+   create_issue {"project_id":N,"title":"...","description":"... (Markdown)","labels":"bug,intake (optional)","assignee":"gitlab-username (optional)","milestone":"Title (optional, or milestone_id:N)"} —
    files a NEW ticket; use it to turn a bug report that does NOT come from GitLab (reported by email, say) into a
    traceable issue. It needs a project_id — if you do not know the target project for certain, DO NOT GUESS:
    ask the reporter which project the fault belongs to (list_projects shows you the projects available to you),
@@ -1303,7 +1445,15 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    list_branches {"project_id":N,"search":"..."} lists branches (the default branch is marked — do not guess branch names),
    list_commits {"project_id":N,"ref":"...","path":"file/or/directory","since":"ISO date"} lists the commit history
    (all filters optional), get_commit {"project_id":N,"sha":"..."} returns a commit's diff,
-   list_merge_requests {"project_id":N,"state":"opened"|"merged"|"closed"|"all","search":"...","target_branch":"..."},
+   list_merge_requests {"project_id":N,"state":"opened"|"merged"|"closed"|"all","search":"...","target_branch":"...","milestone":"..."}
+   (milestone is the milestone TITLE, exactly as with list_issues — that is how you see the merge requests of a
+   whole undertaking instead of matching them by hand),
+   list_milestones {"project_id":N,"state":"active"|"closed"|"all","search":"...","include_parent":true|false} lists the
+   milestones of a project — the undertakings issues and merge requests hang off. include_parent also takes the
+   milestones of the parent GROUP along (a group milestone spans several projects and is otherwise invisible here),
+   get_milestone {"project_id":N,"milestone":"Title"} or {"project_id":N,"milestone_id":N} returns a single one with
+   its dates and state. NOTE the two numbers a milestone carries: "id" is the one every other action wants,
+   "iid" is only its number within the project. Where a milestone_id is asked for, it is always the "id",
    get_merge_request {"project_id":N,"mr_iid":N} returns a single MR with its review state (detailed_merge_status,
    has_conflicts) and CI result (head_pipeline), list_mr_notes {"project_id":N,"mr_iid":N,"limit":N,"page":N} an MR's
    discussion state (review comments) — windowed exactly like list_notes,
@@ -1385,6 +1535,40 @@ const promptDocDeveloper = `   Writing developer actions:
    then comment the result in the associated issue; if it was closed without a merge (state="closed"),
    check why with list_mr_notes and escalate if that is unclear. Before every MR answer, check with list_mr_notes
    whether you have already reacted to the current state — that way recurring runs do not work on anything twice.
+`
+
+// promptDocMilestones needs the write scope: the actions that change a
+// milestone or an item's place in one. Its own block rather than a paragraph
+// in promptDocDeveloper, because this is planning work and not development —
+// a delivery lead uses exactly these and none of the commit/merge-request
+// ones, and a developer agent should not have to read the planning procedure
+// on every turn to find its commit syntax.
+const promptDocMilestones = `   Milestone actions (planning an undertaking):
+   set_milestone {"project_id":N,"issue_iid":N,"milestone":"Title"} puts an EXISTING issue into a milestone —
+   this is how work gets into an undertaking. Give "mr_iid" instead of "issue_iid" to do the same to a merge
+   request (exactly one of the two, never both). Instead of the title you may give {"milestone_id":N} — the "id"
+   from list_milestones, never the "iid"; both forms reach the same milestones, group ones included. Give the
+   title OR the id, never both: they can name different milestones, and guessing which you meant is not this
+   action's job. To take an item OUT of its milestone, give {"detach":true} and no milestone; leaving the field
+   out is an error, not a removal, so that a forgotten field cannot silently unfile a ticket, and detach together
+   WITH a milestone is refused for the same reason. The answer is the updated issue/MR, so you see the state
+   reached instead of asking again.
+   create_milestone {"project_id":N,"title":"...","description":"... (optional)","due_date":"YYYY-MM-DD (optional)",
+   "start_date":"YYYY-MM-DD (optional)"} creates a new milestone. Titles are unique per project, so a second call
+   with the same title FAILS instead of returning the existing one — this action is not idempotent. On a
+   recurring run, check with list_milestones first whether the milestone is already there.
+   update_milestone {"project_id":N,"milestone":"Title","description":"...","due_date":"YYYY-MM-DD",
+   "start_date":"YYYY-MM-DD","state":"close"|"activate"} changes an existing one. Every field is optional and what
+   you leave out stays as it is — so a date correction does not cost the description. A consequence worth knowing:
+   you can MOVE a due date but not clear it from here. Renaming needs {"milestone_id":N,"title":"new name"} — with
+   only a title given there would be no way to tell which milestone you mean from what you want it called.
+   There is no delete: a milestone that is over gets state "close", which keeps its issues and its history.
+   You can also file a new issue straight into an undertaking — create_issue takes "milestone":"Title"
+   (or "milestone_id":N) along. Prefer that to creating and attaching in two steps: between the two the ticket
+   belongs to no milestone, and a run that ends there leaves work no milestone report will count.
+   A GROUP milestone (one spanning several projects) you can attach items to from here, but not edit — that
+   happens in the group. list_milestones {"include_parent":true} shows you which ones those are.
+
 `
 
 // promptDocIssues applies to everyone: how to find your working set and how to
