@@ -50,6 +50,10 @@ type fakeJira struct {
 	users       []map[string]any // what /user/…/search answers
 	userQueries []string         // the queries it was asked, in order
 	numericIDs  bool             // ids as numbers, the way some Cloud responses send them
+	reject401   bool             // every API call answers 401 — the token is dead
+	pats        []map[string]any // the PAT list (Data Center only)
+	noPATAPI    bool             // an instance that has the PAT API switched off
+	revoked     []string         // PAT ids deleted
 
 	srv *httptest.Server
 }
@@ -100,6 +104,14 @@ func (f *fakeJira) handle(w http.ResponseWriter, r *http.Request) {
 	f.authHeader = r.Header.Get("Authorization")
 	f.mu.Unlock()
 
+	if strings.HasPrefix(r.URL.Path, "/rest/pat/") {
+		f.patEndpoint(w, r)
+		return
+	}
+	if f.reject401 {
+		http.Error(w, `{"errorMessages":["Unauthorized (401)"]}`, http.StatusUnauthorized)
+		return
+	}
 	prefix := "/rest/api/" + f.version()
 	if !strings.HasPrefix(r.URL.Path, prefix) {
 		// A call against the other deployment's version is the mistake worth
@@ -287,6 +299,44 @@ func (f *fakeJira) issueEndpoint(w http.ResponseWriter, r *http.Request, rest st
 	default:
 		f.t.Errorf("unexpected issue call %s %s", r.Method, r.URL.Path)
 		http.Error(w, `{"errorMessages":["unexpected"]}`, http.StatusNotFound)
+	}
+}
+
+// patEndpoint is the Data Center PAT API: list, create, delete. Timestamps
+// come the way Jira writes them — a zone without a colon.
+func (f *fakeJira) patEndpoint(w http.ResponseWriter, r *http.Request) {
+	if f.cloud || f.noPATAPI {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rest := strings.TrimPrefix(r.URL.Path, "/rest/pat/latest/tokens")
+	switch {
+	case r.Method == http.MethodGet && rest == "":
+		f.json(w, f.pats)
+	case r.Method == http.MethodPost && rest == "":
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		id := strconv.Itoa(100 + len(f.pats))
+		tok := map[string]any{
+			"id": 100 + len(f.pats), "name": body["name"],
+			"createdAt": "2026-09-02T10:00:00.000+0000", "expiringAt": "2027-09-02T10:00:00.000+0000",
+		}
+		f.pats = append(f.pats, tok)
+		out := map[string]any{}
+		for k, v := range tok {
+			out[k] = v
+		}
+		out["rawToken"] = "minted-" + id
+		w.WriteHeader(http.StatusCreated)
+		f.json(w, out)
+	case r.Method == http.MethodDelete && strings.HasPrefix(rest, "/"):
+		f.revoked = append(f.revoked, strings.TrimPrefix(rest, "/"))
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		f.t.Errorf("unexpected PAT call %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", http.StatusNotFound)
 	}
 }
 

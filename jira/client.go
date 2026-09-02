@@ -139,7 +139,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &apiError{status: resp.StatusCode, method: method, path: path, body: data}
+		err := &apiError{status: resp.StatusCode, method: method, path: path, body: data}
+		if resp.StatusCode == http.StatusUnauthorized {
+			// A 401 is about the credential, not the request: the token has
+			// expired, been revoked, or was never right. Said so, the host
+			// marks the stored secret instead of filing the failure under
+			// the action — where it reads as a permission problem three
+			// weeks later. A 403 stays an apiError: that is a permission.
+			return &target.CredentialRejectedError{Status: resp.StatusCode, Err: err}
+		}
+		return err
 	}
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		return json.Unmarshal(data, out)
