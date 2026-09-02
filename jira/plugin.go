@@ -45,6 +45,12 @@ func init() {
    jira_token = covey-bot@acme.example:<API token>        (Cloud)
               | <personal access token>                    (Server/Data Center)
 
+   Both kinds expire. A Cloud API token lives a year at most and has to be
+   renewed BY HAND (Atlassian offers no API for it) — covey shows the expiry
+   you enter on the secret and warns ahead of it. A Data Center PAT covey can
+   renew itself: it reads the expiry from the instance and mints the successor
+   with the token before it runs out.
+
    The shape of the token decides which of the two deployments is spoken to —
    a pair with a colon is Cloud, a single value is a personal access token.
    An installation where that inference is wrong writes it out:
