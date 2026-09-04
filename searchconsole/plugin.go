@@ -21,14 +21,18 @@ func init() {
 			"were submitted and what Google made of them (sitemaps), and which properties the credential can " +
 			"see at all (list_sites). The action that pays for the rest is inspect_url: it answers a question " +
 			"no amount of reading the page can — Google chose a DIFFERENT canonical than the one declared, a " +
-			"fault invisible from outside that quietly costs the address. Read-only; there is nothing here " +
-			"worth writing. Auth by Google service account (the secret searchconsole_token holds the whole JSON " +
-			"key file, searchconsole_url the property).",
+			"fault invisible from outside that quietly costs the address. Reading is the whole of the read " +
+			"scope; the write scope adds exactly one action, submit_sitemap, for the case an agent can " +
+			"otherwise only report: a sitemap Google does not have. Auth by Google service account (the secret " +
+			"searchconsole_token holds the whole JSON key file, searchconsole_url the property).",
 		Kind:     "builtin",
 		Category: target.CategoryOther,
-		// One scope. The API this plugin speaks has no write side worth
-		// having, and a "write" that nothing implements is furniture.
-		Scopes: []string{"read"},
+		// Two scopes, and read is by far the larger of them. The write scope
+		// buys exactly one action — telling Google about a sitemap — and it is
+		// separate so that an agent which only measures can be given a
+		// credential that literally cannot write: the OAuth scope is chosen
+		// per action, not once per plugin (see client.go).
+		Scopes: []string{"read", "write"},
 		System: System{},
 		SetupDoc: `1. In Google Cloud, in a project of your choice:
    - Enable the "Google Search Console API" (APIs & Services → Library).
@@ -53,7 +57,13 @@ func init() {
                          https://example.com/       (URL prefix, with slash)
 
 4. Enable in the agent's ACCESS.md:
-   - system: searchconsole scope: read
+   - system: searchconsole scope: read          (measuring only)
+   - system: searchconsole scope: read,write    (may also submit a sitemap)
+
+   The difference is not a wording: with scope read the plugin asks Google for
+   the read-only OAuth scope, and the access token an action runs with cannot
+   write. To forbid the one write action while keeping the scope, a guard rail
+   on searchconsole:submit_sitemap does it.
 
 5. No heartbeat entry of its own. Search Console is not a source of work —
    its report changes once a day at best, and there is no event to react to.
@@ -97,6 +107,8 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		return c.inspectURL(ctx, in)
 	case "sitemaps":
 		return c.sitemaps(ctx, in)
+	case "submit_sitemap":
+		return c.submitSitemap(ctx, in)
 	default:
 		return nil, fmt.Errorf("unknown action %q", strings.TrimSpace(action))
 	}
@@ -128,8 +140,11 @@ func (System) Probe(ctx context.Context, cred target.Credential) (string, error)
 		map[bool]string{true: "y", false: "ies"}[len(namen) == 1], strings.Join(namen, ", ")), nil
 }
 
-func (System) PromptDoc() string {
-	return `searchconsole — what Google did with your pages (read-only).
+// The prompt doc in two halves: what measuring can do, and the one action that
+// changes something. They are split because the doc stands in the context of
+// every turn — an agent that may not submit a sitemap should not read about
+// one on each of them.
+const promptDocLesen = `searchconsole — what Google did with your pages.
 
 You can read a page yourself; you cannot see what a search engine made of it.
 That is what this system is for. It reports with a delay of two to three days,
@@ -154,12 +169,52 @@ so the last days of any window are incomplete.
       query / page / country / device / date, also combined
       (["page","query"] tells you which query brought people to which page).
       Without dates: the last 28 days, ending three days ago.
+      Add "page" or "query" to ask about one of them instead of all:
+        {"page":"https://example.com/a/page","dimensions":["query"]}
+      is the question "what brings people HERE, and at what position" — one
+      cheap answer instead of a report over the whole site that you then throw
+      away. Both filters match exactly, not by substring.
 
   sitemaps {}
       Which sitemaps were submitted, when they were last read, and what
-      errors Google found in them.
+      errors Google found in them. Watch for the case where the list is
+      shorter than what the site actually offers: a sitemap that is only
+      announced in robots.txt may never have arrived here.
+`
 
-What this is NOT: it does not change anything, and it says nothing about
-rankings you could influence directly. A position is an observation, not a
-target. Report what you see; do not promise what it will become.`
+const promptDocSchreiben = `
+  submit_sitemap {"feedpath":"https://example.com/sitemap-index.xml"}
+      Tells Google about a sitemap. The only thing here that changes anything,
+      and it is additive: nothing is removed, and there is no action that
+      removes one — that is a decision for a person.
+      Use it when "sitemaps" shows a file missing that the site really offers.
+      Submitting one that is already there is harmless. Google fetches it in
+      the following hours or days; lastDownloaded staying empty for a while is
+      not a fault, and re-submitting does not make it faster.
+`
+
+const promptDocSchluss = `
+What this is NOT: it says nothing about rankings you could influence directly.
+A position is an observation, not a target. Report what you see; do not
+promise what it will become.`
+
+func (System) PromptDoc() string {
+	return promptDocLesen + promptDocSchreiben + promptDocSchluss
+}
+
+// PromptDocForScopes (target.ScopedDocSystem) narrows the doc to the scopes
+// granted in ACCESS.md. Fail-open: without scopes the full doc stands — a
+// missing entry must not silently take a capability away from an agent.
+func (System) PromptDocForScopes(scopes []string) string {
+	if len(scopes) == 0 {
+		return System{}.PromptDoc()
+	}
+	doc := promptDocLesen
+	for _, s := range scopes {
+		if strings.EqualFold(strings.TrimSpace(s), "write") {
+			doc += promptDocSchreiben
+			break
+		}
+	}
+	return doc + promptDocSchluss
 }

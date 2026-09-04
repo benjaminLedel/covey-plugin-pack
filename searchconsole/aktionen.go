@@ -88,6 +88,14 @@ func (c *Client) searchAnalytics(ctx context.Context, in Eingabe) (any, error) {
 	if in.Typ != "" {
 		rumpf["type"] = in.Typ
 	}
+	// Filters. The question an SEO agent actually has is about ONE address:
+	// which queries bring people to it, and at what position. Without a filter
+	// that means reporting over the whole property and throwing away all but
+	// one page — on a site with 190 addresses the rows that matter fall off
+	// the end of the row limit before anybody sees them.
+	if filter := in.filter(); len(filter) > 0 {
+		rumpf["dimensionFilterGroups"] = []map[string]any{{"filters": filter}}
+	}
 
 	var out struct {
 		Rows []Zeile `json:"rows"`
@@ -101,7 +109,11 @@ func (c *Client) searchAnalytics(ctx context.Context, in Eingabe) (any, error) {
 		"start_date": von,
 		"end_date":   bis,
 		"dimensions": dims,
-		"rows":       out.Rows,
+		"filter": map[string]string{
+			"page":  in.Page,
+			"query": in.Query,
+		},
+		"rows": out.Rows,
 		// Search Console holds data back for two to three days. Without this
 		// note an agent reports "traffic collapsed" every time it looks at
 		// yesterday.
@@ -211,6 +223,78 @@ func (c *Client) sitemaps(ctx context.Context, in Eingabe) (any, error) {
 	return map[string]any{"site_url": seite, "sitemaps": out.Sitemap}, nil
 }
 
+// submitSitemap tells Google about a sitemap. The one action in this plugin
+// that changes anything at a search engine.
+//
+// It exists because of a finding an agent could otherwise only report: a
+// property where a single, outdated sitemap was submitted while the current
+// ones were merely announced in robots.txt. Seeing that and being unable to
+// act on it turns a two-second fix into a ticket.
+//
+// There is deliberately no counterpart that deletes one. Removing a sitemap is
+// a judgement about what a site offers, and nothing an agent should reach on
+// its own; adding one it can defend with the file itself.
+func (c *Client) submitSitemap(ctx context.Context, in Eingabe) (any, error) {
+	seite, err := c.eigenschaft(in.SiteURL)
+	if err != nil {
+		return nil, err
+	}
+	feed := strings.TrimSpace(in.Feedpath)
+	if feed == "" {
+		return nil, fmt.Errorf("feedpath missing — the full address of the sitemap, " +
+			"e.g. \"https://example.com/sitemap-index.xml\"")
+	}
+	if err := gehoertZurProperty(feed, seite); err != nil {
+		return nil, err
+	}
+
+	pfad := "/webmasters/v3/sites/" + url.PathEscape(seite) + "/sitemaps/" + url.PathEscape(feed)
+	if err := c.schreib(ctx, "PUT", pfad, nil, nil); err != nil {
+		return nil, err
+	}
+
+	// Read the list back. Google answers a submission with an empty body, and
+	// "no error" is a thinner statement than the entry itself — whoever reads
+	// this should see WHAT is now submitted, not be told that nothing went
+	// wrong.
+	stand, _ := c.sitemaps(ctx, in)
+	return map[string]any{
+		"submitted": feed,
+		"site_url":  seite,
+		"hinweis": "Submitted. Google fetches it within the next hours to days; " +
+			"lastDownloaded stays empty until it does, and that is not a fault.",
+		"sitemaps": stand,
+	}, nil
+}
+
+// gehoertZurProperty refuses a sitemap that does not belong to the property
+// being worked on.
+//
+// The API would take it and answer with an error of its own, but the mistake
+// worth catching here is the other one: a plausible address from somewhere
+// else entirely, taken from a task text or a page the agent read. A credential
+// that reaches one property has no business announcing another site's files.
+func gehoertZurProperty(feed, property string) error {
+	u, err := url.Parse(feed)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("feedpath %q is not a full address — it has to read like "+
+			"\"https://example.com/sitemap.xml\"", feed)
+	}
+	if rest, ok := strings.CutPrefix(property, "sc-domain:"); ok {
+		domain := strings.ToLower(strings.TrimSpace(rest))
+		host := strings.ToLower(u.Hostname())
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return nil
+		}
+		return fmt.Errorf("the sitemap %q does not belong to the property %q — "+
+			"this credential reaches %s and its subdomains", feed, property, domain)
+	}
+	if strings.HasPrefix(strings.ToLower(feed), strings.ToLower(property)) {
+		return nil
+	}
+	return fmt.Errorf("the sitemap %q does not lie under the property %q", feed, property)
+}
+
 // Eingabe are the parameters of all actions in one struct — the shape the
 // other plugins in this pack use.
 type Eingabe struct {
@@ -224,6 +308,32 @@ type Eingabe struct {
 	Typ           string   `json:"type"`
 	InspectionURL string   `json:"inspection_url"`
 	Sprache       string   `json:"language_code"`
+	Page          string   `json:"page"`
+	Query         string   `json:"query"`
+	Feedpath      string   `json:"feedpath"`
+}
+
+// filter turns the page/query parameters into the API's dimension filters.
+// Both are exact matches on purpose: "contains" reads convenient and answers a
+// different question than the one asked — an agent that means one address
+// should get that address, not everything whose URL happens to contain it.
+func (e Eingabe) filter() []map[string]any {
+	var filter []map[string]any
+	if p := strings.TrimSpace(e.Page); p != "" {
+		filter = append(filter, map[string]any{
+			"dimension":  "page",
+			"operator":   "equals",
+			"expression": p,
+		})
+	}
+	if q := strings.TrimSpace(e.Query); q != "" {
+		filter = append(filter, map[string]any{
+			"dimension":  "query",
+			"operator":   "equals",
+			"expression": q,
+		})
+	}
+	return filter
 }
 
 // zeitraum resolves the period: explicit dates win, otherwise the last N days,

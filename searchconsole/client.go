@@ -37,8 +37,18 @@ const (
 	// back and the pipeline goes red for a finding that is not real.
 	oauthExchange = "https://oauth2.googleapis.com/token"
 	apiBase       = "https://searchconsole.googleapis.com"
-	// The read-only scope. This plugin writes nothing — see PromptDoc.
-	scope = "https://www.googleapis.com/auth/webmasters.readonly"
+	// Two scopes, and the difference matters. Nearly everything this plugin
+	// does is a read, and a read asks for the narrow scope; only
+	// submit_sitemap asks for the wider one.
+	//
+	// The lazy version would be to request the wider scope once and use it for
+	// everything. Then every agent — including one whose ACCESS.md says
+	// `scope: read` — would be holding a token that can write, and "read-only"
+	// would be a sentence in a prompt rather than a property of the
+	// credential. Here a read action's access token cannot submit a sitemap
+	// even if the model tried: Google refuses it.
+	scopeLesen     = "https://www.googleapis.com/auth/webmasters.readonly"
+	scopeSchreiben = "https://www.googleapis.com/auth/webmasters"
 )
 
 // dienstkonto is the part of a Google service-account key file that matters
@@ -71,9 +81,18 @@ type Client struct {
 	// Google's answers.
 	basis string
 
-	mu      sync.Mutex
-	token   string
-	tokenAb time.Time
+	// Access tokens, one per OAuth scope. Keyed by scope and not a single
+	// field, because a token minted for reading is worthless for writing and
+	// caching one over the other would mean re-authenticating on every
+	// alternation.
+	mu     sync.Mutex
+	tokens map[string]zugang
+}
+
+// zugang is one cached access token with the moment it stops being used.
+type zugang struct {
+	wert string
+	ab   time.Time
 }
 
 // NewClient builds the client from the brokered credential:
@@ -104,18 +123,19 @@ func NewClient(cred target.Credential) (*Client, error) {
 		HTTP:     target.Client("searchconsole", 30*time.Second),
 		now:      time.Now,
 		basis:    apiBase,
+		tokens:   map[string]zugang{},
 	}, nil
 }
 
 // accessToken signs a JWT with the service account's key and trades it for an
-// access token. Cached per process and renewed a minute early — the token
-// lives an hour, and a daily audit that fetches one per call would spend more
-// time authenticating than reading.
-func (c *Client) accessToken(ctx context.Context) (string, error) {
+// access token for one scope. Cached per process and per scope, renewed a
+// minute early — the token lives an hour, and a daily audit that fetches one
+// per call would spend more time authenticating than reading.
+func (c *Client) accessToken(ctx context.Context, bereich string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.token != "" && c.now().Before(c.tokenAb) {
-		return c.token, nil
+	if z, ok := c.tokens[bereich]; ok && z.wert != "" && c.now().Before(z.ab) {
+		return z.wert, nil
 	}
 
 	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(c.konto.PrivateKey))
@@ -125,7 +145,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	jetzt := c.now()
 	behauptung := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"iss":   c.konto.ClientEmail,
-		"scope": scope,
+		"scope": bereich,
 		"aud":   c.konto.TokenURI,
 		"iat":   jetzt.Unix(),
 		"exp":   jetzt.Add(time.Hour).Unix(),
@@ -174,14 +194,28 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	if ttl <= 0 {
 		ttl = 3600
 	}
-	c.token = out.AccessToken
-	c.tokenAb = c.now().Add(time.Duration(ttl-60) * time.Second)
-	return c.token, nil
+	c.tokens[bereich] = zugang{
+		wert: out.AccessToken,
+		ab:   c.now().Add(time.Duration(ttl-60) * time.Second),
+	}
+	return out.AccessToken, nil
 }
 
-// ruf sends a request to the API and decodes the answer into ziel.
+// ruf sends a reading request to the API and decodes the answer into ziel.
 func (c *Client) ruf(ctx context.Context, methode, pfad string, rumpf, ziel any) error {
-	token, err := c.accessToken(ctx)
+	return c.anfrage(ctx, scopeLesen, methode, pfad, rumpf, ziel)
+}
+
+// schreib sends the one writing request this plugin has. It is a method of its
+// own rather than a parameter on ruf so that the writing scope appears in
+// exactly one place in the source, and a new call site cannot acquire it by
+// accident.
+func (c *Client) schreib(ctx context.Context, methode, pfad string, rumpf, ziel any) error {
+	return c.anfrage(ctx, scopeSchreiben, methode, pfad, rumpf, ziel)
+}
+
+func (c *Client) anfrage(ctx context.Context, bereich, methode, pfad string, rumpf, ziel any) error {
+	token, err := c.accessToken(ctx, bereich)
 	if err != nil {
 		return err
 	}
