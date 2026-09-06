@@ -2,7 +2,7 @@ package zendesk
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"sort"
 	"strconv"
@@ -174,15 +174,15 @@ func isCustomerChannel(v channel) bool {
 // because the map it comes out of has no order, and a signature that changes when
 // nothing changed wakes agents for nothing.
 //
-// SHA-1 here is a fingerprint of state, not a security decision: what matters is
-// that the string changes when the tickets did, and it is not compared against
-// anything an attacker could steer.
+// The hash is a fingerprint of state, not a security decision: what matters is
+// that the string changes when the tickets did. SHA-256 rather than something
+// shorter because nothing here needs a short string, and a blocklisted primitive
+// in a file nobody rereads is a suppression somebody has to justify every time
+// the scanner runs.
 func signature(waiting []string) string {
 	sorted := append([]string(nil), waiting...)
 	sort.Strings(sorted)
-	// #nosec G401 -- a fingerprint of state, see above. Not a secret and not a
-	// comparison against anything an attacker could steer.
-	h := sha1.New()
+	h := sha256.New()
 	h.Write([]byte(strings.Join(sorted, "|")))
 	return "zendesk:waiting@" + hex.EncodeToString(h.Sum(nil))
 }
