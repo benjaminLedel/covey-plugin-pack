@@ -174,8 +174,52 @@ func (c *Config) mints() bool {
 	return c.ClientID != "" && c.ClientSecret != ""
 }
 
+// Form names the credential the way an operator would name it — the answer Inspect
+// reports, and the one thing about a credential that can be derived without asking
+// the account anything. The words are the same ones minted.kind carries, so there is
+// only one vocabulary for the two OAuth forms in the package.
+func (c *Config) Form() string {
+	switch {
+	case c.RefreshToken != "":
+		return "refresh_token"
+	case c.mints():
+		return "client_credentials"
+	case c.APIToken != "":
+		return "api_token"
+	default:
+		return "access_token"
+	}
+}
+
+// expiry is the plugin's best knowledge of when the access token it holds runs out —
+// "holds" meaning one this process minted. A credential that never minted has no
+// expiry to report, and the caller says so rather than guessing a date.
+func (c *Config) expiry() (time.Time, bool) {
+	if c.minted == nil {
+		return time.Time{}, false
+	}
+	c.minted.mu.Lock()
+	defer c.minted.mu.Unlock()
+	if c.minted.token == "" || c.minted.until.IsZero() {
+		return time.Time{}, false
+	}
+	return c.minted.until, true
+}
+
 // root is the account root the /oauth/tokens endpoint hangs off.
 func (c *Config) root() string { return c.BaseURL }
+
+// host is the account's authority — the host a file URL has to be on before the
+// credential is sent along with it. A ticket attachment can point anywhere, and a
+// bearer token that travels to a host the operator never named is a credential
+// leaving the house for somebody else's logs.
+func (c *Config) host() string {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
 
 // api prefixes an API path with the versioned root. Zendesk accepts both
 // /tickets and /tickets.json; the plugin always writes the .json form, because
@@ -218,15 +262,24 @@ func (c *Config) accessToken(ctx context.Context, client *http.Client) (string, 
 	if m.token != "" && time.Until(m.until) > 30*time.Second {
 		return m.token, nil
 	}
-	body := map[string]any{
-		"grant_type":    m.kind,
-		"client_id":     c.ClientID,
-		"client_secret": c.ClientSecret,
-	}
+	// The two grants are asked for differently. Client credentials takes a flat
+	// request; the refresh grant wants its parameters inside an access_token object —
+	// Zendesk's own shape rather than the RFC's, and a body in the wrong one of the
+	// two is answered with a 422 that reads like a permissions problem.
+	var payload map[string]any
 	if m.kind == "refresh_token" {
-		body["refresh_token"] = c.RefreshToken
+		payload = map[string]any{"access_token": map[string]any{
+			"token":      c.RefreshToken,
+			"grant_type": "refresh_token",
+		}}
+	} else {
+		payload = map[string]any{
+			"grant_type":    "client_credentials",
+			"client_id":     c.ClientID,
+			"client_secret": c.ClientSecret,
+		}
 	}
-	raw, err := json.Marshal(body)
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
@@ -249,8 +302,10 @@ func (c *Config) accessToken(ctx context.Context, client *http.Client) (string, 
 		return "", &apiError{status: resp.StatusCode, method: http.MethodPost, path: "/oauth/tokens", body: data}
 	}
 	var out struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		ExpiresAt    string `json:"expires_at"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
 		return "", fmt.Errorf("zendesk token response: %w", err)
@@ -258,16 +313,30 @@ func (c *Config) accessToken(ctx context.Context, client *http.Client) (string, 
 	if out.AccessToken == "" {
 		return "", fmt.Errorf("zendesk token response carries no access_token: %.200s", data)
 	}
-	// An OAuth client created before April 2026 answers without expires_in — the
-	// token then has no lifetime at all. Caching it for a fixed short span anyway
-	// keeps one behaviour for both kinds of client, and the cost of being wrong is
-	// one token request too many.
-	ttl := 10 * time.Minute
-	if out.ExpiresIn > 0 {
-		ttl = time.Duration(out.ExpiresIn) * time.Second
+	// A refresh answers with a NEW refresh token and burns the old one. It is kept in
+	// memory here, which is the whole of what this plugin can do with it: the rotated
+	// value cannot be written back into the secret store from inside a call. An
+	// installation on the refresh-token form therefore has to let the platform rotate
+	// it (probe.go's Rotate, whose result the control plane stores) — restarting the
+	// process with a burned refresh token is a credential that no longer works, which
+	// is why the setup doc points at client credentials for anything meant to last.
+	if out.RefreshToken != "" {
+		c.RefreshToken = out.RefreshToken
+	}
+	// The expiry is taken from expires_at where the account gives one — that is the
+	// account's own clock and its own idea of the token's life. expires_in is the
+	// fallback, and an account that answers with neither gets a short cache rather
+	// than a token treated as immortal.
+	var until time.Time
+	if at, err := time.Parse(time.RFC3339, out.ExpiresAt); err == nil {
+		until = at
+	} else if out.ExpiresIn > 0 {
+		until = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+	} else {
+		until = time.Now().Add(10 * time.Minute)
 	}
 	m.token = out.AccessToken
-	m.until = time.Now().Add(ttl)
+	m.until = until
 	return m.token, nil
 }
 
