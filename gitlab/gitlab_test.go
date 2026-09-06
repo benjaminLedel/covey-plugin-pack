@@ -3600,3 +3600,99 @@ func TestReadFileOhneRangeUnterstuetzung(t *testing.T) {
 		t.Fatalf("der Anfang wurde nicht abgeschnitten: %.20q", got)
 	}
 }
+
+// TestCheckoutZuGrossLaesstDenBaumStehen hält #14 fest: die Größenprüfung lief
+// erst beim Auspacken, also NACH pruneExceptPreserved. Ein Abbruch meldete
+// damit einen Zustand ohne Seiteneffekt, und der bestehende Arbeitsbaum war
+// trotzdem weg — samt der Fehlermeldung, die als Ausweg einen Teil-Checkout in
+// genau diesen Baum empfiehlt.
+func TestCheckoutZuGrossLaesstDenBaumStehen(t *testing.T) {
+	klein := tarGz(t, map[string]string{
+		"support-main-abc123/":              "",
+		"support-main-abc123/composer.json": `{"name":"support"}`,
+		"support-main-abc123/src/app.php":   "<?php echo 1;",
+	})
+	gross := tarGz(t, map[string]string{
+		"support-main-abc123/":         "",
+		"support-main-abc123/blob.bin": strings.Repeat("x", 2<<20),
+	})
+	archiv := klein
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repository/archive") {
+			w.Write(archiv)
+			return
+		}
+		w.Write([]byte("[]"))
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "test-token"}
+	work := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), work)
+
+	res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":15}`), cred)
+	if err != nil {
+		t.Fatalf("erster Checkout: %v", err)
+	}
+	dir := res.(CheckoutResult).Path
+	vorher := filepath.Join(dir, "composer.json")
+	if _, err := os.Stat(vorher); err != nil {
+		t.Fatalf("der erste Checkout hat nichts hinterlassen: %v", err)
+	}
+
+	// Jetzt derselbe Baum, aber das Archiv sprengt die Grenze.
+	archiv = gross
+	t.Setenv("COVEY_GITLAB_CHECKOUT_MAX_MB", "1")
+	if _, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":15}`), cred); err == nil {
+		t.Fatal("ein zu großes Archiv muss abbrechen")
+	} else if !strings.Contains(err.Error(), "list_tree") {
+		t.Fatalf("der Abbruch soll die Auswege nennen: %v", err)
+	}
+
+	// Der Kern der Sache: der Abbruch darf den Arbeitsbaum nicht mitnehmen.
+	if _, err := os.Stat(vorher); err != nil {
+		t.Fatalf("der bestehende Arbeitsbaum wurde beim Abbruch geräumt: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "src", "app.php")); err != nil {
+		t.Fatalf("auch der Unterbaum muss stehen bleiben: %v", err)
+	}
+}
+
+// TestCheckoutZweimalDerselbePfadVerschachteltNicht hält #15 fest: ein zweiter
+// Teil-Abruf desselben Pfades legte <path>/<path> an, ohne etwas zu sagen.
+func TestCheckoutZweimalDerselbePfadVerschachteltNicht(t *testing.T) {
+	archiv := tarGz(t, map[string]string{
+		"support-main-abc123/":                      "",
+		"support-main-abc123/stupla/artisan":        "#!/usr/bin/env php",
+		"support-main-abc123/stupla/app/Kernel.php": "<?php",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repository/archive") {
+			w.Write(archiv)
+			return
+		}
+		w.Write([]byte("[]"))
+	}))
+	defer srv.Close()
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "test-token"}
+	work := t.TempDir()
+	ctx := target.WithWorkdir(context.Background(), work)
+
+	var dir string
+	for i := 0; i < 2; i++ {
+		res, err := sys.Execute(ctx, "checkout", []byte(`{"project_id":15,"path":"stupla"}`), cred)
+		if err != nil {
+			t.Fatalf("Checkout %d: %v", i+1, err)
+		}
+		dir = res.(CheckoutResult).Path
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stupla", "artisan")); err != nil {
+		t.Fatalf("der Teilbaum gehört nach <repo>/stupla: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stupla", "stupla")); err == nil {
+		t.Fatal("der zweite Abruf desselben Pfades hat verschachtelt: <path>/<path>")
+	}
+}

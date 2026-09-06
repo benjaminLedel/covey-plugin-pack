@@ -102,6 +102,68 @@ func pruneExceptPreserved(dir string) error {
 	return nil
 }
 
+// errTooLarge is the one wording both size checks use — the one before the
+// working tree is touched and the one that still guards the unpacking. An agent
+// that reads two different sentences for the same limit looks for two different
+// causes.
+func errTooLarge(maxBytes int64) error {
+	return fmt.Errorf("archive larger than %d MB — your working tree is untouched. Fetch the parts you need with checkout {\"path\":\"<subdirectory>\"}; they grow into ONE working tree, so fetch everything the project needs to build before you start. If you only want to read, list_tree and read_file do without a checkout entirely. The limit is set by COVEY_GITLAB_CHECKOUT_MAX_MB", maxBytes>>20)
+}
+
+// spoolArchive writes the downloaded archive to a temp file and rewinds it. The
+// file is the price of measuring before acting: gzip cannot be rewound, and the
+// unpacked size is not knowable from anything the response carries.
+func spoolArchive(r io.Reader) (*os.File, error) {
+	f, err := os.CreateTemp("", "covey-checkout-*.tar.gz")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, fmt.Errorf("read archive: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, err
+	}
+	return f, nil
+}
+
+// checkUnpackedSize adds up what the archive would occupy and refuses beyond the
+// cap — reading the spool file and leaving it rewound for the extraction.
+// Directories and symlinks carry no payload and are not counted, exactly as in
+// extractTarGzInto, so both checks agree on the same number.
+func checkUnpackedSize(f *os.File) error {
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("read archive: %w", err)
+	}
+	defer gz.Close()
+	maxBytes := checkoutMaxBytes()
+	var total int64
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read archive: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		total += hdr.Size
+		if total > maxBytes {
+			return errTooLarge(maxBytes)
+		}
+	}
+	_, err = f.Seek(0, io.SeekStart)
+	return err
+}
+
 // checkoutMaxBytes caps the unpacked total size of a checkout — protection of
 // the sandbox against huge repos and zip bombs. Default 512 MB, overridable
 // via COVEY_GITLAB_CHECKOUT_MAX_MB (the daemon's process env).
@@ -176,6 +238,26 @@ func Checkout(ctx context.Context, gc *Client, projectID int, ref, subPath, work
 	}
 	defer body.Close()
 
+	// The size is settled BEFORE anything on disk is touched. It used to be
+	// counted while unpacking, three lines after the working tree had been
+	// emptied — so an oversized archive destroyed the tree it was meant to
+	// replace and reported an abort that sounded like nothing had happened. The
+	// agent then followed the advice in that very message ("fetch the parts you
+	// need with path") into a directory that no longer held a project (#14).
+	//
+	// Knowing it early costs a spool file: the archive is written down once and
+	// read twice, because an archive is only measurable by unpacking it and a
+	// stream cannot be rewound. What that buys is that the failure has no side
+	// effect at all, which is what the message always claimed.
+	spool, err := spoolArchive(body)
+	if err != nil {
+		return CheckoutResult{}, err
+	}
+	defer func() { spool.Close(); os.Remove(spool.Name()) }()
+	if err := checkUnpackedSize(spool); err != nil {
+		return CheckoutResult{}, err
+	}
+
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return CheckoutResult{}, err
 	}
@@ -184,7 +266,7 @@ func Checkout(ctx context.Context, gc *Client, projectID int, ref, subPath, work
 	if err := pruneExceptPreserved(destDir); err != nil {
 		return CheckoutResult{}, err
 	}
-	files, err := extractTarGzInto(body, rootDir, sub)
+	files, err := extractTarGzInto(spool, rootDir, sub)
 	if err != nil {
 		return CheckoutResult{}, err
 	}
@@ -386,7 +468,7 @@ func extractTarGzInto(r io.Reader, rootDir, sub string) (files int, err error) {
 		case tar.TypeReg:
 			total += hdr.Size
 			if total > maxBytes {
-				return 0, fmt.Errorf("archive larger than %d MB — fetch the parts you need with checkout {\"path\":\"<subdirectory>\"}; they grow into ONE working tree, so fetch everything the project needs to build before you start. If you only want to read, list_tree and read_file do without a checkout entirely. The limit is set by COVEY_GITLAB_CHECKOUT_MAX_MB", maxBytes>>20)
+				return 0, errTooLarge(maxBytes)
 			}
 			if dir := filepath.Dir(rel); dir != "." {
 				if err := root.MkdirAll(dir, 0o755); err != nil {
