@@ -699,32 +699,52 @@ func (o ListOptions) filters() int {
 
 // ListTickets reads tickets, most recently active first — which is what an agent
 // working a queue wants, and the order Zendesk's own interface defaults to.
+//
+// **A narrowed list goes through the search endpoint, and that is the whole
+// point of this function.** /tickets.json LISTS tickets; it does not filter
+// them. It takes sorting and paging and ignores everything else — status,
+// group_id, assignee_id, requester_id, organization_id all silently do nothing
+// there. The plugin used to set them anyway, and the consequence was not an
+// error but the wrong answer with a straight face: `list_tickets status=open`
+// came back full of closed tickets, `group=X` returned the tickets of every
+// group, and the queue pinned in the credential — documented as a ceiling —
+// held nothing at all.
+//
+// Found on a live account, where a support agent reported "0 open tickets" from
+// a list of twenty closed ones, and a filter for a group it does not work in
+// returned the same five tickets as no filter.
+//
+// The search endpoint is the one place in the API that answers a narrowed
+// question, so every narrowing is expressed as a query there and the plain list
+// is used only when nothing is being asked.
 func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, error) {
 	if o.filters() > 1 {
 		return nil, fmt.Errorf("list_tickets: group, assignee, requester and organization each answer a different question — name one of them")
 	}
+	status := strings.ToLower(strings.TrimSpace(o.Status))
+	if status == "any" {
+		status = ""
+	}
+	if status != "" {
+		if err := checkChoice("status", status, statuses); err != nil {
+			return nil, err
+		}
+	}
+	terms, err := c.narrowing(ctx, o, status)
+	if err != nil {
+		return nil, err
+	}
+
 	q := url.Values{}
 	q.Set("sort_by", "updated_at")
 	q.Set("sort_order", "desc")
 	pageSize(q, o.Limit)
-	status := strings.ToLower(strings.TrimSpace(o.Status))
-	if status != "" && status != "any" {
-		if err := checkChoice("status", status, statuses); err != nil {
-			return nil, err
-		}
-		q.Set("status", status)
+	path, key := "/tickets.json", "tickets"
+	if len(terms) > 0 {
+		path, key = "/search.json", "results"
+		q.Set("query", strings.Join(append([]string{"type:ticket"}, terms...), " "))
 	}
-	if err := c.applyFilter(ctx, q, o); err != nil {
-		return nil, err
-	}
-	// A queue pinned in the credential is a ceiling, and a ceiling is only real if
-	// the list obeys it even when the caller asked for something else.
-	if c.cfg.Queue != "" && o.Group == "" {
-		if id, err := c.groupID(ctx, c.cfg.Queue); err == nil {
-			q.Set("group_id", strconv.FormatInt(id, 10))
-		}
-	}
-	tickets, err := collect[Ticket](ctx, c, "/tickets.json", "tickets", q, o.Limit)
+	tickets, err := collect[Ticket](ctx, c, path, key, q, o.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -732,53 +752,76 @@ func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, erro
 	return tickets, nil
 }
 
-// applyFilter turns the one ownership filter into its query parameter. An id is
-// checked before it is put into a URL, and `me` is resolved rather than passed on:
-// whose "me" the account would answer with depends on whose token is in the
-// header, and the plugin knows its own.
-func (c *Client) applyFilter(ctx context.Context, q url.Values, o ListOptions) error {
-	switch value := strings.TrimSpace(o.Group); {
-	case value != "":
-		id, err := c.groupID(ctx, value)
-		if err != nil {
-			return err
-		}
-		q.Set("group_id", strconv.FormatInt(id, 10))
-		return nil
+// narrowing turns the options into search terms — none of them if nothing is
+// being narrowed, which is what keeps the plain list on the plain endpoint.
+//
+// The names are checked before they are used: a group that does not exist is an
+// error the caller can fix, and an id that is not one has no business in a
+// query.
+func (c *Client) narrowing(ctx context.Context, o ListOptions, status string) ([]string, error) {
+	var terms []string
+	if status != "" {
+		terms = append(terms, "status:"+status)
 	}
+
+	// A queue pinned in the credential is a ceiling, and a ceiling is only real
+	// if the list obeys it even when the caller asked for something else.
+	group := strings.TrimSpace(o.Group)
+	if group == "" {
+		group = strings.TrimSpace(c.cfg.Queue)
+	}
+	if group != "" {
+		id, err := c.groupID(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		// The search asks by name; a queue written as an id is resolved back to
+		// one, so both spellings of the same group ask the same question.
+		if name := c.groupName(ctx, id); name != "" {
+			group = name
+		}
+		terms = append(terms, "group:"+quoteTerm(group))
+		return terms, nil
+	}
+
 	if value := strings.TrimSpace(o.Organization); value != "" {
 		if err := checkID("organization", value); err != nil {
-			return err
+			return nil, err
 		}
-		q.Set("organization_id", value)
-		return nil
+		return append(terms, "organization:"+value), nil
 	}
 	if value := strings.TrimSpace(o.Requester); value != "" {
 		if err := checkID("requester", value); err != nil {
-			return err
+			return nil, err
 		}
-		q.Set("requester_id", value)
-		return nil
+		return append(terms, "requester:"+value), nil
 	}
+
 	value := strings.TrimSpace(o.Assignee)
-	if value == "" {
-		return nil
-	}
 	switch value {
-	case "null": // the unassigned pile — a queue of its own in every helpdesk
+	case "":
+		return terms, nil
+	case "null":
+		// The unassigned pile — a queue of its own in every helpdesk.
+		return append(terms, "assignee:none"), nil
 	case "current_user", "me":
-		mine, err := c.myID(ctx)
-		if err != nil {
-			return err
-		}
-		value = strconv.FormatInt(mine, 10)
-	default:
-		if err := checkID("assignee", value); err != nil {
-			return err
-		}
+		// "me" in a search is the account the token belongs to, which is exactly
+		// whose "me" the caller meant.
+		return append(terms, "assignee:me"), nil
 	}
-	q.Set("assignee_id", value)
-	return nil
+	if err := checkID("assignee", value); err != nil {
+		return nil, err
+	}
+	return append(terms, "assignee:"+value), nil
+}
+
+// quoteTerm puts a search term in quotes where it needs them. Group names have
+// spaces ("Support L1"), and an unquoted space ends the term.
+func quoteTerm(value string) string {
+	if strings.ContainsAny(value, " \t\"") {
+		return `"` + strings.ReplaceAll(value, `"`, "") + `"`
+	}
+	return value
 }
 
 // GetTicket reads one ticket with its conversation and its files inline. This is

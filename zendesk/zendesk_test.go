@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -205,22 +206,27 @@ func (f *fake) handleGroups(w http.ResponseWriter, r *http.Request) {
 
 // handleTicketList is the one endpoint with real filtering, because the queue ceiling
 // is a claim about the query and only the query shows it.
+// handleTicketList answers /tickets.json the way Zendesk does: it LISTS, it does
+// not filter. Sorting and paging are honoured, every other parameter is ignored.
+//
+// It used to filter by group_id and status here, and that is why the plugin
+// spent months setting parameters the account never read: the double was built
+// after the code's assumption instead of after the API, so the tests confirmed
+// the misunderstanding. On a live account it came out as "0 open tickets" from
+// a list of closed ones.
 func (f *fake) handleTicketList(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
-	groupID := r.URL.Query().Get("group_id")
-	status := r.URL.Query().Get("status")
-	var out []map[string]any
+	if q := r.URL.Query(); q.Get("group_id") != "" || q.Get("status") != "" ||
+		q.Get("assignee_id") != "" || q.Get("requester_id") != "" || q.Get("organization_id") != "" {
+		f.t.Errorf("/tickets.json cannot filter — this belongs in a search query: %s", r.URL.RawQuery)
+	}
+	out := []map[string]any{}
 	for _, tk := range f.tickets {
-		if groupID != "" && fmt.Sprint(tk["group_id"]) != groupID {
-			continue
-		}
-		if status != "" && tk["status"] != status {
-			continue
-		}
 		out = append(out, tk)
 	}
+	sortByID(out)
 	writeJSON(w, map[string]any{"tickets": out, "next_page": nil})
 }
 
@@ -366,24 +372,95 @@ func commentsOf(tk map[string]any) []any {
 	return []any{}
 }
 
+// handleSearch is the endpoint that DOES narrow, and it narrows by reading the
+// query the way the account does: `status:`, `group:` and `assignee:` as terms,
+// not as parameters. Everything the plugin wants filtered has to arrive here.
+//
+// A search for type:ticket answers with the tickets themselves, which is why the
+// list path can decode the results into the same struct.
 func (f *fake) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
-	query := r.URL.Query().Get("query")
-	var out []map[string]any
+	terms := searchTerms(r.URL.Query().Get("query"))
+	out := []map[string]any{}
 	for _, tk := range f.tickets {
-		if !strings.Contains(query, "status:open") {
+		if v, ok := terms["status"]; ok && fmt.Sprint(tk["status"]) != v {
 			continue
 		}
-		out = append(out, map[string]any{
-			"id": tk["id"], "ticket_id": tk["id"], "result_type": "ticket",
-			"title": tk["subject"], "status": tk["status"], "group_id": tk["group_id"],
-			"createtime": "2026-02-01T09:00:00Z", "update_time": "2026-02-02T09:00:00Z",
-		})
+		if v, ok := terms["group"]; ok && f.groupNamed(v) != fmt.Sprint(tk["group_id"]) {
+			continue
+		}
+		if v, ok := terms["assignee"]; ok {
+			switch v {
+			case "none":
+				if tk["assignee_id"] != nil && fmt.Sprint(tk["assignee_id"]) != "0" {
+					continue
+				}
+			case "me":
+				if fmt.Sprint(tk["assignee_id"]) != "7" { // users/me says 7
+					continue
+				}
+			default:
+				if fmt.Sprint(tk["assignee_id"]) != v {
+					continue
+				}
+			}
+		}
+		hit := map[string]any{"result_type": "ticket", "createtime": "2026-02-01T09:00:00Z",
+			"update_time": "2026-02-02T09:00:00Z", "title": tk["subject"], "ticket_id": tk["id"]}
+		for k, v := range tk {
+			hit[k] = v
+		}
+		out = append(out, hit)
 	}
+	sortByID(out)
 	// The search endpoint is the one that still carries the older dialect.
 	writeJSON(w, map[string]any{"results": out, "next_page": nil, "count": len(out)})
+}
+
+// searchTerms splits `type:ticket status:open group:"Support L1"` into its
+// field/value pairs — quotes included, because group names have spaces.
+func searchTerms(query string) map[string]string {
+	out := map[string]string{}
+	var current strings.Builder
+	inQuotes := false
+	push := func() {
+		term := current.String()
+		current.Reset()
+		if field, value, ok := strings.Cut(term, ":"); ok && value != "" {
+			out[field] = strings.Trim(value, `"`)
+		}
+	}
+	for _, r := range query {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+			current.WriteRune(r)
+		case r == ' ' && !inQuotes:
+			push()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	push()
+	return out
+}
+
+// groupNamed answers with the id the fake's group of that name carries.
+func (f *fake) groupNamed(name string) string {
+	if id, ok := f.groups[name]; ok {
+		return fmt.Sprint(id)
+	}
+	return ""
+}
+
+// sortByID keeps the fake's answers in a stable order — a map has none, and a
+// test that depends on iteration order is a test that fails on Tuesdays.
+func sortByID(rows []map[string]any) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		return fmt.Sprint(rows[i]["id"]) < fmt.Sprint(rows[j]["id"])
+	})
 }
 
 func (f *fake) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -810,16 +887,24 @@ func TestQueueIsACeiling(t *testing.T) {
 	if len(tickets) != 1 || tickets[0].ID != 42 {
 		t.Fatalf("pinned queue leaked foreign tickets: %v", tickets)
 	}
-	var askedGroup string
+	// The ceiling has to reach the account, and the only endpoint that narrows a
+	// ticket list is the search — /tickets.json would have taken a group_id and
+	// ignored it, which is how this ceiling held nothing for months.
+	var askedFor string
 	for _, r := range f.requests {
-		if strings.Contains(r, "/tickets.json") {
+		if strings.Contains(r, "/search.json") {
 			if q, err := url.Parse(strings.Replace(r, "GET ", f.srv.URL, 1)); err == nil {
-				askedGroup = q.Query().Get("group_id")
+				askedFor = q.Query().Get("query")
 			}
 		}
 	}
-	if askedGroup != "101" {
-		t.Errorf("the ceiling was not put into the list query: %v", f.requests)
+	if !strings.Contains(askedFor, `group:"Support L1"`) {
+		t.Errorf("the ceiling was not put into the search query: %q of %v", askedFor, f.requests)
+	}
+	for _, r := range f.requests {
+		if strings.Contains(r, "/tickets.json?") && strings.Contains(r, "group_id") {
+			t.Errorf("a group_id on the plain list is a parameter the account ignores: %s", r)
+		}
 	}
 	for _, tk := range tickets {
 		if !tk.InScope {
@@ -1884,5 +1969,81 @@ func TestRequesterHistoryIsTheAskersOwnTickets(t *testing.T) {
 	}
 	if _, err := f.client("tok").RequesterHistory(context.Background(), 0, 5); err == nil {
 		t.Error("history for nobody must be refused")
+	}
+}
+
+// TestListTicketsNarrowsThroughTheSearch pins what the account actually
+// answers. /tickets.json lists and does not filter: status, group_id,
+// assignee_id, requester_id and organization_id are parameters it ignores. The
+// plugin set them for months, and the result was never an error — it was the
+// wrong list with a straight face. On a live account `status=open` came back
+// full of closed tickets and a filter for a foreign group returned everything.
+//
+// So: nothing to narrow → the plain list. Anything to narrow → a search query
+// carrying it.
+func TestListTicketsNarrowsThroughTheSearch(t *testing.T) {
+	f := newFake(t)
+	f.addTicket(42, 101, 9, "open", "offen, Gruppe Support L1")
+	f.addTicket(43, 102, 9, "closed", "geschlossen, andere Gruppe")
+	// users/me says 7, and addTicket assigns 8 by default — so this one is set
+	// on purpose: "mine" has to mean the token's own identity, not the default.
+	f.addTicket(44, 101, 9, "open", "offen, mir zugewiesen")["assignee_id"] = 7
+	c := f.client("tok")
+
+	// Nothing asked: the plain list, and no query on it.
+	alle, err := c.ListTickets(context.Background(), ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alle) != 3 {
+		t.Fatalf("the unfiltered list is the whole account: %d", len(alle))
+	}
+
+	faelle := []struct {
+		name string
+		o    ListOptions
+		want []int64
+		term string
+	}{
+		{"status", ListOptions{Status: "open", Limit: 10}, []int64{42, 44}, "status:open"},
+		{"group", ListOptions{Group: "Support L1", Limit: 10}, []int64{42, 44}, `group:"Support L1"`},
+		{"status und Gruppe", ListOptions{Status: "open", Group: "Support L1", Limit: 10}, []int64{42, 44}, "status:open"},
+		{"mir zugewiesen", ListOptions{Assignee: "me", Limit: 10}, []int64{44}, "assignee:me"},
+		{"niemandem zugewiesen", ListOptions{Assignee: "null", Limit: 10}, nil, "assignee:none"},
+	}
+	for _, fall := range faelle {
+		t.Run(fall.name, func(t *testing.T) {
+			f.requests = nil
+			tickets, err := c.ListTickets(context.Background(), fall.o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []int64
+			for _, tk := range tickets {
+				ids = append(ids, tk.ID)
+			}
+			if fmt.Sprint(ids) != fmt.Sprint(fall.want) {
+				t.Errorf("got %v, expected %v", ids, fall.want)
+			}
+			var asked string
+			for _, r := range f.requests {
+				if strings.Contains(r, "/search.json") {
+					asked = r
+				}
+				if strings.Contains(r, "/tickets.json?") {
+					t.Errorf("a narrowed list must not go to the plain endpoint: %s", r)
+				}
+			}
+			if asked == "" {
+				t.Fatalf("no search was made: %v", f.requests)
+			}
+			query, err := url.QueryUnescape(asked)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(query, "type:ticket") || !strings.Contains(query, fall.term) {
+				t.Errorf("the query does not carry %q: %s", fall.term, query)
+			}
+		})
 	}
 }
