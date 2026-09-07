@@ -388,10 +388,26 @@ func decodeString(raw json.RawMessage) string {
 // allows 100 per page; asking for exactly the caller's limit keeps a "give me ten"
 // from fetching a hundred.
 func pageSize(q url.Values, limit int) {
+	q.Set("page[size]", strconv.Itoa(atMostAHundred(limit)))
+}
+
+// searchPageSize is the same wish spelled for the search index, which pages by
+// an integer `page` and not by a cursor. Handed the cursor spelling it does not
+// ignore it — it reads page[size] as `page`, finds no number and answers
+// "Invalid parameter: page must be an integer" with HTTP 400. Two endpoints,
+// two dialects, and the wrong one is not a nuance but the difference between a
+// list and an error.
+func searchPageSize(q url.Values, limit int) {
+	q.Set("per_page", strconv.Itoa(atMostAHundred(limit)))
+}
+
+// atMostAHundred is what both of them mean by a page: the caller's limit while
+// it is one, the account's ceiling otherwise.
+func atMostAHundred(limit int) int {
 	if limit < 1 || limit > 100 {
-		limit = 100
+		return 100
 	}
-	q.Set("page[size]", strconv.Itoa(limit))
+	return limit
 }
 
 // ---------------------------------------------------------------- TYPES
@@ -738,11 +754,13 @@ func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, erro
 	q := url.Values{}
 	q.Set("sort_by", "updated_at")
 	q.Set("sort_order", "desc")
-	pageSize(q, o.Limit)
 	path, key := "/tickets.json", "tickets"
 	if len(terms) > 0 {
 		path, key = "/search.json", "results"
 		q.Set("query", strings.Join(append([]string{"type:ticket"}, terms...), " "))
+		searchPageSize(q, o.Limit)
+	} else {
+		pageSize(q, o.Limit)
 	}
 	tickets, err := collect[Ticket](ctx, c, path, key, q, o.Limit)
 	if err != nil {
@@ -850,9 +868,7 @@ func (c *Client) SearchTickets(ctx context.Context, query string, limit int) ([]
 	q := url.Values{}
 	q.Set("query", ensureTicketType(strings.TrimSpace(query)))
 	q.Set("sort_order", "desc")
-	if limit > 0 {
-		q.Set("per_page", strconv.Itoa(min(100, limit)))
-	}
+	searchPageSize(q, limit)
 	hits, err := collect[SearchHit](ctx, c, "/search.json", "results", q, limit)
 	if err != nil {
 		return nil, err
@@ -969,10 +985,9 @@ func (t *looseTime) UnmarshalJSON(raw []byte) error {
 //
 // It has to be assembled rather than fetched. A ticket object carries a comment id
 // and never the text outside of its own inline copy; the complete history lives in
-// the audits, where a comment is an event with a name per channel
-// (CommentCreate, CommentUpdate, InternalComment, VoiceCommentCreate). Field
-// changes are audit events too and are not part of the conversation, which is why
-// this walks events and ignores everything else.
+// the audits, where a comment is one kind of event among many. Field changes are
+// audit events too and are not part of the conversation, which is why this walks
+// events and asks isComment about every one of them.
 func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([]Comment, error) {
 	q := url.Values{}
 	pageSize(q, limit)
@@ -990,7 +1005,7 @@ func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([
 	authors := map[int64]struct{}{}
 	for _, a := range audits {
 		for _, ev := range a.Events {
-			if !strings.HasSuffix(ev.Type, "CommentCreate") && ev.Type != "CommentUpdate" && ev.Type != "InternalComment" {
+			if !isComment(ev.Type) {
 				continue
 			}
 			body := ev.plainBody()
@@ -1025,6 +1040,29 @@ func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([
 		out = out[len(out)-limit:]
 	}
 	return out, nil
+}
+
+// isComment says whether an audit event is a message, and it has to name both
+// families because Zendesk uses two.
+//
+// The audits endpoint calls the event what it is: `Comment`, and `VoiceComment`
+// for a call. The incremental export of the same events calls it `CommentCreate`
+// / `VoiceCommentCreate` / `CommentUpdate` / `InternalComment`. Only the second
+// set was listed here, so the filter matched nothing this endpoint ever sends —
+// and because an empty conversation is not an error, list_messages answered
+// every ticket with "no messages" and sounded certain about it. Found on a live
+// account, on a ticket that has a description and a whole thread (#23).
+//
+// Written out rather than matched by suffix: CommentPrivacyChange and
+// CommentRedaction are about a comment without being one, and a suffix rule
+// would have to argue with them.
+func isComment(kind string) bool {
+	switch kind {
+	case "Comment", "VoiceComment",
+		"CommentCreate", "VoiceCommentCreate", "CommentUpdate", "InternalComment":
+		return true
+	}
+	return false
 }
 
 // audit is one entry of /tickets/{id}/audits.json — the change log of a ticket, of

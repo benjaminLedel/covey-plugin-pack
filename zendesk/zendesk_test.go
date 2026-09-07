@@ -382,6 +382,17 @@ func (f *fake) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
+	// The search index pages by an integer, and it says so rather than shrugging:
+	// handed the cursor spelling page[size] it reads the parameter as `page` and
+	// refuses the whole request. The fake refuses it too — an endpoint here that
+	// accepts both dialects is exactly the doppelgaenger that hides a 400 from a
+	// live account (#21).
+	if q := r.URL.Query(); q.Get("page[size]") != "" || (q.Get("page") != "" && !isInteger(q.Get("page"))) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"title":"Invalid attribute","message":"You passed an invalid value for the page attribute. Invalid parameter: page must be an integer from api/v2/search/index"}}`)
+		return
+	}
 	terms := searchTerms(r.URL.Query().Get("query"))
 	out := []map[string]any{}
 	for _, tk := range f.tickets {
@@ -417,6 +428,12 @@ func (f *fake) handleSearch(w http.ResponseWriter, r *http.Request) {
 	sortByID(out)
 	// The search endpoint is the one that still carries the older dialect.
 	writeJSON(w, map[string]any{"results": out, "next_page": nil, "count": len(out)})
+}
+
+// isInteger is the whole of what the search index asks of `page`.
+func isInteger(v string) bool {
+	_, err := strconv.Atoi(v)
+	return err == nil
 }
 
 // searchTerms splits `type:ticket status:open group:"Support L1"` into its
@@ -608,9 +625,19 @@ func auditOf(id, authorID int64, at string, events ...map[string]any) map[string
 	return map[string]any{"id": id, "ticket_id": 0, "author_id": authorID, "created_at": at, "events": events}
 }
 
+// createdEvent is a comment the way the AUDITS endpoint sends one — type
+// `Comment`, which is what this plugin reads and what a live account answers
+// with. It said `CommentCreate` here for a long time; that name belongs to the
+// incremental export, and the fake speaking it kept #23 invisible.
 func createdEvent(id, authorID int64, public bool, body, channel string) map[string]any {
+	return commentEvent("Comment", id, authorID, public, body, channel)
+}
+
+// commentEvent is the same event under a named type, for the tests that ask what
+// happens to the other family of names.
+func commentEvent(kind string, id, authorID int64, public bool, body, channel string) map[string]any {
 	return map[string]any{
-		"type": "CommentCreate", "id": id, "public": public, "author_id": authorID,
+		"type": kind, "id": id, "public": public, "author_id": authorID,
 		"plain_body": body, "value": "<div>" + body + "</div>",
 		"via": map[string]any{"channel": channel},
 	}
@@ -1004,6 +1031,57 @@ func TestConversationIsRebuiltFromAudits(t *testing.T) {
 	}
 	if askedAudits {
 		t.Error("the pre-check read the audits although the ticket carried its thread inline")
+	}
+}
+
+// TestConversationReadsBothNamesForAComment is the fault that made every
+// list_messages answer "no messages" on a live account: the audits endpoint
+// calls a comment `Comment`, the incremental export calls the same thing
+// `CommentCreate` — and only the export's names were listed. Nothing matched,
+// nothing was an error, and the empty answer sounded like a fact about the
+// ticket.
+//
+// Both families are named here, and the audits' own names come first: they are
+// the ones this endpoint actually sends.
+func TestConversationReadsBothNamesForAComment(t *testing.T) {
+	for _, kind := range []string{
+		"Comment", "VoiceComment",
+		"CommentCreate", "VoiceCommentCreate", "CommentUpdate", "InternalComment",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			f := newFake(t)
+			f.addTicket(42, 101, 9, "open", "Eine Frage")
+			f.addAudits(42, auditOf(1, 9, "2026-02-01T09:00:00Z",
+				commentEvent(kind, 101, 9, true, "erste Nachricht", "email")))
+
+			thread, err := f.client("tok").Conversation(context.Background(), 42, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(thread) != 1 || thread[0].Body != "erste Nachricht" {
+				t.Fatalf("a %s event is a message and did not arrive as one: %+v", kind, thread)
+			}
+		})
+	}
+
+	// The other half of the claim: a name that merely mentions a comment is not
+	// one. Redaction and privacy changes are about a comment; the conversation
+	// would gain a line that nobody wrote.
+	for _, kind := range []string{"CommentPrivacyChange", "CommentRedaction", "Change"} {
+		t.Run("nicht "+kind, func(t *testing.T) {
+			f := newFake(t)
+			f.addTicket(42, 101, 9, "open", "Eine Frage")
+			f.addAudits(42, auditOf(1, 9, "2026-02-01T09:00:00Z",
+				commentEvent(kind, 101, 9, true, "nicht gesagt", "email")))
+
+			thread, err := f.client("tok").Conversation(context.Background(), 42, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(thread) != 0 {
+				t.Fatalf("%s ended up in the conversation: %+v", kind, thread)
+			}
+		})
 	}
 }
 
