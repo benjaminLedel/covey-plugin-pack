@@ -985,10 +985,9 @@ func (t *looseTime) UnmarshalJSON(raw []byte) error {
 //
 // It has to be assembled rather than fetched. A ticket object carries a comment id
 // and never the text outside of its own inline copy; the complete history lives in
-// the audits, where a comment is an event with a name per channel
-// (CommentCreate, CommentUpdate, InternalComment, VoiceCommentCreate). Field
-// changes are audit events too and are not part of the conversation, which is why
-// this walks events and ignores everything else.
+// the audits, where a comment is one kind of event among many. Field changes are
+// audit events too and are not part of the conversation, which is why this walks
+// events and asks isComment about every one of them.
 func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([]Comment, error) {
 	q := url.Values{}
 	pageSize(q, limit)
@@ -1006,7 +1005,7 @@ func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([
 	authors := map[int64]struct{}{}
 	for _, a := range audits {
 		for _, ev := range a.Events {
-			if !strings.HasSuffix(ev.Type, "CommentCreate") && ev.Type != "CommentUpdate" && ev.Type != "InternalComment" {
+			if !isComment(ev.Type) {
 				continue
 			}
 			body := ev.plainBody()
@@ -1041,6 +1040,29 @@ func (c *Client) Conversation(ctx context.Context, ticketID int64, limit int) ([
 		out = out[len(out)-limit:]
 	}
 	return out, nil
+}
+
+// isComment says whether an audit event is a message, and it has to name both
+// families because Zendesk uses two.
+//
+// The audits endpoint calls the event what it is: `Comment`, and `VoiceComment`
+// for a call. The incremental export of the same events calls it `CommentCreate`
+// / `VoiceCommentCreate` / `CommentUpdate` / `InternalComment`. Only the second
+// set was listed here, so the filter matched nothing this endpoint ever sends —
+// and because an empty conversation is not an error, list_messages answered
+// every ticket with "no messages" and sounded certain about it. Found on a live
+// account, on a ticket that has a description and a whole thread (#23).
+//
+// Written out rather than matched by suffix: CommentPrivacyChange and
+// CommentRedaction are about a comment without being one, and a suffix rule
+// would have to argue with them.
+func isComment(kind string) bool {
+	switch kind {
+	case "Comment", "VoiceComment",
+		"CommentCreate", "VoiceCommentCreate", "CommentUpdate", "InternalComment":
+		return true
+	}
+	return false
 }
 
 // audit is one entry of /tickets/{id}/audits.json — the change log of a ticket, of
