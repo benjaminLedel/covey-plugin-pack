@@ -388,10 +388,26 @@ func decodeString(raw json.RawMessage) string {
 // allows 100 per page; asking for exactly the caller's limit keeps a "give me ten"
 // from fetching a hundred.
 func pageSize(q url.Values, limit int) {
+	q.Set("page[size]", strconv.Itoa(atMostAHundred(limit)))
+}
+
+// searchPageSize is the same wish spelled for the search index, which pages by
+// an integer `page` and not by a cursor. Handed the cursor spelling it does not
+// ignore it — it reads page[size] as `page`, finds no number and answers
+// "Invalid parameter: page must be an integer" with HTTP 400. Two endpoints,
+// two dialects, and the wrong one is not a nuance but the difference between a
+// list and an error.
+func searchPageSize(q url.Values, limit int) {
+	q.Set("per_page", strconv.Itoa(atMostAHundred(limit)))
+}
+
+// atMostAHundred is what both of them mean by a page: the caller's limit while
+// it is one, the account's ceiling otherwise.
+func atMostAHundred(limit int) int {
 	if limit < 1 || limit > 100 {
-		limit = 100
+		return 100
 	}
-	q.Set("page[size]", strconv.Itoa(limit))
+	return limit
 }
 
 // ---------------------------------------------------------------- TYPES
@@ -738,11 +754,13 @@ func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, erro
 	q := url.Values{}
 	q.Set("sort_by", "updated_at")
 	q.Set("sort_order", "desc")
-	pageSize(q, o.Limit)
 	path, key := "/tickets.json", "tickets"
 	if len(terms) > 0 {
 		path, key = "/search.json", "results"
 		q.Set("query", strings.Join(append([]string{"type:ticket"}, terms...), " "))
+		searchPageSize(q, o.Limit)
+	} else {
+		pageSize(q, o.Limit)
 	}
 	tickets, err := collect[Ticket](ctx, c, path, key, q, o.Limit)
 	if err != nil {
@@ -850,9 +868,7 @@ func (c *Client) SearchTickets(ctx context.Context, query string, limit int) ([]
 	q := url.Values{}
 	q.Set("query", ensureTicketType(strings.TrimSpace(query)))
 	q.Set("sort_order", "desc")
-	if limit > 0 {
-		q.Set("per_page", strconv.Itoa(min(100, limit)))
-	}
+	searchPageSize(q, limit)
 	hits, err := collect[SearchHit](ctx, c, "/search.json", "results", q, limit)
 	if err != nil {
 		return nil, err

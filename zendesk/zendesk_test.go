@@ -382,6 +382,17 @@ func (f *fake) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
+	// The search index pages by an integer, and it says so rather than shrugging:
+	// handed the cursor spelling page[size] it reads the parameter as `page` and
+	// refuses the whole request. The fake refuses it too — an endpoint here that
+	// accepts both dialects is exactly the doppelgaenger that hides a 400 from a
+	// live account (#21).
+	if q := r.URL.Query(); q.Get("page[size]") != "" || (q.Get("page") != "" && !isInteger(q.Get("page"))) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"title":"Invalid attribute","message":"You passed an invalid value for the page attribute. Invalid parameter: page must be an integer from api/v2/search/index"}}`)
+		return
+	}
 	terms := searchTerms(r.URL.Query().Get("query"))
 	out := []map[string]any{}
 	for _, tk := range f.tickets {
@@ -417,6 +428,12 @@ func (f *fake) handleSearch(w http.ResponseWriter, r *http.Request) {
 	sortByID(out)
 	// The search endpoint is the one that still carries the older dialect.
 	writeJSON(w, map[string]any{"results": out, "next_page": nil, "count": len(out)})
+}
+
+// isInteger is the whole of what the search index asks of `page`.
+func isInteger(v string) bool {
+	_, err := strconv.Atoi(v)
+	return err == nil
 }
 
 // searchTerms splits `type:ticket status:open group:"Support L1"` into its
