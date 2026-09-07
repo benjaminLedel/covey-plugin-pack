@@ -999,7 +999,7 @@ type auditEvent struct {
 	ID          int64        `json:"id"`
 	Public      bool         `json:"public"`
 	AuthorID    int64        `json:"author_id"`
-	Value       string       `json:"value"`
+	Value       eventValue   `json:"value"`
 	Body        string       `json:"body"`
 	PlainBody   string       `json:"plain_body"`
 	Via         channel      `json:"via"`
@@ -1007,11 +1007,51 @@ type auditEvent struct {
 	Uploads     []string     `json:"uploads"`
 }
 
+// eventValue is the `value` of an audit event, and its type is whatever the
+// event is about: a string for a comment or a status, an ARRAY for tags and
+// multi-select fields, a number, a boolean, an object.
+//
+// It was read as a string, and the consequence was out of all proportion to the
+// field: json.Unmarshal fails on the first array, the whole audits response is
+// discarded, and list_messages returns nothing for that ticket — not the one
+// odd event, the entire conversation. On a grown account that is most tickets,
+// because "somebody once changed a tag" is the normal state of a ticket. Found
+// on a live account, where reading the queue worked and every ticket in it came
+// back as `cannot unmarshal array into Go struct field auditEvent.events.value`.
+//
+// So: never an error. A shape that was not expected becomes text and travels
+// on — the alternative is losing a conversation over a field the conversation
+// does not even use.
+type eventValue string
+
+func (v *eventValue) UnmarshalJSON(raw []byte) error {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		*v = eventValue(text)
+		return nil
+	}
+	// Tags and multi-selects. Joined the way a person would read them back,
+	// because that is the only thing anybody does with this field.
+	var list []string
+	if json.Unmarshal(raw, &list) == nil {
+		*v = eventValue(strings.Join(list, ", "))
+		return nil
+	}
+	// A number, a boolean, an object, a list of objects: kept as it came. It is
+	// not pretty and it is not lost.
+	*v = eventValue(trimmed)
+	return nil
+}
+
 // plainBody picks the text out of the three places a comment event can carry it:
 // the plain body a person reading it wants, the HTML body otherwise, and the
 // value field where the event names its payload after itself instead.
 func (e auditEvent) plainBody() string {
-	for _, candidate := range []string{e.PlainBody, e.Body, e.Value} {
+	for _, candidate := range []string{e.PlainBody, e.Body, string(e.Value)} {
 		if strings.TrimSpace(candidate) != "" {
 			return candidate
 		}

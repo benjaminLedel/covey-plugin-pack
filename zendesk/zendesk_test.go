@@ -922,6 +922,69 @@ func TestConversationIsRebuiltFromAudits(t *testing.T) {
 	}
 }
 
+// TestConversationSurvivesAnEventValueThatIsNotAString pins the fault that made
+// list_messages useless on a live account: the `value` of an audit event is a
+// string for a comment and an ARRAY for a tag change, and the field was read as
+// a string. json.Unmarshal then fails on the whole audits response — not on the
+// one event — and the ticket comes back without a conversation at all.
+//
+// "Somebody once changed a tag" is the normal state of a grown ticket, so this
+// was not an edge case: reading the queue worked and no ticket in it could be
+// opened.
+func TestConversationSurvivesAnEventValueThatIsNotAString(t *testing.T) {
+	f := newFake(t)
+	f.addTicket(42, 101, 9, "open", "Mit Tags")
+	f.addAudits(42,
+		auditOf(1, 9, "2026-02-01T09:00:00Z",
+			createdEvent(101, 9, true, "die Frage des Kunden", "email"),
+			// The shapes a real account sends beside a comment.
+			map[string]any{"type": "Change", "field": "tags", "value": []string{"vip", "rechnung"}},
+			map[string]any{"type": "Change", "field": "priority", "value": nil},
+			map[string]any{"type": "Change", "field": "custom_field_42", "value": []any{1, 2}},
+			map[string]any{"type": "Change", "field": "satisfaction", "value": map[string]any{"score": "good"}},
+		),
+		auditOf(2, 7, "2026-02-02T09:00:00Z",
+			createdEvent(102, 7, false, "die interne Notiz", "API")),
+	)
+
+	thread, err := f.client("tok").Conversation(context.Background(), 42, 0)
+	if err != nil {
+		t.Fatalf("an array in a field the conversation does not use must not cost the conversation: %v", err)
+	}
+	if len(thread) != 2 {
+		t.Fatalf("%d comments, expected 2: %+v", len(thread), thread)
+	}
+	if thread[0].Body != "die Frage des Kunden" || thread[1].Body != "die interne Notiz" {
+		t.Errorf("the thread is not what the audits carry: %+v", thread)
+	}
+}
+
+// TestEventValueReadsEveryShapeZendeskSends: what the tolerant field makes of
+// the shapes, one by one. The list is the point — a new shape must land in the
+// last case rather than in an error.
+func TestEventValueReadsEveryShapeZendeskSends(t *testing.T) {
+	faelle := []struct{ roh, want string }{
+		{`"pending"`, "pending"},                 // a status
+		{`""`, ""},                               // an empty one
+		{`null`, ""},                             // a field that was cleared
+		{`["vip","rechnung"]`, "vip, rechnung"},  // tags — the case that broke it
+		{`[]`, ""},                               // all tags removed
+		{`42`, "42"},                             // a number
+		{`true`, "true"},                         // a flag
+		{`{"score":"good"}`, `{"score":"good"}`}, // an object, kept as it came
+	}
+	for _, f := range faelle {
+		var v eventValue
+		if err := json.Unmarshal([]byte(f.roh), &v); err != nil {
+			t.Errorf("%s must not be an error: %v", f.roh, err)
+			continue
+		}
+		if string(v) != f.want {
+			t.Errorf("%s → %q, expected %q", f.roh, string(v), f.want)
+		}
+	}
+}
+
 // TestPaginationFollowsWhicheverDialectTheAnswerCarries: the search endpoint still
 // answers with next_page, the newer list endpoints with links.next, and a plugin can
 // only follow what the response actually has.
