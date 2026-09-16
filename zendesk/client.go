@@ -412,29 +412,39 @@ func atMostAHundred(limit int) int {
 
 // ---------------------------------------------------------------- TYPES
 
+// CustomFieldValue is one regular custom field of a ticket with the value the
+// ticket carries — a dropdown or tagger as its string, a multiselect as its
+// array, a number or a date as it came. The id is the catalogue id that
+// list_ticket_fields reports; titles are resolved there, not per ticket.
+type CustomFieldValue struct {
+	ID    int64 `json:"id"`
+	Value any   `json:"value"`
+}
+
 // Ticket is a Zendesk ticket as the agent sees it. The fields up to Group carry
 // the API's own names; the five below them are what this plugin adds, because a
 // group id and a user id are not answers to anything a person — or a model — is
 // asking.
 type Ticket struct {
-	ID             int64        `json:"id"`
-	Subject        string       `json:"subject"`
-	Description    string       `json:"description,omitempty"`
-	Status         string       `json:"status"`
-	Priority       string       `json:"priority,omitempty"`
-	Type           string       `json:"type,omitempty"`
-	Tags           []string     `json:"tags,omitempty"`
-	GroupID        int64        `json:"group_id,omitempty"`
-	AssigneeID     int64        `json:"assignee_id,omitempty"`
-	RequesterID    int64        `json:"requester_id,omitempty"`
-	OrganizationID int64        `json:"organization_id,omitempty"`
-	LatestComment  int64        `json:"comment_id,omitempty"`
-	CreatedAt      string       `json:"created_at,omitempty"`
-	UpdatedAt      string       `json:"updated_at,omitempty"`
-	DueAt          string       `json:"due_at,omitempty"`
-	Via            channel      `json:"via,omitempty"`
-	Comments       []Comment    `json:"comments,omitempty"`
-	Attachments    []Attachment `json:"attachments,omitempty"`
+	ID             int64              `json:"id"`
+	Subject        string             `json:"subject"`
+	Description    string             `json:"description,omitempty"`
+	Status         string             `json:"status"`
+	Priority       string             `json:"priority,omitempty"`
+	Type           string             `json:"type,omitempty"`
+	Tags           []string           `json:"tags,omitempty"`
+	CustomFields   []CustomFieldValue `json:"custom_fields,omitempty"`
+	GroupID        int64              `json:"group_id,omitempty"`
+	AssigneeID     int64              `json:"assignee_id,omitempty"`
+	RequesterID    int64              `json:"requester_id,omitempty"`
+	OrganizationID int64              `json:"organization_id,omitempty"`
+	LatestComment  int64              `json:"comment_id,omitempty"`
+	CreatedAt      string             `json:"created_at,omitempty"`
+	UpdatedAt      string             `json:"updated_at,omitempty"`
+	DueAt          string             `json:"due_at,omitempty"`
+	Via            channel            `json:"via,omitempty"`
+	Comments       []Comment          `json:"comments,omitempty"`
+	Attachments    []Attachment       `json:"attachments,omitempty"`
 
 	// Group, Requester and Assignee are names, resolved from the ids. The ids
 	// stay in the payload beside them, so nothing is hidden and nothing has to be
@@ -1325,6 +1335,87 @@ func (f ticketFieldRecord) values() []string {
 		}
 	}
 	return out
+}
+
+func offered(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// customFieldUpdates turns the custom_fields object of an update_ticket into
+// the list the API expects: [{"id":…,"value":…}]. A key is accepted as a field
+// id and as a field title, because a person writes "PST" where an integration
+// writes a number. Every key is looked up in the catalogue before the write:
+// an account that does not know a field — or does not offer a value on a
+// tagger or dropdown — ignores the write and answers ok, so a change can be
+// lost without a word (measured live, 2026-09-16). Refusing with the unknown
+// name or the offered values in hand is the point; passing the account's
+// silence on would be worse.
+func (c *Client) customFieldUpdates(ctx context.Context, in map[string]any) ([]map[string]any, error) {
+	catalogue, err := c.TicketFields(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]TicketField, len(catalogue))
+	byTitle := make(map[string]TicketField, len(catalogue))
+	for _, f := range catalogue {
+		byID[f.ID] = f
+		byTitle[strings.ToLower(strings.TrimSpace(f.Title))] = f
+	}
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]map[string]any, 0, len(in))
+	for _, key := range keys {
+		trimmed := strings.TrimSpace(key)
+		var (
+			fld TicketField
+			ok  bool
+		)
+		if idPattern.MatchString(trimmed) {
+			id, _ := strconv.ParseInt(trimmed, 10, 64)
+			fld, ok = byID[id]
+		} else {
+			fld, ok = byTitle[strings.ToLower(trimmed)]
+		}
+		if !ok {
+			return nil, fmt.Errorf("custom_fields: this account has no field %q — list_ticket_fields names them", key)
+		}
+		if fld.System {
+			return nil, fmt.Errorf("custom_fields: %q is a system field — update_ticket has its own parameter for it", key)
+		}
+		value := in[key]
+		// null clears a field; the two checks below are about values, not about
+		// absence.
+		if value != nil && len(fld.Values) > 0 {
+			switch fld.Type {
+			case "tagger", "dropdown":
+				s, isString := value.(string)
+				if !isString || !offered(fld.Values, s) {
+					return nil, fmt.Errorf("custom_fields: %q offers %s, got %v", key, strings.Join(fld.Values, ", "), value)
+				}
+			case "multiselect":
+				list, isList := value.([]any)
+				if !isList {
+					return nil, fmt.Errorf("custom_fields: %q is a multiselect — pass a JSON array of its values", key)
+				}
+				for _, v := range list {
+					s, isString := v.(string)
+					if !isString || !offered(fld.Values, s) {
+						return nil, fmt.Errorf("custom_fields: %q offers %s, got %v", key, strings.Join(fld.Values, ", "), v)
+					}
+				}
+			}
+		}
+		out = append(out, map[string]any{"id": fld.ID, "value": value})
+	}
+	return out, nil
 }
 
 // GetMetrics reads the timings of one ticket.

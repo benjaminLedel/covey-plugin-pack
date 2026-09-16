@@ -399,8 +399,15 @@ func (c *Client) changes(ctx context.Context, in updateFields) (map[string]any, 
 	if len(in.Tags) > 0 {
 		fields["tags"] = in.Tags
 	}
+	if len(in.CustomFields) > 0 {
+		custom, err := c.customFieldUpdates(ctx, in.CustomFields)
+		if err != nil {
+			return nil, err
+		}
+		fields["custom_fields"] = custom
+	}
 	if len(fields) == 0 {
-		return nil, fmt.Errorf("update_ticket: nothing to change — pass subject, status, priority, assignee, requester, type, group or tags")
+		return nil, fmt.Errorf("update_ticket: nothing to change — pass subject, status, priority, assignee, requester, type, group, tags or custom_fields")
 	}
 	return fields, nil
 }
@@ -408,14 +415,15 @@ func (c *Client) changes(ctx context.Context, in updateFields) (map[string]any, 
 // updateFields is the subset of the action parameters update_ticket reads, named
 // apart so that changes() says what it actually takes.
 type updateFields struct {
-	Subject   string   `json:"subject"`
-	Status    string   `json:"status"`
-	Priority  string   `json:"priority"`
-	Assignee  string   `json:"assignee"`
-	Requester string   `json:"requester"`
-	Type      string   `json:"type"`
-	Group     string   `json:"group"`
-	Tags      []string `json:"tags"`
+	Subject      string         `json:"subject"`
+	Status       string         `json:"status"`
+	Priority     string         `json:"priority"`
+	Assignee     string         `json:"assignee"`
+	Requester    string         `json:"requester"`
+	Type         string         `json:"type"`
+	Group        string         `json:"group"`
+	Tags         []string       `json:"tags"`
+	CustomFields map[string]any `json:"custom_fields"`
 }
 
 func (System) PromptDoc() string {
@@ -432,7 +440,14 @@ func (System) PromptDoc() string {
    attach_file {"ticket_id":123,"path":"screenshot.png","body":"…"},
    reply {"ticket_id":123,"body":"…","internal":true|false},
    create_ticket {"subject":"…","body":"…","requester":"customer@example.com","priority":"normal"},
-   update_ticket {"ticket_id":123,"priority":"high","assignee":"…"},
+   update_ticket {"ticket_id":123,"priority":"high","assignee":"…","custom_fields":{"PST":"cos"}},
+   Regular custom fields (dropdown, tagger, multiselect, number, date) go in
+   custom_fields, keyed by field title or field id as list_ticket_fields
+   reports them; a tagger or dropdown only takes a value the field offers —
+   an account ignores a write it was offered nothing for, silently and with
+   an ok, so the plugin checks the catalogue first and refuses with the
+   offered values. get_ticket reads custom_fields back, so a write can be
+   verified against what the ticket now carries.
    set_status {"ticket_id":123,"status":"pending"}, escalate {"ticket_id":123,"note":"…"},
    merge_tickets {"ticket_id":123,"merge_into":456,"note":"…"},
    list_groups {}, list_views {}, list_view_tickets {"view_id":2233,"limit":20},

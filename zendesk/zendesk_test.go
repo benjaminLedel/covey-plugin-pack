@@ -330,6 +330,10 @@ func (f *fake) applyUpdate(w http.ResponseWriter, id int64) {
 	if ticket == nil {
 		f.t.Errorf("PUT /tickets/%d.json arrived without a ticket object", id)
 	} else {
+		// A written custom field rides on the ticket, the way the API keeps it.
+		if cf, ok := ticket["custom_fields"]; ok {
+			tk["custom_fields"] = cf
+		}
 		if comment, ok := ticket["comment"].(map[string]any); ok {
 			next := f.nextCommentID
 			f.nextCommentID++
@@ -2032,6 +2036,65 @@ func TestReadsTheCatalogue(t *testing.T) {
 	}
 	if metrics.AgentWaitMin != 12 || metrics.ReplyCount != 2 {
 		t.Errorf("metrics: %+v", metrics)
+	}
+}
+
+func TestUpdatesRegularCustomFields(t *testing.T) {
+	f := newFake(t)
+	f.addTicket(42, 101, 9, "open", "Messwerte")
+	f.fields = []map[string]any{
+		{"id": 1, "title": "Type", "system": true, "raw_editable": true},
+		{
+			"id": 2, "title": "PST", "type": "tagger", "raw_editable": true,
+			"custom_field_options": []any{
+				map[string]any{"value": "cos"},
+				map[string]any{"value": "rüdi"},
+			},
+		},
+	}
+	c := f.client("tok")
+	ctx := context.Background()
+
+	// A title as key and a value the field offers: the write goes out through
+	// custom_fields and the ticket reads back what it became.
+	fields, err := c.changes(ctx, updateFields{CustomFields: map[string]any{"PST": "cos"}})
+	if err != nil {
+		t.Fatalf("changes: %v", err)
+	}
+	if _, err := c.UpdateTicket(ctx, 42, fields); err != nil {
+		t.Fatalf("UpdateTicket: %v", err)
+	}
+	tk, err := c.GetTicket(ctx, 42)
+	if err != nil {
+		t.Fatalf("GetTicket: %v", err)
+	}
+	if len(tk.CustomFields) != 1 || tk.CustomFields[0].ID != 2 || tk.CustomFields[0].Value != "cos" {
+		t.Errorf("the tagger reads back as %+v, expected field 2 with value cos", tk.CustomFields)
+	}
+
+	// An id is the same field as its title, a null clears the field.
+	fields, err = c.changes(ctx, updateFields{CustomFields: map[string]any{"2": nil}})
+	if err != nil {
+		t.Fatalf("changes with id key and null: %v", err)
+	}
+	if got, ok := fields["custom_fields"].([]map[string]any); !ok || len(got) != 1 || got[0]["id"] != int64(2) || got[0]["value"] != nil {
+		t.Errorf("custom_fields: %+v, expected one entry for field 2 cleared to null", fields["custom_fields"])
+	}
+
+	// What the account does not offer is refused with the offered values in
+	// hand, not handed to the account to be dropped without a word.
+	if _, err := c.changes(ctx, updateFields{CustomFields: map[string]any{"PST": "billing"}}); err == nil || !strings.Contains(err.Error(), "cos, rüdi") {
+		t.Errorf("a value no field offers: %v, expected a refusal naming cos and rüdi", err)
+	}
+	if _, err := c.changes(ctx, updateFields{CustomFields: map[string]any{"Phantom": "x"}}); err == nil || !strings.Contains(err.Error(), "no field") {
+		t.Errorf("a field this account lacks: %v", err)
+	}
+	if _, err := c.changes(ctx, updateFields{CustomFields: map[string]any{"Type": "incident"}}); err == nil || !strings.Contains(err.Error(), "system field") {
+		t.Errorf("a system field: %v, expected the pointer to its own parameter", err)
+	}
+	// custom_fields alone is a change; none at all names it among the options.
+	if _, err := c.changes(ctx, updateFields{}); err == nil || !strings.Contains(err.Error(), "custom_fields") {
+		t.Errorf("nothing to change should name custom_fields among the options: %v", err)
 	}
 }
 
