@@ -391,6 +391,22 @@ func pageSize(q url.Values, limit int) {
 	q.Set("page[size]", strconv.Itoa(atMostAHundred(limit)))
 }
 
+// newestFirst asks a list endpoint for its freshest rows. Which spelling that is
+// depends on the pagination the request asks for: a request carrying page[size]
+// (the cursor dialect, see pageSize) is sorted by `sort`, where a leading "-" is
+// descending — `sort_by` and `sort_order` belong to the offset dialect.
+//
+// Spelling it wrong is not an error but a silence. Handed sort_by=updated_at and
+// page[size] together, the account answers in its default order, which is by id
+// ascending: the OLDEST tickets the account holds. Nothing complains; the list
+// simply stops being the one the caller asked for. That is how the heartbeat
+// pre-check came to answer "no work" for a queue with open tickets in it — it read
+// the ten oldest tickets of the account, found them all solved, and reported a
+// backlog of nothing on every beat.
+func newestFirst(q url.Values) {
+	q.Set("sort", "-updated_at")
+}
+
 // searchPageSize is the same wish spelled for the search index, which pages by
 // an integer `page` and not by a cursor. Handed the cursor spelling it does not
 // ignore it — it reads page[size] as `page`, finds no number and answers
@@ -752,14 +768,17 @@ func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, erro
 	}
 
 	q := url.Values{}
-	q.Set("sort_by", "updated_at")
-	q.Set("sort_order", "desc")
 	path, key := "/tickets.json", "tickets"
 	if len(terms) > 0 {
 		path, key = "/search.json", "results"
 		q.Set("query", strings.Join(append([]string{"type:ticket"}, terms...), " "))
+		// The index is the one list that pages by an integer, so the offset
+		// spelling is the right one here (see searchPageSize).
+		q.Set("sort_by", "updated_at")
+		q.Set("sort_order", "desc")
 		searchPageSize(q, o.Limit)
 	} else {
+		newestFirst(q)
 		pageSize(q, o.Limit)
 	}
 	tickets, err := collect[Ticket](ctx, c, path, key, q, o.Limit)
@@ -1360,8 +1379,7 @@ func (c *Client) RequesterHistory(ctx context.Context, userID int64, limit int) 
 		return nil, fmt.Errorf("user_id missing — list_requester_history asks for the person behind a ticket, not for nobody")
 	}
 	q := url.Values{}
-	q.Set("sort_by", "updated_at")
-	q.Set("sort_order", "desc")
+	newestFirst(q)
 	pageSize(q, limit)
 	tickets, err := collect[Ticket](ctx, c, fmt.Sprintf("/users/%d/tickets/requested.json", userID), "tickets", q, limit)
 	if err != nil {
