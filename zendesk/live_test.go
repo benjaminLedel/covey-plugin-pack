@@ -3,6 +3,8 @@ package zendesk
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -254,6 +256,60 @@ func TestLiveHeartbeat(t *testing.T) {
 	}
 	for _, e := range entries {
 		t.Logf("  waiting: %s", e)
+	}
+}
+
+// TestLiveListSortsNewestFirst asks the account the one question the double cannot
+// answer: whether the sort the plain list is asked with is the sort the account
+// reads. It is asked for both spellings, because that difference is what an agent's
+// "no tickets waiting" rests on — see newestFirst in client.go.
+//
+// The offset spelling is only logged, not asserted: what the account does with a
+// parameter it was never meant to get is the account's business. What must hold is
+// the spelling the plugin actually sends.
+func TestLiveListSortsNewestFirst(t *testing.T) {
+	c := liveClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	frisch, err := c.ListTickets(ctx, ListOptions{Limit: 5})
+	if err != nil {
+		t.Fatalf("ListTickets: %v", err)
+	}
+	if len(frisch) < 2 {
+		t.Skip("account holds fewer than two tickets — nothing to sort")
+	}
+	for i := range frisch {
+		t.Logf("neueste Liste [%d]: id=%d updated=%s status=%s", i, frisch[i].ID, frisch[i].UpdatedAt, frisch[i].Status)
+	}
+	for i := range frisch[:len(frisch)-1] {
+		if frisch[i].UpdatedAt < frisch[i+1].UpdatedAt {
+			t.Errorf("`sort=-updated_at` answered oldest-first at %d: %s before %s",
+				frisch[i].ID, frisch[i].UpdatedAt, frisch[i+1].UpdatedAt)
+			break
+		}
+	}
+
+	q := url.Values{}
+	q.Set("sort_by", "updated_at")
+	q.Set("sort_order", "desc")
+	q.Set("page[size]", "5")
+	var gealtert struct {
+		Tickets []struct {
+			ID        int64  `json:"id"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"tickets"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/tickets.json", q, nil, &gealtert); err != nil {
+		t.Fatalf("offset spelling: %v", err)
+	}
+	if len(gealtert.Tickets) > 1 {
+		erste, letzte := gealtert.Tickets[0], gealtert.Tickets[len(gealtert.Tickets)-1]
+		t.Logf("sort_by=updated_at&sort_order=desc unter page[size]: erste id=%d updated=%s, letzte id=%d updated=%s",
+			erste.ID, erste.UpdatedAt, letzte.ID, letzte.UpdatedAt)
+		if erste.ID < letzte.ID {
+			t.Logf("→ the account read that as nothing and answered by id, oldest first (this is the trap)")
+		}
 	}
 }
 

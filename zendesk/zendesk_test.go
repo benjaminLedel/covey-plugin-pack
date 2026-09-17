@@ -218,7 +218,8 @@ func (f *fake) handleTicketList(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
-	if q := r.URL.Query(); q.Get("group_id") != "" || q.Get("status") != "" ||
+	q := r.URL.Query()
+	if q.Get("group_id") != "" || q.Get("status") != "" ||
 		q.Get("assignee_id") != "" || q.Get("requester_id") != "" || q.Get("organization_id") != "" {
 		f.t.Errorf("/tickets.json cannot filter — this belongs in a search query: %s", r.URL.RawQuery)
 	}
@@ -226,8 +227,49 @@ func (f *fake) handleTicketList(w http.ResponseWriter, r *http.Request) {
 	for _, tk := range f.tickets {
 		out = append(out, tk)
 	}
-	sortByID(out)
+	out = f.accountOrder(q, out)
 	writeJSON(w, map[string]any{"tickets": out, "next_page": nil})
+}
+
+// accountOrder answers a list the way the account answers it: by the order the
+// request asked for, in the dialect the request used, cut to the page it asked for.
+//
+// Under cursor pagination (page[size]) the account sorts by `sort`, a leading "-"
+// meaning descending, and reads sort_by as nothing. Under offset pagination the
+// pair sort_by + sort_order is what decides. Both spellings exist on the same
+// endpoint and asking in the wrong one is not an error, it is the default order —
+// id ascending, the oldest tickets first. A double that answered in one fixed order
+// whatever it was asked (this one used to) is a doppelgaenger: it confirmed the
+// plugin's assumption instead of testing it, and the pre-check spent weeks reading
+// the same ten solved tickets while the queue filled up.
+func (f *fake) accountOrder(q url.Values, rows []map[string]any) []map[string]any {
+	cursor := q.Get("page[size]") != "" || q.Get("page[after]") != "" || q.Get("page[before]") != ""
+	field, descending := "id", false
+	if cursor {
+		if q.Get("sort_by") != "" || q.Get("sort_order") != "" {
+			f.t.Errorf("cursor pagination sorts by `sort`; sort_by=%q arrives as nothing and the account answers oldest-first: %s",
+				q.Get("sort_by"), q.Encode())
+		}
+		field = strings.TrimPrefix(q.Get("sort"), "-")
+		descending = strings.HasPrefix(q.Get("sort"), "-")
+	} else {
+		field = q.Get("sort_by")
+		descending = q.Get("sort_order") == "desc"
+	}
+	if field == "" {
+		field = "id"
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := fmt.Sprint(rows[i][field]), fmt.Sprint(rows[j][field])
+		if descending {
+			return a > b
+		}
+		return a < b
+	})
+	if n, err := strconv.Atoi(q.Get("page[size]")); err == nil && n > 0 && len(rows) > n {
+		rows = rows[:n]
+	}
+	return rows
 }
 
 // handleTicketChild dispatches everything hanging off /api/v2/tickets/:id — the
@@ -543,7 +585,7 @@ func (f *fake) handleUserChild(w http.ResponseWriter, r *http.Request) {
 			out = append(out, tk)
 		}
 	}
-	writeJSON(w, map[string]any{"tickets": out, "next_page": nil})
+	writeJSON(w, map[string]any{"tickets": f.accountOrder(r.URL.Query(), out), "next_page": nil})
 }
 
 func (f *fake) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -1646,6 +1688,78 @@ func TestHeartbeatCostsLittle(t *testing.T) {
 	}
 }
 
+// TestPrecheckWakesOnTheNewestTickets is the account that has been running a while.
+//
+// The pre-check asks the plain list — the list endpoint takes exactly one status
+// filter, so "everything but solved and closed" is asked by reading the newest
+// tickets and dropping the rest here. Handed the wrong sorting dialect the account
+// does not answer an error, it answers in its default order: by id, oldest first.
+// An account whose old tickets are all solved then reports ten solved tickets, the
+// pre-check finds nothing open, and the heartbeat is skipped. Forever — a gate that
+// cannot open again is worse than no gate, because it looks like an empty queue.
+//
+// This is the live finding from covey.work: the same 24733 bytes on every beat for
+// eight hours, ticket 17340 first, while ten open tickets waited further down.
+func TestPrecheckWakesOnTheNewestTickets(t *testing.T) {
+	f := newFake(t)
+	for id := int64(100); id < 120; id++ {
+		tk := f.addTicket(id, 101, 9, "solved", fmt.Sprintf("alt %d", id))
+		tk["updated_at"] = fmt.Sprintf("2026-01-%02dT09:00:00Z", id-99)
+	}
+	frisch := f.addTicket(9001, 101, 9, "open", "Wartet auf Antwort")
+	frisch["updated_at"] = "2026-09-17T15:02:00Z"
+	f.withComments(9001, comment(501, 9, true, "Kunde wartet", "email"))
+
+	waiting, _, err := (System{}).HasWorkSigned(context.Background(), f.cred("tok"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waiting {
+		t.Fatal("the account holds an open ticket waiting for an answer — the beat must fire")
+	}
+
+	// The window moved, not just the answer: of the twenty old tickets not one is
+	// close enough to the top to be read.
+	lesen := 0
+	for _, r := range f.requests {
+		if strings.Contains(r, "/tickets/") && !strings.Contains(r, "tickets.json") {
+			lesen++
+		}
+	}
+	if lesen != 1 {
+		t.Errorf("%d ticket reads — the window is not the freshest ten: %v", lesen, f.requests)
+	}
+}
+
+// TestPlainListAnswersWithTheFreshestTickets is the same wrong dialect on the
+// agent-facing side: list_tickets with no filter asks the plain endpoint, and an
+// agent that gets the ten oldest tickets of an account instead of the ten newest
+// reports "nothing to do" having never seen the queue.
+func TestPlainListAnswersWithTheFreshestTickets(t *testing.T) {
+	f := newFake(t)
+	for id := int64(100); id < 120; id++ {
+		tk := f.addTicket(id, 101, 9, "open", fmt.Sprintf("alt %d", id))
+		tk["updated_at"] = fmt.Sprintf("2026-01-%02dT09:00:00Z", id-99)
+	}
+	frisch := f.addTicket(9001, 101, 9, "open", "Neuestes")
+	frisch["updated_at"] = "2026-09-17T15:02:00Z"
+
+	tickets, err := f.client("tok").ListTickets(context.Background(), ListOptions{Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tickets) != 5 {
+		t.Fatalf("%d tickets", len(tickets))
+	}
+	if tickets[0].ID != 9001 {
+		ids := []int64{}
+		for _, tk := range tickets {
+			ids = append(ids, tk.ID)
+		}
+		t.Errorf("newest-first list starts at %d, not at the freshest ticket: %v", tickets[0].ID, ids)
+	}
+}
+
 func TestWritesWorkSignatureOnlyForWrites(t *testing.T) {
 	writes := []string{"reply", "reply_external", "reply_internal", "update_ticket", "set_status", "escalate", "attach_file", "create_ticket"}
 	for _, a := range writes {
@@ -2038,12 +2152,20 @@ func TestReadsTheCatalogue(t *testing.T) {
 func TestRequesterHistoryIsTheAskersOwnTickets(t *testing.T) {
 	f := newFake(t)
 	f.addTicket(42, 101, 9, "solved", "schonmal")
+	neueste := f.addTicket(43, 101, 9, "open", "zuletzt")
+	neueste["updated_at"] = "2026-09-17T09:00:00Z"
 	hits, err := f.client("tok").RequesterHistory(context.Background(), 9, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 1 || hits[0].ID != 42 {
+	if len(hits) != 2 {
 		t.Fatalf("history: %+v", hits)
+	}
+	// "Has this come up before, and how did it end" is asked from the front. An
+	// answer that starts with the person's first ticket ever is the same list read
+	// backwards, which is what the cursor-dialect endpoint does with sort_by.
+	if hits[0].ID != 43 {
+		t.Errorf("history starts at ticket %d, not at the most recent one", hits[0].ID)
 	}
 	if _, err := f.client("tok").RequesterHistory(context.Background(), 0, 5); err == nil {
 		t.Error("history for nobody must be refused")
