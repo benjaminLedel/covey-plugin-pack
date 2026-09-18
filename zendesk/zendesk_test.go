@@ -1778,6 +1778,58 @@ func TestPlainListAnswersWithTheFreshestTickets(t *testing.T) {
 	}
 }
 
+// TestQueueViewCarriesNoMailBodies is #32: a list that hands over every ticket's
+// first mail does not arrive.
+//
+// Twenty rows of a live account were 27,734 characters, the runtime compressed the
+// answer and compressed its middle, and the agent — seeing the first rows and the
+// last one — reported "no candidates" with a ticket from that morning in the gap.
+// The text is not lost, it is one get_ticket away for the tickets actually taken on.
+func TestQueueViewCarriesNoMailBodies(t *testing.T) {
+	f := newFake(t)
+	f.addTicket(42, 101, 9, "open", "Frage")
+	f.addTicket(43, 101, 9, "open", "Noch eine Frage")
+	c := f.client("tok")
+
+	tickets, err := c.ListTickets(context.Background(), ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tickets) != 2 {
+		t.Fatalf("%d tickets", len(tickets))
+	}
+	for _, tk := range tickets {
+		if tk.Description != "" {
+			t.Errorf("ticket %d carries its mail into the list: %q", tk.ID, tk.Description)
+		}
+		if tk.Subject == "" || tk.Status == "" || tk.UpdatedAt == "" {
+			t.Errorf("the row lost what the queue is read for: %+v", tk)
+		}
+	}
+
+	view, err := c.ViewTickets(context.Background(), 9, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view) == 0 {
+		t.Fatal("the view answered with nothing")
+	}
+	for _, tk := range view {
+		if tk.Description != "" {
+			t.Errorf("view row %d carries its mail: %q", tk.ID, tk.Description)
+		}
+	}
+
+	// And the text is where it belongs.
+	full, err := c.GetTicket(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.Description == "" {
+		t.Error("get_ticket lost the first message too — then the list did not move it, it deleted it")
+	}
+}
+
 func TestWritesWorkSignatureOnlyForWrites(t *testing.T) {
 	writes := []string{"reply", "reply_external", "reply_internal", "update_ticket", "set_status", "escalate", "attach_file", "create_ticket"}
 	for _, a := range writes {

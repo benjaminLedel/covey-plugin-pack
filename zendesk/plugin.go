@@ -427,7 +427,9 @@ func (System) PromptDoc() string {
    "assignee":"me" or "assignee":"null" for the unassigned pile, "requester":"12345",
    "organization_id":123 — one of those per call, they answer different questions. Is your credential
    pinned to a group, that group is a CEILING: you see and touch its tickets and no others, and naming
-   a different one is an error),
+   a different one is an error. The rows say WHICH tickets: id, subject, status, tags, dates — not
+   what the customer wrote; that is get_ticket. And "status" takes exactly ONE value: a ticket nobody
+   has picked up yet is "new", not "open", so a queue is read as new AND open),
    search_tickets {"query":"status:open tag:billing login problem","limit":10} (the account's own
    search — how was this answered before?),
    list_messages {"ticket_id":123} (the thread oldest first; internal notes are marked),
