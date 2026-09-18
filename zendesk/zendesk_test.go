@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -638,8 +639,10 @@ func (f *fake) ticket(id, groupID int64, status, subject string) map[string]any 
 	return f.addTicket(id, groupID, 9, status, subject)
 }
 
-// withComments puts a thread inline on the ticket object, which is what the pre-check
-// reads and what GetTicket hands back.
+// withComments puts a thread inline on the ticket object. The real API does not send
+// that shape — a ticket object carries no comments, which is what #31 was about — so
+// this is a convenience for the tests that read a conversation, not a picture of a
+// live payload.
 func (f *fake) withComments(id int64, comments ...map[string]any) {
 	list := make([]any, 0, len(comments))
 	for _, cm := range comments {
@@ -1577,54 +1580,69 @@ func TestAttachFileUploadsThenComments(t *testing.T) {
 
 // ---------------------------------------------------------------- HEARTBEAT
 
-// TestHeartbeatWaitsOnCustomerWordsOnly is the pre-check: an open ticket whose newest
-// public comment came from a customer is work; one we answered is not.
-func TestHeartbeatWaitsOnCustomerWordsOnly(t *testing.T) {
+// TestPrecheckFingerprintsTheOpenQueue is the pre-check after #31: it says WHICH
+// tickets are open in scope and WHAT STATE they were in, it says it in one call, and
+// its fingerprint moves when a ticket moves.
+//
+// The test the gate used to carry — "whose words came last" — is gone because it was
+// never true on a live account: a ticket object carries no comments, so every ticket
+// fell through the "nothing was ever said here" branch, and where an account takes
+// its mail in under a shared support identity the author's role answers "we wrote
+// last" for the customer's own message.
+func TestPrecheckFingerprintsTheOpenQueue(t *testing.T) {
 	f := newFake(t)
-	f.addTicket(42, 101, 9, "open", "Frage")      // answered by us
-	f.addTicket(43, 101, 9, "open", "Neue Frage") // customer wrote last
-	f.addTicket(44, 101, 9, "open", "Ohne Wort")  // nothing said yet: IS the message
+	f.addTicket(42, 101, 9, "open", "Frage")
+	f.addTicket(43, 101, 9, "open", "Neue Frage")
+	f.addTicket(44, 101, 9, "pending", "Wartet auf den Kunden")
 	f.addTicket(45, 101, 9, "solved", "Erledigt")
-	f.withComments(42, comment(101, 9, true, "Kunde fragt", "email"), comment(102, 7, true, "Antwort vom Bot", "API"))
-	f.withComments(43, comment(201, 9, true, "Kunde fragt erneut", "email"))
 
 	cred := f.cred("bot@acme.example/token:apitok")
+	f.requests = nil
 	waiting, sig, err := (System{}).HasWorkSigned(context.Background(), cred, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !waiting {
-		t.Fatal("two tickets are waiting for an answer")
+		t.Fatal("three tickets are open — the beat must fire")
 	}
 	if !strings.HasPrefix(sig, "zendesk:waiting@") {
 		t.Errorf("signature carries no system prefix: %s", sig)
 	}
+
+	// One list read. The per-ticket reads the old gate spent were the price of an
+	// answer it never actually used.
+	ticketReads, audits := 0, 0
+	for _, r := range f.requests {
+		switch {
+		case strings.Contains(r, "audits.json"):
+			audits++
+		case strings.Contains(r, "/tickets/") && !strings.Contains(r, "tickets.json"):
+			ticketReads++
+		}
+	}
+	if ticketReads != 0 || audits != 0 {
+		t.Errorf("the gate read %d tickets and %d audit pages: %v", ticketReads, audits, f.requests)
+	}
+
 	entries, err := ticketsAwaitingReply(context.Background(), f.client("bot@acme.example/token:apitok"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("waiting set: %v", entries)
+	if len(entries) != 3 {
+		t.Fatalf("open set: %v", entries)
 	}
-	var has43, has44, has42 bool
-	for _, e := range entries {
-		switch {
-		case strings.HasPrefix(e, "ticket:42"):
-			has42 = true
-		case strings.HasPrefix(e, "ticket:43"):
-			has43 = true
-		case strings.HasPrefix(e, "ticket:44"):
-			has44 = true
+	for _, want := range []string{"ticket:42@2026-02-02T09:00:00Z", "ticket:43@2026-02-02T09:00:00Z", "ticket:44@2026-02-02T09:00:00Z"} {
+		if !slices.Contains(entries, want) {
+			t.Errorf("%q missing from the open set: %v", want, entries)
 		}
 	}
-	if has42 {
-		t.Error("the ticket we answered ourselves counts as work — the agent would wake on its own reply")
-	}
-	if !has43 || !has44 {
-		t.Errorf("waiting set incomplete: %v", entries)
+	for _, e := range entries {
+		if strings.HasPrefix(e, "ticket:45") {
+			t.Error("a solved ticket is in the open set")
+		}
 	}
 
-	// Stable across reads, and the two entry points agree.
+	// Nothing happened: the same state, the same signature, no second wake.
 	again, sig2, err := (System{}).HasWorkSigned(context.Background(), cred, "")
 	if err != nil {
 		t.Fatal(err)
@@ -1637,25 +1655,29 @@ func TestHeartbeatWaitsOnCustomerWordsOnly(t *testing.T) {
 		t.Errorf("HasWork said %v (%v)", any, err)
 	}
 
-	// The customer writes again → new signature → the wake happens.
-	f.withComments(43, comment(201, 9, true, "Kunde fragt erneut", "email"), comment(202, 9, true, "und nochmal", "email"))
+	// The customer writes on a ticket that is ALREADY in the set. This is the case
+	// the old fingerprint could not see — it hashed the ids alone, the set stayed
+	// the same, and the heartbeat was skipped as "backlog unchanged" while somebody
+	// waited.
+	f.tickets[43]["updated_at"] = "2026-02-03T11:00:00Z"
 	_, sig3, err := (System{}).HasWorkSigned(context.Background(), cred, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sig3 == sig {
-		t.Error("a new customer comment left the signature alone")
+		t.Error("a new comment on a ticket already in the set left the signature alone")
 	}
 
-	// Answer everything and the queue is empty: the expensive wake is skipped.
-	f.withComments(43, comment(202, 7, true, "geantwortet", "API"))
-	f.withComments(44, comment(301, 7, true, "geantwortet", "API"))
+	// Everything closed: the expensive wake is skipped.
+	for _, id := range []int64{42, 43, 44} {
+		f.tickets[id]["status"] = "solved"
+	}
 	any, _, err = (System{}).HasWorkSigned(context.Background(), cred, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if any {
-		t.Error("after answering everything, nothing is waiting")
+		t.Error("with nothing open, nothing is waiting")
 	}
 }
 
@@ -1665,26 +1687,25 @@ func TestHeartbeatCostsLittle(t *testing.T) {
 	f := newFake(t)
 	for id := int64(100); id < 105; id++ {
 		f.addTicket(id, 101, 9, "open", "x")
-		f.withComments(id, comment(1, 7, true, "geantwortet", "API"))
 	}
 	f.requests = nil
 	if _, _, err := (System{}).HasWorkSigned(context.Background(), f.cred("tok"), ""); err != nil {
 		t.Fatal(err)
 	}
-	audits, ticketReads := 0, 0
+	lists := 0
 	for _, r := range f.requests {
-		switch {
-		case strings.Contains(r, "audits.json"):
-			audits++
-		case strings.Contains(r, "/tickets/") && !strings.Contains(r, "tickets.json"):
-			ticketReads++
+		if strings.Contains(r, "tickets.json") {
+			lists++
+		}
+		if strings.Contains(r, "audits.json") {
+			t.Errorf("the gate read the audits: %v", f.requests)
+		}
+		if strings.Contains(r, "/tickets/") && !strings.Contains(r, "tickets.json") {
+			t.Errorf("the gate read a single ticket: %v", f.requests)
 		}
 	}
-	if audits > 0 {
-		t.Errorf("the audits were read (%d) although every ticket carried its thread inline", audits)
-	}
-	if ticketReads > 5 {
-		t.Errorf("%d ticket reads for 5 candidates — the limit is not holding", ticketReads)
+	if lists != 1 {
+		t.Errorf("%d list reads for one beat: %v", lists, f.requests)
 	}
 }
 
@@ -1708,7 +1729,6 @@ func TestPrecheckWakesOnTheNewestTickets(t *testing.T) {
 	}
 	frisch := f.addTicket(9001, 101, 9, "open", "Wartet auf Antwort")
 	frisch["updated_at"] = "2026-09-17T15:02:00Z"
-	f.withComments(9001, comment(501, 9, true, "Kunde wartet", "email"))
 
 	waiting, _, err := (System{}).HasWorkSigned(context.Background(), f.cred("tok"), "")
 	if err != nil {
@@ -1718,16 +1738,14 @@ func TestPrecheckWakesOnTheNewestTickets(t *testing.T) {
 		t.Fatal("the account holds an open ticket waiting for an answer — the beat must fire")
 	}
 
-	// The window moved, not just the answer: of the twenty old tickets not one is
-	// close enough to the top to be read.
-	lesen := 0
-	for _, r := range f.requests {
-		if strings.Contains(r, "/tickets/") && !strings.Contains(r, "tickets.json") {
-			lesen++
-		}
+	// The window moved, not just the answer: the one open ticket is in the set and
+	// the twenty old ones are not.
+	entries, err := ticketsAwaitingReply(context.Background(), f.client("tok"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if lesen != 1 {
-		t.Errorf("%d ticket reads — the window is not the freshest ten: %v", lesen, f.requests)
+	if len(entries) != 1 || entries[0] != "ticket:9001@2026-09-17T15:02:00Z" {
+		t.Errorf("the window is not the freshest ten: %v", entries)
 	}
 }
 

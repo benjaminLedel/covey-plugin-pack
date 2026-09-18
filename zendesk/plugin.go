@@ -87,9 +87,12 @@ func init() {
       alle: 15m nur-wenn: zendesk titel: Look after the support queue
       aufgabe: Check the open tickets (list_tickets) for ones waiting for an
       answer, read the conversation (list_messages) and reply.
-      nur-wenn: zendesk checks whether a ticket in scope is waiting for US; a
-      ticket nobody has answered yet counts, a ticket whose last public comment
-      came from our own API identity does not.
+      nur-wenn: zendesk asks in one call which tickets in scope are open and what
+      state they are in. It fires when that picture CHANGES — a new ticket, a new
+      comment, a status moved — and stays quiet while the queue stands still.
+      Which of the open tickets is actually news stays the agent's judgement: no
+      Zendesk field answers it, and the author of the newest comment does not
+      either where an account takes its mail in through a shared address.
    b) By webhook, if a ticket is to be picked up the moment it arrives. Create a
       webhook (Admin Center → Apps and extensions → Trigger and automation
       webhooks → Webhooks) with:

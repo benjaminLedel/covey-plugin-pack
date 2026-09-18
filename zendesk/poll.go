@@ -16,11 +16,17 @@ import (
 //
 // Zendesk has no endpoint that answers it. There is no "tickets waiting for you"
 // call, no unread marker, nothing that says which of the open tickets somebody has
-// not answered yet. Getting the answer costs one list read plus one read per
-// candidate, which is exactly why it is bounded by COVEY_ZENDESK_PROBE_TICKETS:
-// whoever has four hundred open tickets in scope is woken on the newest ten, and
-// which of them is actually news stays the agent's judgement rather than the
-// gate's.
+// not answered yet — and, as #31 showed on a live account, no reliable way to read
+// it off the tickets either: where an account takes its mail in through a shared
+// support address, the customer's own words arrive under a staff identity, and a
+// gate that asks "who wrote last" answers "we did" for the whole queue.
+//
+// So the gate answers the question it can answer honestly: WHICH tickets are open
+// in this agent's scope, and WHAT STATE were they in when we looked. Whether one of
+// them is news is the agent's judgement, and the signature is what keeps it from
+// being asked the same question twice. The window is bounded by
+// COVEY_ZENDESK_PROBE_TICKETS: whoever has four hundred open tickets in scope is
+// woken on the newest ten.
 
 // HasWork (target.WorkChecker) is the pre-check behind nur-wenn: zendesk. Zendesk
 // needs no webhook to be usable — an account that sets none up takes up work purely
@@ -32,11 +38,11 @@ func (System) HasWork(ctx context.Context, cred target.Credential) (bool, error)
 }
 
 // HasWorkSigned (target.SignedWorkChecker) is the check itself. Besides the yes/no
-// it returns a fingerprint of WHAT is waiting, so that the control plane does not
-// wake an agent twice over the same state: an agent may read a ticket, decide there
-// is nothing to do and end the run without writing — and must then not be started
-// again a minute later by the same ticket. The moment the customer writes again the
-// fingerprint changes and the wake happens.
+// it returns a fingerprint of WHAT is open, so that the control plane does not wake
+// an agent twice over the same state: an agent may read a ticket, decide there is
+// nothing to do and end the run without writing — and must then not be started again
+// a minute later by the same ticket. The moment anything happens on one of those
+// tickets the fingerprint changes and the wake happens.
 func (System) HasWorkSigned(ctx context.Context, cred target.Credential, kind string) (bool, string, error) {
 	c, err := NewClient(cred)
 	if err != nil {
@@ -52,21 +58,30 @@ func (System) HasWorkSigned(ctx context.Context, cred target.Credential, kind st
 	return true, signature(waiting), nil
 }
 
-// ticketsAwaitingReply returns one fingerprint entry per ticket that is waiting for
-// an answer: "ticket:<id>@<id of its newest comment>".
+// ticketsAwaitingReply returns one fingerprint entry per open ticket in this
+// agent's scope: "ticket:<id>@<updated_at>".
 //
-// Waiting means one of two things: the ticket has no comment at all — it IS the
-// customer's first message — or its newest PUBLIC comment came from somebody the
-// account does not count as staff. An end-user is not staff, which is the whole
-// test: everything else that writes on a ticket (an agent, an automation, the
-// account's own system) has answered something rather than asked something.
+// Both halves are read off the list row that has already been fetched, and that is
+// the point. The entry used to carry the id of the ticket's newest public comment,
+// read with one GetTicket per ticket — and that read answers with a ticket object,
+// which carries neither `comments` nor `comment_id` (the latter is filled by the
+// update path alone, see Client.Reply). So the branch below it, the one that asked
+// whether a customer or a colleague wrote last, was never reached on a live account:
+// every ticket fell into "nothing was ever said here" and counted as waiting, at the
+// price of a read per ticket per tick (#31).
 //
-// Who answered is not asked in the other direction on purpose. In a shared group a
-// colleague's answer is an answer, and the agent's own internal note ("waiting for
-// the log file") is a deliberate pause — neither is work. The one case that cannot
-// be told apart by role is a comment WE wrote while pretending to be a customer,
-// which is what an API-token credential can do; that is why every candidate is also
-// tested against this plugin's own identity (see Client.myID).
+// The consequence that hurt was not the wasted call but the signature: an entry of
+// "ticket:<id>@0" fingerprints the SET of open tickets, and a set does not change
+// when a customer writes on a ticket that is already in it. The heartbeat was then
+// skipped as "backlog unchanged" while somebody waited. `updated_at` is the field
+// that moves whenever anything happens on a ticket, it is free, and the control
+// plane's watermark is built to tell the agent's own writes from foreign ones
+// (target.SignatureWriter).
+//
+// What is deliberately NOT narrowed here: pending and hold count as open, because
+// which of an account's statuses mean "waiting on somebody else" is the account's
+// convention and not this plugin's to guess. The agent sees the status in the list
+// and decides.
 func ticketsAwaitingReply(ctx context.Context, c *Client) ([]string, error) {
 	// No status filter: the list endpoint takes exactly one, and "open" in Covey's
 	// sense is new, open, pending and hold together. One read without a filter,
@@ -81,76 +96,29 @@ func ticketsAwaitingReply(ctx context.Context, c *Client) ([]string, error) {
 		if !isOpen(t.Status) || !t.InScope || !t.InIntakeScope {
 			continue
 		}
-		last, waiting, err := newestPublicComment(ctx, c, t)
-		if err != nil {
-			return nil, err
-		}
-		if !waiting {
-			continue
-		}
-		entries = append(entries, "ticket:"+strconv.FormatInt(t.ID, 10)+"@"+strconv.FormatInt(last, 10))
+		entries = append(entries, "ticket:"+strconv.FormatInt(t.ID, 10)+"@"+ticketState(t))
 	}
 	return entries, nil
 }
 
-// newestPublicComment reports, for one ticket, the id of the comment the waiting
-// state hangs on and whether that state counts as work.
-//
-// It reads the ticket rather than its audits because that is one call instead of one
-// per page of history, and the ticket object carries its thread inline. Where an
-// account inlined nothing, the audits are asked — once, and the answer is the same.
-func newestPublicComment(ctx context.Context, c *Client, t Ticket) (int64, bool, error) {
-	full, err := c.GetTicket(ctx, t.ID)
-	if err != nil {
-		return 0, false, err
+// ticketState is the half of an entry that has to change when the ticket changes.
+// `updated_at` is that field; an account that sends none leaves the status, which at
+// least still moves when the ticket is worked on.
+func ticketState(t Ticket) string {
+	if v := strings.TrimSpace(t.UpdatedAt); v != "" {
+		return v
 	}
-	if full.LatestComment == 0 && len(full.Comments) == 0 {
-		// Nothing was ever said on this ticket. It IS the customer's message.
-		return 0, true, nil
-	}
-	comments := full.Comments
-	if len(comments) == 0 {
-		thread, err := c.Conversation(ctx, full.ID, 0)
-		if err != nil {
-			return 0, false, err
-		}
-		for _, cm := range thread {
-			if cm.Public {
-				comments = append(comments, cm)
-			}
-		}
-	}
-	var last *Comment
-	for i := range comments {
-		cm := comments[i]
-		if !cm.Public {
-			continue
-		}
-		if last == nil || cm.ID > last.ID {
-			last = &cm
-		}
-	}
-	if last == nil {
-		// Only internal notes. Somebody is already on this ticket and decided to
-		// wait for something — that is a pause, not work.
-		return full.LatestComment, false, nil
-	}
-	mine, err := c.myID(ctx)
-	if err == nil && last.Via.isAPI() && last.AuthorID == mine {
-		// Our own answer. This is the case the role test cannot see: an API-token
-		// credential can write as any user of the account, including a customer.
-		return last.ID, false, nil
-	}
-	c.namesFor(ctx, map[int64]struct{}{last.AuthorID: {}})
-	// Not staff means a customer wrote last. An agent, an admin or the account's own
-	// system has answered something rather than asked something.
-	return last.ID, !isStaff(c.userRole(last.AuthorID)), nil
+	return strings.TrimSpace(t.Status)
 }
 
 // isStaff: the roles that write on a ticket on the company's side. A role the
 // account would not name counts as not staff — the honest failure here is to wake
 // an agent for a ticket it then finds already answered. A run costs money; a customer
 // that is never answered costs something else.
+//
+// The webhook is what asks: there a payload names its author, and an account that
+// posts its own triggers can say so. The pre-check does not ask any more — see
+// ticketsAwaitingReply for why the same question has no honest answer there.
 func isStaff(role string) bool {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "agent", "admin", "team_member":
@@ -159,19 +127,8 @@ func isStaff(role string) bool {
 	return false
 }
 
-// isCustomerChannel: the channels a person outside the company writes through.
-// "api" and "automated-rule" are deliberately not among them — that is a system
-// talking, and systems do not need an agent woken for them.
-func isCustomerChannel(v channel) bool {
-	switch strings.ToLower(string(v)) {
-	case "email", "web form", "chat", "voice", "mobile", "twitter dm", "facebook post", "community topic":
-		return true
-	}
-	return false
-}
-
-// signature folds the waiting set into one short, stable string. Sorted first
-// because the map it comes out of has no order, and a signature that changes when
+// signature folds the open set into one short, stable string. Sorted first because
+// the list's order is the account's and not ours, and a signature that changes when
 // nothing changed wakes agents for nothing.
 //
 // The hash is a fingerprint of state, not a security decision: what matters is
