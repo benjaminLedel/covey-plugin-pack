@@ -87,9 +87,12 @@ func init() {
       alle: 15m nur-wenn: zendesk titel: Look after the support queue
       aufgabe: Check the open tickets (list_tickets) for ones waiting for an
       answer, read the conversation (list_messages) and reply.
-      nur-wenn: zendesk checks whether a ticket in scope is waiting for US; a
-      ticket nobody has answered yet counts, a ticket whose last public comment
-      came from our own API identity does not.
+      nur-wenn: zendesk asks in one call which tickets in scope are open and what
+      state they are in. It fires when that picture CHANGES — a new ticket, a new
+      comment, a status moved — and stays quiet while the queue stands still.
+      Which of the open tickets is actually news stays the agent's judgement: no
+      Zendesk field answers it, and the author of the newest comment does not
+      either where an account takes its mail in through a shared address.
    b) By webhook, if a ticket is to be picked up the moment it arrives. Create a
       webhook (Admin Center → Apps and extensions → Trigger and automation
       webhooks → Webhooks) with:
@@ -424,7 +427,9 @@ func (System) PromptDoc() string {
    "assignee":"me" or "assignee":"null" for the unassigned pile, "requester":"12345",
    "organization_id":123 — one of those per call, they answer different questions. Is your credential
    pinned to a group, that group is a CEILING: you see and touch its tickets and no others, and naming
-   a different one is an error),
+   a different one is an error. The rows say WHICH tickets: id, subject, status, tags, dates — not
+   what the customer wrote; that is get_ticket. And "status" takes exactly ONE value: a ticket nobody
+   has picked up yet is "new", not "open", so a queue is read as new AND open),
    search_tickets {"query":"status:open tag:billing login problem","limit":10} (the account's own
    search — how was this answered before?),
    list_messages {"ticket_id":123} (the thread oldest first; internal notes are marked),

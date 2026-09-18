@@ -786,7 +786,27 @@ func (c *Client) ListTickets(ctx context.Context, o ListOptions) ([]Ticket, erro
 		return nil, err
 	}
 	c.decorate(ctx, tickets)
-	return tickets, nil
+	return asQueueView(tickets), nil
+}
+
+// asQueueView takes the first mail out of the rows of a list.
+//
+// A ticket object carries its `description`: the customer's opening message in
+// full, with the disclaimer the mail gateway prepends, the signature block and
+// whatever thread was quoted underneath. One `list_tickets {"status":"open",
+// "limit":20}` on a live account came back as 27,734 characters, and an answer of
+// that size does not arrive: the runtime compresses it, and it compresses the
+// MIDDLE. The agent saw the first three tickets and the last one, reported "no
+// candidates" and left a ticket from that morning lying — nothing failed, nothing
+// was logged, the list was complete and the picture of it was not (#32).
+//
+// A list answers WHICH tickets. What they say is one `get_ticket` away, for the two
+// or three the agent actually takes on.
+func asQueueView(tickets []Ticket) []Ticket {
+	for i := range tickets {
+		tickets[i].Description = ""
+	}
+	return tickets
 }
 
 // narrowing turns the options into search terms — none of them if nothing is
@@ -1299,7 +1319,7 @@ func (c *Client) ViewTickets(ctx context.Context, viewID int64, limit int) ([]Ti
 		return nil, err
 	}
 	c.decorate(ctx, tickets)
-	return tickets, nil
+	return asQueueView(tickets), nil
 }
 
 // TicketFields is the field catalogue: what a ticket on this account can carry,
