@@ -1497,16 +1497,18 @@ const promptDocDeveloper = `   Writing developer actions:
    start_branch. Direct commits onto the default branch are forbidden — the route there goes through:
    create_merge_request {"project_id":N,"source_branch":"fix/…","target_branch":"main (optional, default: the default branch)",
    "title":"...","description":"...","assignee":"gitlab-username (optional)","issue_iid":N (optional),
-   "reviewer":"gitlab-username (optional)"} — opens the merge request. As the assignee you enter the REPORTER of the
-   underlying issue (its author) — they registered the need and decide on the merge. Simply pass
-   issue_iid instead and Covey enters the reporter itself. Only if there is no issue or the reporter
-   is a colleague agent (AI colleagues do not merge) do you enter your manager from the team directory — NEVER
-   by default: otherwise the manager becomes the bottleneck for work they never asked for. Without a reviewer the
-   assignee also becomes the reviewer (as before). If the section "Team (AI colleagues)" contains a QA/test agent responsible
-   for testing, you enter THEM as the reviewer (their GitLab user name exactly from the directory) — preferably a
-   colleague from YOUR TEAM (the same department); if there is none there, take whoever is responsible for testing
-   organisation-wide. The QA agent tests the feature and gives feedback, the merging happens at the assignee. The source
-   branch is removed automatically after the merge.
+   "reviewer":"gitlab-username (optional)"} — opens the merge request. What the two fields
+   MEAN: the assignee owns the merge request and decides on the merge; the reviewer is whoever looks at
+   it next, and setting one REPLACES the reviewer list. Pass issue_iid and the issue's reporter is
+   entered as the assignee for you. Without a reviewer the assignee reviews as well (as before). The
+   source branch is removed automatically after the merge.
+   What is USUAL, where your own config says nothing else: the merge request goes to whoever registered
+   the need, and a QA/test agent from the section "Team (AI colleagues)" — from your own department if
+   there is one there — becomes the reviewer, tests the feature and gives feedback. Do not enter your
+   manager by default: they become the bottleneck for work they never asked for.
+   Who may merge is not decided here. It is decided by the scope of the agent in question: whoever
+   carries the scope merge may merge, and whether that is a person or an agent is the operator's
+   arrangement, written in the agent's config — which beats this paragraph wherever the two disagree.
    How to work as a developer — when you do not only confirm a bug but fix it:
    1. checkout the project, reproduce the fault against the code (file:line).
    2. SET the project UP like a new colleague: read README/CONTRIBUTING, install the dependencies
