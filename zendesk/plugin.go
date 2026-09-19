@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
@@ -402,8 +403,30 @@ func (c *Client) changes(ctx context.Context, in updateFields) (map[string]any, 
 	if len(in.Tags) > 0 {
 		fields["tags"] = in.Tags
 	}
+	if len(in.CustomFields) > 0 {
+		// Sorted, so that the same request produces the same body — a map has no
+		// order, and a body that shuffles makes two identical writes look
+		// different in a log.
+		keys := make([]string, 0, len(in.CustomFields))
+		for k := range in.CustomFields {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		eigene := make([]map[string]any, 0, len(keys))
+		for _, k := range keys {
+			f, err := c.fieldByKey(ctx, k)
+			if err != nil {
+				return nil, err
+			}
+			if err := checkFieldValue(f, in.CustomFields[k]); err != nil {
+				return nil, err
+			}
+			eigene = append(eigene, map[string]any{"id": f.ID, "value": in.CustomFields[k]})
+		}
+		fields["custom_fields"] = eigene
+	}
 	if len(fields) == 0 {
-		return nil, fmt.Errorf("update_ticket: nothing to change — pass subject, status, priority, assignee, requester, type, group or tags")
+		return nil, fmt.Errorf("update_ticket: nothing to change — pass subject, status, priority, assignee, requester, type, group, tags or custom_fields")
 	}
 	return fields, nil
 }
@@ -419,6 +442,11 @@ type updateFields struct {
 	Type      string   `json:"type"`
 	Group     string   `json:"group"`
 	Tags      []string `json:"tags"`
+	// CustomFields are the account's own fields, keyed by field id or by the
+	// field's exact title. An account that routes its queue by a tagger field
+	// cannot be worked by an agent that can only write the eight named ones
+	// (#27).
+	CustomFields map[string]any `json:"custom_fields"`
 }
 
 func (System) PromptDoc() string {
@@ -437,7 +465,9 @@ func (System) PromptDoc() string {
    attach_file {"ticket_id":123,"path":"screenshot.png","body":"…"},
    reply {"ticket_id":123,"body":"…","internal":true|false},
    create_ticket {"subject":"…","body":"…","requester":"customer@example.com","priority":"normal"},
-   update_ticket {"ticket_id":123,"priority":"high","assignee":"…"},
+   update_ticket {"ticket_id":123,"priority":"high","assignee":"…","custom_fields":{"PST":"hph"}} — custom_fields
+   are this account's own fields, keyed by field title or field id; a tagger or dropdown takes one of its options
+   (list_ticket_fields names them) and anything else is refused rather than silently dropped,
    set_status {"ticket_id":123,"status":"pending"}, escalate {"ticket_id":123,"note":"…"},
    merge_tickets {"ticket_id":123,"merge_into":456,"note":"…"},
    list_groups {}, list_views {}, list_view_tickets {"view_id":2233,"limit":20},

@@ -2260,6 +2260,85 @@ func TestProbeNamesTheIdentity(t *testing.T) {
 	}
 }
 
+// TestUpdateTicketWritesOwnFields is #27: an account that routes its queue by a
+// tagger field ("PST") could not be worked by an agent — update_ticket sent the
+// eight named fields and nothing else, and the value of such a field was not even
+// readable, because the ticket payload dropped custom_fields.
+func TestUpdateTicketWritesOwnFields(t *testing.T) {
+	f := newFake(t)
+	tk := f.addTicket(42, 101, 9, "open", "Routing")
+	tk["custom_fields"] = []any{map[string]any{"id": 2, "value": "dns"}}
+	f.fields = []map[string]any{
+		{"id": 1, "title": "Type", "system": true, "raw_editable": true},
+		{
+			"id": 2, "title": "Root cause", "type": "tagger", "raw_editable": true, "tag": "root_cause",
+			"custom_field_options": []any{
+				map[string]any{"value": "dns"},
+				map[string]any{"value": "capacity"},
+			},
+		},
+		{"id": 3, "title": "Kundennummer", "type": "text", "raw_editable": true},
+	}
+	sys := System{}
+	cred := f.cred("tok")
+	ctx := context.Background()
+
+	// Reading: the field's value arrives instead of being dropped in the decode.
+	voll, err := f.client("tok").GetTicket(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(voll.CustomFields) != 1 || voll.CustomFields[0].ID != 2 || voll.CustomFields[0].Value != "dns" {
+		t.Fatalf("the ticket's own fields did not arrive: %+v", voll.CustomFields)
+	}
+
+	// Writing by title, and by id — both spellings a human reads.
+	for _, schluessel := range []string{"Root cause", "2"} {
+		if _, err := sys.Execute(ctx, "update_ticket",
+			[]byte(`{"ticket_id":42,"custom_fields":{"`+schluessel+`":"capacity"}}`), cred); err != nil {
+			t.Fatalf("update_ticket with %q: %v", schluessel, err)
+		}
+		ticket, _ := f.lastBody["ticket"].(map[string]any)
+		liste, _ := ticket["custom_fields"].([]any)
+		if len(liste) != 1 {
+			t.Fatalf("custom_fields did not go out: %+v", ticket)
+		}
+		eintrag, _ := liste[0].(map[string]any)
+		if eintrag["id"] != float64(2) || eintrag["value"] != "capacity" {
+			t.Errorf("the account is written to by id and value: %+v", eintrag)
+		}
+	}
+
+	// A tagger takes one of its options. An account answers ok and stores
+	// nothing when it gets anything else, so the refusal has to happen here —
+	// and it has to name what IS allowed.
+	_, err = sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Root cause":"gremlins"}}`), cred)
+	if err == nil {
+		t.Fatal("a value outside the field's options must be refused")
+	}
+	for _, muss := range []string{"dns", "capacity"} {
+		if !strings.Contains(err.Error(), muss) {
+			t.Errorf("the message has to name the options, got: %v", err)
+		}
+	}
+
+	// A field this account does not have, and a system field that has its own
+	// parameter — both are caller errors with a way out in the message.
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Gibtsnicht":"x"}}`), cred); err == nil ||
+		!strings.Contains(err.Error(), "Root cause") {
+		t.Errorf("an unknown field must name the catalogue, got: %v", err)
+	}
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Type":"question"}}`), cred); err == nil ||
+		!strings.Contains(err.Error(), "system field") {
+		t.Errorf("a system field must point at its own parameter, got: %v", err)
+	}
+
+	// A free-text field has no options, so it takes what it is given.
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Kundennummer":"K-4711"}}`), cred); err != nil {
+		t.Errorf("a text field takes free text: %v", err)
+	}
+}
+
 func TestReadsTheCatalogue(t *testing.T) {
 	f := newFake(t)
 	f.addTicket(42, 101, 9, "open", "Messwerte")
