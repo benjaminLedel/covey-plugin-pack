@@ -1380,20 +1380,41 @@ func (c *Client) fieldByKey(ctx context.Context, key string) (TicketField, error
 // else does not answer an error: it stores nothing and reports ok. Refusing here,
 // with the allowed values in the message, is the difference between a write that
 // failed and a write that lied.
+//
+// What it does NOT refuse is null: that is how a field is cleared, and clearing
+// is a write like any other. And a multiselect takes a LIST of its options — the
+// shape follows the field's type rather than the presence of options, so a
+// multiselect is not rejected for failing to be a string (from #28, which had
+// this right before this branch did).
 func checkFieldValue(f TicketField, value any) error {
-	if len(f.Values) == 0 {
+	if len(f.Values) == 0 || value == nil {
 		return nil
 	}
-	v, ok := value.(string)
-	if !ok {
-		return fmt.Errorf("custom_fields: %q takes one of its options (%s), not %T", f.Title, strings.Join(f.Values, ", "), value)
-	}
-	for _, opt := range f.Values {
-		if opt == v {
-			return nil
+	erlaubt := func(v any) error {
+		s, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("custom_fields: %q takes one of its options (%s), not %T", f.Title, strings.Join(f.Values, ", "), v)
 		}
+		for _, opt := range f.Values {
+			if opt == s {
+				return nil
+			}
+		}
+		return fmt.Errorf("custom_fields: %q does not take %q — its options are: %s", f.Title, s, strings.Join(f.Values, ", "))
 	}
-	return fmt.Errorf("custom_fields: %q does not take %q — its options are: %s", f.Title, v, strings.Join(f.Values, ", "))
+	if f.Type == "multiselect" {
+		list, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("custom_fields: %q is a multiselect — pass a JSON array of its options (%s)", f.Title, strings.Join(f.Values, ", "))
+		}
+		for _, v := range list {
+			if err := erlaubt(v); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return erlaubt(value)
 }
 
 func (c *Client) TicketFields(ctx context.Context) ([]TicketField, error) {
