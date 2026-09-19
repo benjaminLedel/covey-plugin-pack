@@ -45,16 +45,20 @@ type fake struct {
 	fields  []map[string]any
 	metrics map[int64]map[string]any
 
-	requests      []string          // "METHOD path?query", in the order they arrived
-	authSeen      []string          // Authorization header of each API call
-	mints         int               // POSTs to /oauth/tokens
-	tokenSeq      int               // which minted token number we are on
-	nextCommentID int64             // the id the next written comment gets
-	reject        bool              // answer every API call with 401
-	rejectMint    bool              // answer the token endpoint with 401
-	lastBody      map[string]any    // last request body with a JSON object in it
-	deleted       string            // path of the last DELETE
-	noAuth        map[string]string // path → auth header seen, for the foreign-host check
+	requests      []string // "METHOD path?query", in the order they arrived
+	authSeen      []string // Authorization header of each API call
+	mints         int      // POSTs to /oauth/tokens
+	tokenSeq      int      // which minted token number we are on
+	nextCommentID int64    // the id the next written comment gets
+	// wieInEcht: answer an update the way a live account does — the ticket
+	// WITHOUT its thread, and the comment that was just created in the update's
+	// own audit. The default keeps the inlined shape the older tests rely on.
+	wieInEcht  bool
+	reject     bool              // answer every API call with 401
+	rejectMint bool              // answer the token endpoint with 401
+	lastBody   map[string]any    // last request body with a JSON object in it
+	deleted    string            // path of the last DELETE
+	noAuth     map[string]string // path → auth header seen, for the foreign-host check
 }
 
 func newFake(t *testing.T) *fake {
@@ -398,6 +402,37 @@ func (f *fake) applyUpdate(w http.ResponseWriter, id int64) {
 			}
 			tk["comments"] = append(commentsOf(tk), newComment)
 			tk["comment_id"] = next
+			if f.wieInEcht {
+				// What a live account sends back: the ticket WITHOUT its thread,
+				// and the comment that was just created in the update's own audit.
+				// The fake keeps the thread for itself, so list_messages still
+				// works — only the response drops it, as the API does.
+				for _, key := range []string{"status", "priority", "group_id", "tags", "subject", "assignee_id"} {
+					if v, ok := ticket[key]; ok {
+						tk[key] = v
+					}
+				}
+				ohneVerlauf := map[string]any{}
+				for k, v := range tk {
+					if k == "comments" || k == "comment_id" {
+						continue
+					}
+					ohneVerlauf[k] = v
+				}
+				writeJSON(w, map[string]any{
+					"ticket": ohneVerlauf,
+					"audit": map[string]any{
+						"id": next * 10, "ticket_id": id, "author_id": 7,
+						"created_at": "2026-02-03T10:00:00Z",
+						"events": []any{
+							map[string]any{"type": "Notification", "id": next * 11},
+							map[string]any{"type": "Comment", "id": next, "public": comment["public"] == true,
+								"author_id": 7, "body": body, "plain_body": body},
+						},
+					},
+				})
+				return
+			}
 		}
 		for _, key := range []string{"status", "priority", "group_id", "tags", "subject", "assignee_id"} {
 			if v, ok := ticket[key]; ok {
@@ -1260,6 +1295,30 @@ func TestSearchPutsTypeTicketInFront(t *testing.T) {
 // TestReplyIsAnUpdateAndSettlesTheStatus: Zendesk has no "add a comment" endpoint, so
 // a reply is a ticket update carrying a comment — and an answer that went out to the
 // customer leaves the ticket pending, which is what the queue means by "answered".
+// TestReplyReportsTheIdTheAccountGave is #36: reply answered with comment_id 0
+// on every live account, because it read the id off the ticket object of the
+// update response — and a ticket object carries no comments. The id is in the
+// update's own audit, which is what the account actually sends.
+func TestReplyReportsTheIdTheAccountGave(t *testing.T) {
+	f := newFake(t)
+	f.wieInEcht = true
+	f.addTicket(42, 101, 9, "open", "Frage")
+
+	cm, err := f.client("tok").Reply(context.Background(), 42, "ANALYSE (covey): geprueft", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.ID == 0 {
+		t.Fatal("reply reported comment_id 0 — the agent cannot point at what it wrote")
+	}
+	if cm.Public {
+		t.Error("an internal note must not come back as public")
+	}
+	if cm.Body != "ANALYSE (covey): geprueft" {
+		t.Errorf("body: %q", cm.Body)
+	}
+}
+
 func TestReplyIsAnUpdateAndSettlesTheStatus(t *testing.T) {
 	f := newFake(t)
 	f.addTicket(42, 101, 9, "open", "Login kaputt")
@@ -2198,6 +2257,85 @@ func TestProbeNamesTheIdentity(t *testing.T) {
 	}
 	if static.ExpiresAt != nil {
 		t.Errorf("a token that was not minted here reports a minted expiry: %v", static.ExpiresAt)
+	}
+}
+
+// TestUpdateTicketWritesOwnFields is #27: an account that routes its queue by a
+// tagger field ("PST") could not be worked by an agent — update_ticket sent the
+// eight named fields and nothing else, and the value of such a field was not even
+// readable, because the ticket payload dropped custom_fields.
+func TestUpdateTicketWritesOwnFields(t *testing.T) {
+	f := newFake(t)
+	tk := f.addTicket(42, 101, 9, "open", "Routing")
+	tk["custom_fields"] = []any{map[string]any{"id": 2, "value": "dns"}}
+	f.fields = []map[string]any{
+		{"id": 1, "title": "Type", "system": true, "raw_editable": true},
+		{
+			"id": 2, "title": "Root cause", "type": "tagger", "raw_editable": true, "tag": "root_cause",
+			"custom_field_options": []any{
+				map[string]any{"value": "dns"},
+				map[string]any{"value": "capacity"},
+			},
+		},
+		{"id": 3, "title": "Kundennummer", "type": "text", "raw_editable": true},
+	}
+	sys := System{}
+	cred := f.cred("tok")
+	ctx := context.Background()
+
+	// Reading: the field's value arrives instead of being dropped in the decode.
+	voll, err := f.client("tok").GetTicket(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(voll.CustomFields) != 1 || voll.CustomFields[0].ID != 2 || voll.CustomFields[0].Value != "dns" {
+		t.Fatalf("the ticket's own fields did not arrive: %+v", voll.CustomFields)
+	}
+
+	// Writing by title, and by id — both spellings a human reads.
+	for _, schluessel := range []string{"Root cause", "2"} {
+		if _, err := sys.Execute(ctx, "update_ticket",
+			[]byte(`{"ticket_id":42,"custom_fields":{"`+schluessel+`":"capacity"}}`), cred); err != nil {
+			t.Fatalf("update_ticket with %q: %v", schluessel, err)
+		}
+		ticket, _ := f.lastBody["ticket"].(map[string]any)
+		liste, _ := ticket["custom_fields"].([]any)
+		if len(liste) != 1 {
+			t.Fatalf("custom_fields did not go out: %+v", ticket)
+		}
+		eintrag, _ := liste[0].(map[string]any)
+		if eintrag["id"] != float64(2) || eintrag["value"] != "capacity" {
+			t.Errorf("the account is written to by id and value: %+v", eintrag)
+		}
+	}
+
+	// A tagger takes one of its options. An account answers ok and stores
+	// nothing when it gets anything else, so the refusal has to happen here —
+	// and it has to name what IS allowed.
+	_, err = sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Root cause":"gremlins"}}`), cred)
+	if err == nil {
+		t.Fatal("a value outside the field's options must be refused")
+	}
+	for _, muss := range []string{"dns", "capacity"} {
+		if !strings.Contains(err.Error(), muss) {
+			t.Errorf("the message has to name the options, got: %v", err)
+		}
+	}
+
+	// A field this account does not have, and a system field that has its own
+	// parameter — both are caller errors with a way out in the message.
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Gibtsnicht":"x"}}`), cred); err == nil ||
+		!strings.Contains(err.Error(), "Root cause") {
+		t.Errorf("an unknown field must name the catalogue, got: %v", err)
+	}
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Type":"question"}}`), cred); err == nil ||
+		!strings.Contains(err.Error(), "system field") {
+		t.Errorf("a system field must point at its own parameter, got: %v", err)
+	}
+
+	// A free-text field has no options, so it takes what it is given.
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Kundennummer":"K-4711"}}`), cred); err != nil {
+		t.Errorf("a text field takes free text: %v", err)
 	}
 }
 

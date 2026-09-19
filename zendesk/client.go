@@ -467,6 +467,21 @@ type Ticket struct {
 	// a ticket without reading a log.
 	InScope       bool `json:"in_scope"`
 	InIntakeScope bool `json:"in_intake_scope"`
+
+	// CustomFields are the account's own fields, the way the API names them:
+	// id and value. They are carried through rather than dropped because a
+	// field an agent can be routed by (a tagger such as "PST") is one it has to
+	// be able to READ — otherwise it can only infer its own assignment from the
+	// tags, which an account does not keep truthful (#27).
+	CustomFields []CustomField `json:"custom_fields,omitempty"`
+}
+
+// CustomField is one entry of a ticket's own fields. The value is whatever the
+// field is: a string for a tagger or a text field, a number, a boolean, a list
+// for a multi-select — so it stays `any` rather than being forced into a string.
+type CustomField struct {
+	ID    int64 `json:"id"`
+	Value any   `json:"value"`
 }
 
 // Comment is one entry of a ticket's conversation. Zendesk does not store a
@@ -1324,6 +1339,63 @@ func (c *Client) ViewTickets(ctx context.Context, viewID int64, limit int) ([]Ti
 
 // TicketFields is the field catalogue: what a ticket on this account can carry,
 // which of it is required, and what the allowed values of a dropdown are.
+// fieldByKey resolves what an agent wrote — a field id or a field's exact title —
+// against the account's own catalogue. Both spellings are allowed because both are
+// what a human reads: the id is what the API speaks, the title is what the field is
+// called in the admin UI and in list_ticket_fields.
+//
+// Unknown keys are refused rather than passed on. An account silently ignores a
+// custom field it does not know, so a write that "worked" would leave the agent
+// believing it had routed a ticket it never touched.
+func (c *Client) fieldByKey(ctx context.Context, key string) (TicketField, error) {
+	fields, err := c.TicketFields(ctx)
+	if err != nil {
+		return TicketField{}, err
+	}
+	want := strings.ToLower(strings.TrimSpace(key))
+	if want == "" {
+		return TicketField{}, fmt.Errorf("custom_fields: a field without a name")
+	}
+	var namen []string
+	for _, f := range fields {
+		if f.System {
+			continue
+		}
+		namen = append(namen, f.Title)
+		if strconv.FormatInt(f.ID, 10) == want || strings.ToLower(f.Title) == want {
+			return f, nil
+		}
+	}
+	for _, f := range fields {
+		if f.System && (strconv.FormatInt(f.ID, 10) == want || strings.ToLower(f.Title) == want) {
+			return TicketField{}, fmt.Errorf("custom_fields: %q is a system field — set it with its own parameter (subject, status, priority, assignee, requester, type, group, tags)", key)
+		}
+	}
+	sort.Strings(namen)
+	return TicketField{}, fmt.Errorf("custom_fields: this account has no field %q — list_ticket_fields names them: %s", key, strings.Join(namen, ", "))
+}
+
+// checkFieldValue holds a value against what the field allows. A tagger or a
+// dropdown has a fixed set of options, and an account that is handed something
+// else does not answer an error: it stores nothing and reports ok. Refusing here,
+// with the allowed values in the message, is the difference between a write that
+// failed and a write that lied.
+func checkFieldValue(f TicketField, value any) error {
+	if len(f.Values) == 0 {
+		return nil
+	}
+	v, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("custom_fields: %q takes one of its options (%s), not %T", f.Title, strings.Join(f.Values, ", "), value)
+	}
+	for _, opt := range f.Values {
+		if opt == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("custom_fields: %q does not take %q — its options are: %s", f.Title, v, strings.Join(f.Values, ", "))
+}
+
 func (c *Client) TicketFields(ctx context.Context) ([]TicketField, error) {
 	q := url.Values{}
 	pageSize(q, 0)
@@ -1702,20 +1774,42 @@ func (c *Client) Reply(ctx context.Context, ticketID int64, body string, interna
 	}
 	var out struct {
 		Ticket Ticket `json:"ticket"`
+		// The update's own audit — this is where the account puts the comment it
+		// just created. It is asked for because the ticket beside it does not
+		// carry one: a ticket object has no thread, which is why the branch below
+		// it never ran and reply answered with comment_id 0 on every live account
+		// (#36, same assumption as #31 and #34).
+		Audit audit `json:"audit"`
 	}
 	if err := c.do(ctx, http.MethodPut, fmt.Sprintf("/tickets/%d.json", ticketID), nil,
 		map[string]any{"ticket": map[string]any{"comment": comment}}, &out); err != nil {
 		return Comment{}, err
 	}
-	// The response carries the ticket with its thread, oldest comment first — so
-	// the newest one is the answer that was just written, and the caller sees the id
-	// and timestamp the account gave it rather than what this plugin guessed.
+	// Where an account does inline the thread, the newest comment is the answer
+	// just written and carries the account's own timestamp.
 	if n := len(out.Ticket.Comments); n > 0 {
 		last := out.Ticket.Comments[n-1]
 		c.namesFor(ctx, map[int64]struct{}{last.AuthorID: {}})
 		last.Author = c.userName(last.AuthorID)
 		last.AuthorRole = c.userRole(last.AuthorID)
 		return last, nil
+	}
+	// The ordinary case: read the id off the audit event. An agent that gets an
+	// id back can point at what it wrote — "my note on this ticket" — instead of
+	// reading the whole thread again to find itself in it.
+	for i := len(out.Audit.Events) - 1; i >= 0; i-- {
+		e := out.Audit.Events[i]
+		if !isComment(e.Type) || e.ID == 0 {
+			continue
+		}
+		wrote := Comment{ID: e.ID, Public: e.Public, Body: body, AuthorID: e.AuthorID,
+			CreatedAt: out.Audit.CreatedAt}
+		if e.AuthorID != 0 {
+			c.namesFor(ctx, map[int64]struct{}{e.AuthorID: {}})
+			wrote.Author = c.userName(e.AuthorID)
+			wrote.AuthorRole = c.userRole(e.AuthorID)
+		}
+		return wrote, nil
 	}
 	return Comment{ID: out.Ticket.LatestComment, Public: !internal, Body: body}, nil
 }

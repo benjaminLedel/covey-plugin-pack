@@ -1189,17 +1189,32 @@ var aktionen = map[string]aktion{
 		}
 	},
 	"assign": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
-		if in.ProjectID == 0 || in.IssueIID == 0 {
-			return nil, fmt.Errorf("project_id or issue_iid missing")
+		// Works on either an issue or a merge request, the way set_labels does
+		// below: GitLab keeps them as two resources, so the target is whichever
+		// id the caller supplied, and issue_iid wins if both arrive. Before, an
+		// MR's assignee could be set exactly once — at create_merge_request —
+		// and an agent that entered the wrong one could not take it back (#25).
+		if in.ProjectID == 0 {
+			return nil, fmt.Errorf("project_id missing")
+		}
+		if in.IssueIID == 0 && in.MRIID == 0 {
+			return nil, fmt.Errorf("issue_iid or mr_iid missing")
 		}
 		u, err := gc.LookupUser(ctx, in.Username)
 		if err != nil {
 			return nil, err
 		}
-		if err := gc.AssignIssue(ctx, in.ProjectID, in.IssueIID, []int{u.ID}); err != nil {
+		if in.IssueIID != 0 {
+			if err := gc.AssignIssue(ctx, in.ProjectID, in.IssueIID, []int{u.ID}); err != nil {
+				return nil, err
+			}
+			return map[string]any{"issue_iid": in.IssueIID, "assigned_to": u.Username, "user_id": u.ID}, nil
+		}
+		mr, err := gc.AssignMR(ctx, in.ProjectID, in.MRIID, []int{u.ID})
+		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"assigned_to": u.Username, "user_id": u.ID}, nil
+		return map[string]any{"mr_iid": mr.IID, "assigned_to": u.Username, "user_id": u.ID}, nil
 	},
 	"set_labels": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
 		// Works on either an issue or a merge request — GitLab exposes labels
@@ -1426,9 +1441,10 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    set_state {"project_id":N,"issue_iid":N|"mr_iid":N,"state":"close"|"reopen"} — works on an issue OR a merge request
    (whichever id you give); closing an MR this way is NOT a merge, use it for one that is superseded/redundant/withdrawn
    and was never meant to land, escalate {"project_id":N,"issue_iid":N,"note":"..."},
-   assign {"project_id":N,"issue_iid":N,"username":"gitlab-username"} assigns the issue to a person — after a fix,
-   for instance, to the team member responsible for testing according to the team directory; take the GitLab user name
-   exactly from the section "Team (human employees)" of your prompt and explain the handover in a comment,
+   assign {"project_id":N,"issue_iid":N | "mr_iid":N,"username":"gitlab-username"} assigns an issue OR a merge
+   request to somebody and REPLACES whoever was entered — after a fix, for instance, to the team member responsible
+   for testing according to the team directory; take the GitLab user name exactly from the section
+   "Team (human employees)" of your prompt and explain the handover in a comment,
    set_labels {"project_id":N,"issue_iid":N,"add_labels":["…"],"remove_labels":["…"]} sets and removes labels on an
    EXISTING issue without touching the others (give at least one of the two lists; the answer contains the
    label state reached). Give "mr_iid" instead of "issue_iid" to do the exact same thing on a merge request
@@ -1497,16 +1513,18 @@ const promptDocDeveloper = `   Writing developer actions:
    start_branch. Direct commits onto the default branch are forbidden — the route there goes through:
    create_merge_request {"project_id":N,"source_branch":"fix/…","target_branch":"main (optional, default: the default branch)",
    "title":"...","description":"...","assignee":"gitlab-username (optional)","issue_iid":N (optional),
-   "reviewer":"gitlab-username (optional)"} — opens the merge request. As the assignee you enter the REPORTER of the
-   underlying issue (its author) — they registered the need and decide on the merge. Simply pass
-   issue_iid instead and Covey enters the reporter itself. Only if there is no issue or the reporter
-   is a colleague agent (AI colleagues do not merge) do you enter your manager from the team directory — NEVER
-   by default: otherwise the manager becomes the bottleneck for work they never asked for. Without a reviewer the
-   assignee also becomes the reviewer (as before). If the section "Team (AI colleagues)" contains a QA/test agent responsible
-   for testing, you enter THEM as the reviewer (their GitLab user name exactly from the directory) — preferably a
-   colleague from YOUR TEAM (the same department); if there is none there, take whoever is responsible for testing
-   organisation-wide. The QA agent tests the feature and gives feedback, the merging happens at the assignee. The source
-   branch is removed automatically after the merge.
+   "reviewer":"gitlab-username (optional)"} — opens the merge request. What the two fields
+   MEAN: the assignee owns the merge request and decides on the merge; the reviewer is whoever looks at
+   it next, and setting one REPLACES the reviewer list. Pass issue_iid and the issue's reporter is
+   entered as the assignee for you. Without a reviewer the assignee reviews as well (as before). The
+   source branch is removed automatically after the merge.
+   What is USUAL, where your own config says nothing else: the merge request goes to whoever registered
+   the need, and a QA/test agent from the section "Team (AI colleagues)" — from your own department if
+   there is one there — becomes the reviewer, tests the feature and gives feedback. Do not enter your
+   manager by default: they become the bottleneck for work they never asked for.
+   Who may merge is not decided here. It is decided by the scope of the agent in question: whoever
+   carries the scope merge may merge, and whether that is a person or an agent is the operator's
+   arrangement, written in the agent's config — which beats this paragraph wherever the two disagree.
    How to work as a developer — when you do not only confirm a bug but fix it:
    1. checkout the project, reproduce the fault against the code (file:line).
    2. SET the project UP like a new colleague: read README/CONTRIBUTING, install the dependencies

@@ -1646,6 +1646,31 @@ func TestAssignAction(t *testing.T) {
 	if _, err := sys.Execute(ctx, "assign", []byte(`{"username":"maxm"}`), cred); err == nil {
 		t.Fatal("assign without project_id/issue_iid must be refused")
 	}
+	if _, err := sys.Execute(ctx, "assign", []byte(`{"project_id":15,"username":"maxm"}`), cred); err == nil {
+		t.Fatal("assign without a target must name the two ids it takes")
+	}
+
+	// #25: the same action moves the assignee of an EXISTING merge request. It
+	// used to be settable once, at create_merge_request, and an agent that
+	// entered the wrong person could not take it back.
+	out, err = sys.Execute(ctx, "assign", []byte(`{"project_id":15,"mr_iid":7,"username":"maxm"}`), cred)
+	if err != nil {
+		t.Fatalf("assign on a merge request: %v", err)
+	}
+	if m := out.(map[string]any); m["assigned_to"] != "maxm" || m["user_id"] != 42 {
+		t.Fatalf("the assign result is wrong: %+v", out)
+	}
+	if gotMethod != http.MethodPut || gotPath != "/api/v4/projects/15/merge_requests/7" {
+		t.Fatalf("assign on an MR must be PUT /projects/15/merge_requests/7: %s %s", gotMethod, gotPath)
+	}
+	if ids, _ := gotBody["assignee_ids"].([]any); len(ids) != 1 || ids[0] != float64(42) {
+		t.Fatalf("assignee_ids are wrong: %+v", gotBody)
+	}
+	// It replaces rather than appends — like set_reviewer, so the pair behaves
+	// the same way.
+	if _, ok := gotBody["add_assignee_ids"]; ok {
+		t.Errorf("assign must replace, not append: %+v", gotBody)
+	}
 }
 
 // TestReviewerHandoff covers handing an MR over to a QA/test agent:
