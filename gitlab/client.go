@@ -986,6 +986,22 @@ func (c *Client) CommentMR(ctx context.Context, projectID, mrIID int, body strin
 	return out, err
 }
 
+// AssignMR — PUT /projects/{id}/merge_requests/{iid} with assignee_ids: moves
+// the assignee of an EXISTING merge request, which is the one field that used to
+// be settable exactly once, at create_merge_request (#25).
+//
+// It replaces rather than adds, like SetMRReviewer next door: the two fields are
+// read as a pair by anyone looking at an MR, and a pair whose halves behave
+// differently is a trap. The assignee also fills a person's work list in GitLab,
+// so a field that can only be filled and never cleared piles up exactly where it
+// gets in the way most.
+func (c *Client) AssignMR(ctx context.Context, projectID, mrIID int, userIDs []int) (MergeRequestDetail, error) {
+	var out MergeRequestDetail
+	err := c.do(ctx, http.MethodPut, fmt.Sprintf("/projects/%d/merge_requests/%d", projectID, mrIID),
+		map[string]any{"assignee_ids": userIDs}, &out)
+	return out, err
+}
+
 // SetMRReviewer — PUT /projects/{id}/merge_requests/{iid} with reviewer_ids:
 // enters the reviewer(s) of an existing MR. That is how the developer agent
 // hands its MR over to the QA agent deliberately (or hands it back), without
