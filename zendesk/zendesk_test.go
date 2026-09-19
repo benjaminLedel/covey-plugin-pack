@@ -1440,6 +1440,40 @@ func TestAttachmentIDSAndDedup(t *testing.T) {
 	}
 }
 
+// TestAttachmentsComeFromTheThread is #34: on a live account the ticket object
+// carries no comments, so an Attachments that reads only the ticket found nothing —
+// and DownloadAttachment, which validates the id against that list, refused the very
+// screenshot the customer was pointing at. The fake therefore serves the file the way
+// the API does: in the audits, not on the ticket.
+func TestAttachmentsComeFromTheThread(t *testing.T) {
+	f := newFake(t)
+	f.addTicket(42, 101, 9, "open", "siehe Screenshot")
+	ev := createdEvent(101, 9, true, "siehe Anhang", "email")
+	ev["attachments"] = []any{attachmentJSON("900", "screenshot.png", "image/png", f.srv.URL)}
+	f.addAudits(42, auditOf(1, 9, "2026-02-02T09:00:00Z", ev))
+
+	list, err := f.client("tok").Attachments(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID.String() != "900" || list[0].FileName != "screenshot.png" {
+		t.Fatalf("the file in the thread did not arrive: %+v", list)
+	}
+
+	// And the download finds it, which is the half that was actually broken.
+	res, err := DownloadAttachmentToSandbox(context.Background(), f.client("tok"), 42, "900", "", t.TempDir())
+	if err != nil {
+		t.Fatalf("download refused a file that is on the ticket: %v", err)
+	}
+	// The id goes in front of the name on purpose — two customers send logo.png.
+	if !strings.HasSuffix(res.FileName, "screenshot.png") || res.Bytes == 0 {
+		t.Errorf("download result: %+v", res)
+	}
+	if _, err := os.Stat(res.Path); err != nil {
+		t.Errorf("the file is not where the result says it is: %v", err)
+	}
+}
+
 func attachmentJSON(id, name, ctype, base string) map[string]any {
 	return map[string]any{
 		"id": id, "file_name": name, "content_type": ctype, "size": 12,

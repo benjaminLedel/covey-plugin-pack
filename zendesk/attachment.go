@@ -24,13 +24,19 @@ import (
 // thing the wall around a pinned queue can actually check.
 
 // Attachments lists the files on a ticket: the ones the ticket object carries plus
-// the ones inside the thread, which the ticket object does not always repeat. An
-// attachment appears once; where the same file shows up twice it is the same file,
-// and an agent counting screenshots twice counts wrong.
+// the ones inside the thread. An attachment appears once; where the same file shows
+// up twice it is the same file, and an agent counting screenshots twice counts wrong.
 //
 // A customer who writes "see the attachment" has said something that cannot be
 // answered from the text — which is why this is the action an agent reaches for
 // before it reaches for a guess.
+//
+// **The thread is asked for, not hoped for.** This used to read the ticket object
+// alone, and a ticket object carries no comments: the loop below ran over an empty
+// slice, the list came back empty on every live ticket, and DownloadAttachment then
+// refused the very file the customer was pointing at, because it validates the id
+// against this list (#34). The conversation is where the files are, and Conversation
+// is how this plugin reads it everywhere else.
 func (c *Client) Attachments(ctx context.Context, ticketID int64) ([]Attachment, error) {
 	t, err := c.GetTicket(ctx, ticketID)
 	if err != nil {
@@ -52,7 +58,17 @@ func (c *Client) Attachments(ctx context.Context, ticketID int64) ([]Attachment,
 		}
 	}
 	add(t.Attachments, t.Requester)
-	for _, cm := range t.Comments {
+	comments := t.Comments
+	if len(comments) == 0 {
+		// The ordinary case on a live account, and the reason this function
+		// exists in this shape at all.
+		thread, err := c.Conversation(ctx, ticketID, 0)
+		if err != nil {
+			return nil, err
+		}
+		comments = thread
+	}
+	for _, cm := range comments {
 		add(cm.Attachments, cm.Author)
 	}
 	return out, nil
