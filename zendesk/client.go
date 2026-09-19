@@ -1357,14 +1357,33 @@ func (c *Client) fieldByKey(ctx context.Context, key string) (TicketField, error
 		return TicketField{}, fmt.Errorf("custom_fields: a field without a name")
 	}
 	var namen []string
+	var treffer []TicketField
 	for _, f := range fields {
 		if f.System {
 			continue
 		}
 		namen = append(namen, f.Title)
-		if strconv.FormatInt(f.ID, 10) == want || strings.ToLower(f.Title) == want {
+		if strconv.FormatInt(f.ID, 10) == want {
 			return f, nil
 		}
+		if strings.ToLower(f.Title) == want {
+			treffer = append(treffer, f)
+		}
+	}
+	// A grown account has the same title twice — a live one carries two fields
+	// called "Abo" and two called "Welches Modul?". Taking the first would write
+	// into whichever the catalogue happens to list first, and the agent would be
+	// told it succeeded. The id is unambiguous, so the way out is named.
+	if len(treffer) > 1 {
+		ids := make([]string, 0, len(treffer))
+		for _, f := range treffer {
+			ids = append(ids, strconv.FormatInt(f.ID, 10))
+		}
+		return TicketField{}, fmt.Errorf("custom_fields: this account has %d fields called %q — name the one you mean by its id: %s",
+			len(treffer), key, strings.Join(ids, ", "))
+	}
+	if len(treffer) == 1 {
+		return treffer[0], nil
 	}
 	for _, f := range fields {
 		if f.System && (strconv.FormatInt(f.ID, 10) == want || strings.ToLower(f.Title) == want) {

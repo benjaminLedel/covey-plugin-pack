@@ -2368,6 +2368,26 @@ func TestUpdateTicketWritesOwnFields(t *testing.T) {
 		t.Error("one bad entry in the list has to be refused like a bad single value")
 	}
 
+	// A grown account has the same title twice — the live one this came from
+	// carries two fields called "Abo". Taking the first would write into
+	// whichever the catalogue lists first and report success.
+	f.fields = append(f.fields,
+		map[string]any{"id": 5, "title": "Abo", "type": "text", "raw_editable": true},
+		map[string]any{"id": 6, "title": "Abo", "type": "text", "raw_editable": true})
+	_, err = sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Abo":"gold"}}`), cred)
+	if err == nil {
+		t.Fatal("an ambiguous title must not be resolved by guessing")
+	}
+	for _, muss := range []string{"5", "6", "id"} {
+		if !strings.Contains(err.Error(), muss) {
+			t.Errorf("the message has to name the ids to choose from: %v", err)
+		}
+	}
+	// By id it is unambiguous, so that write goes through.
+	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"6":"gold"}}`), cred); err != nil {
+		t.Errorf("by id the same field is reachable: %v", err)
+	}
+
 	// null clears a field. Clearing is a write like any other — a ticket that
 	// was routed to the wrong team has to be able to lose the code again.
 	if _, err := sys.Execute(ctx, "update_ticket",
