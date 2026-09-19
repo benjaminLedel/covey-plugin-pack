@@ -2337,6 +2337,51 @@ func TestUpdateTicketWritesOwnFields(t *testing.T) {
 	if _, err := sys.Execute(ctx, "update_ticket", []byte(`{"ticket_id":42,"custom_fields":{"Kundennummer":"K-4711"}}`), cred); err != nil {
 		t.Errorf("a text field takes free text: %v", err)
 	}
+
+	// A multiselect takes a LIST of its options — the shape follows the field's
+	// type, not the presence of options.
+	f.fields = append(f.fields, map[string]any{
+		"id": 4, "title": "Betroffene Module", "type": "multiselect", "raw_editable": true,
+		"custom_field_options": []any{
+			map[string]any{"value": "connect"},
+			map[string]any{"value": "journal"},
+		},
+	})
+	if _, err := sys.Execute(ctx, "update_ticket",
+		[]byte(`{"ticket_id":42,"custom_fields":{"Betroffene Module":["connect","journal"]}}`), cred); err != nil {
+		t.Errorf("a multiselect takes an array: %v", err)
+	}
+	ticket, _ := f.lastBody["ticket"].(map[string]any)
+	liste, _ := ticket["custom_fields"].([]any)
+	if len(liste) != 1 {
+		t.Fatalf("the multiselect did not go out: %+v", ticket)
+	}
+	if werte, _ := liste[0].(map[string]any)["value"].([]any); len(werte) != 2 {
+		t.Errorf("both values have to go out: %+v", liste[0])
+	}
+	if _, err := sys.Execute(ctx, "update_ticket",
+		[]byte(`{"ticket_id":42,"custom_fields":{"Betroffene Module":"connect"}}`), cred); err == nil {
+		t.Error("a multiselect must not silently take a single string")
+	}
+	if _, err := sys.Execute(ctx, "update_ticket",
+		[]byte(`{"ticket_id":42,"custom_fields":{"Betroffene Module":["connect","gibtsnicht"]}}`), cred); err == nil {
+		t.Error("one bad entry in the list has to be refused like a bad single value")
+	}
+
+	// null clears a field. Clearing is a write like any other — a ticket that
+	// was routed to the wrong team has to be able to lose the code again.
+	if _, err := sys.Execute(ctx, "update_ticket",
+		[]byte(`{"ticket_id":42,"custom_fields":{"Root cause":null}}`), cred); err != nil {
+		t.Errorf("null has to clear a field: %v", err)
+	}
+	ticket, _ = f.lastBody["ticket"].(map[string]any)
+	liste, _ = ticket["custom_fields"].([]any)
+	if len(liste) != 1 {
+		t.Fatalf("the clearing write did not go out: %+v", ticket)
+	}
+	if v, ok := liste[0].(map[string]any)["value"]; !ok || v != nil {
+		t.Errorf("null has to reach the account as null: %+v", liste[0])
+	}
 }
 
 func TestReadsTheCatalogue(t *testing.T) {
