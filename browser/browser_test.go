@@ -101,6 +101,40 @@ func exec2(t *testing.T, ctx context.Context, action, params string) (any, error
 	return System{}.Execute(ctx, action, json.RawMessage(params), target.Credential{})
 }
 
+// TestStartRetriesOnce covers the answer to #11: a cold Chromium that does not
+// announce its websocket in time is retried once. The path is exercised through a
+// binary that fails deterministically — if the retry were missing, one failure
+// would be enough and the error would read differently.
+func TestStartRetriesOnce(t *testing.T) {
+	dir := t.TempDir()
+	zaehler := filepath.Join(dir, "versuche")
+	falsch := filepath.Join(dir, "kein-chromium.sh")
+	skript := "#!/bin/sh\necho x >> " + zaehler + "\nexit 1\n"
+	if err := os.WriteFile(falsch, []byte(skript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("COVEY_BROWSER_CHROME_PATH", falsch)
+	t.Setenv("COVEY_BROWSER_TIMEOUT_SECS", "2")
+	m := &manager{}
+	t.Cleanup(m.shutdown)
+
+	m.mu.Lock()
+	_, err := m.ensureLocked()
+	m.mu.Unlock()
+	if err == nil {
+		t.Fatal("a chromium that cannot start has to be an error")
+	} else if !strings.Contains(err.Error(), "twice") {
+		t.Errorf("the message has to say that it was tried twice: %v", err)
+	}
+	roh, leseFehler := os.ReadFile(zaehler)
+	if leseFehler != nil {
+		t.Fatalf("the fake chromium was never started: %v", leseFehler)
+	}
+	if n := strings.Count(string(roh), "x"); n != 2 {
+		t.Errorf("chromium was started %d times, expected 2", n)
+	}
+}
+
 func TestBrowserEndToEnd(t *testing.T) {
 	chrome := findChromium(t)
 	t.Setenv("COVEY_BROWSER_CHROME_PATH", chrome)

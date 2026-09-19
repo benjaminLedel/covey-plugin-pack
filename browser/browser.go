@@ -141,23 +141,42 @@ func (m *manager) ensureLocked() (context.Context, error) {
 	// than a whole action is broken in a way no bound should paper over.
 	opts = append(opts, chromedp.WSURLReadTimeout(actionTimeout()))
 
-	// Detached from any single action: the session is the whole point of this
-	// plugin — cookies and login are meant to survive across several actions.
-	// It is ended via allocCancel/browserCancel (Close), not via an inherited
-	// context.
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-	// An empty run forces the browser to start and binds the initial tab to the
-	// long-lived browserCtx — NOT to a timeout child, whose cancel() would tear
-	// the tab down again right away. A missing Chromium surfaces here as a clear
-	// error (instead of only on the first navigation).
-	if err := chromedp.Run(browserCtx); err != nil {
-		browserCancel()
-		allocCancel()
-		return nil, fmt.Errorf("chromium start (is chromium installed in the sandbox image?): %w", err)
+	// A cold start is attempted twice before it counts as broken.
+	//
+	// Raising the bound was the first answer and it is spent: the ceiling went
+	// from chromedp's 20 s to the action timeout, and CI then failed at 45.1 s
+	// with the same "websocket url timeout reached" (#11). A start that needs
+	// more than a whole action is not slow, it is stuck — a lock in the profile
+	// directory, a process that came up without announcing its port — and the
+	// thing that reliably fixed it was starting again, which is what a human
+	// re-running the pipeline was doing by hand.
+	//
+	// Twice, not more: the second attempt separates the transient from the
+	// broken. Where Chromium is missing or unusable, both fail in about the same
+	// way and the error names the last one, so nothing is hidden — only the coin
+	// flip is.
+	var fehler error
+	for versuch := 1; versuch <= 2; versuch++ {
+		// Detached from any single action: the session is the whole point of
+		// this plugin — cookies and login are meant to survive across several
+		// actions. It is ended via allocCancel/browserCancel (Close), not via an
+		// inherited context.
+		allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+		browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+		// An empty run forces the browser to start and binds the initial tab to
+		// the long-lived browserCtx — NOT to a timeout child, whose cancel()
+		// would tear the tab down again right away. A missing Chromium surfaces
+		// here as a clear error (instead of only on the first navigation).
+		if err := chromedp.Run(browserCtx); err != nil {
+			browserCancel()
+			allocCancel()
+			fehler = err
+			continue
+		}
+		m.allocCancel, m.browserCtx, m.browserCancel = allocCancel, browserCtx, browserCancel
+		return m.browserCtx, nil
 	}
-	m.allocCancel, m.browserCtx, m.browserCancel = allocCancel, browserCtx, browserCancel
-	return m.browserCtx, nil
+	return nil, fmt.Errorf("chromium start failed twice (is chromium installed in the sandbox image?): %w", fehler)
 }
 
 // do runs a series of chromedp actions atomically and serialized.
