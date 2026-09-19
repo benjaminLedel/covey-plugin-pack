@@ -1702,20 +1702,42 @@ func (c *Client) Reply(ctx context.Context, ticketID int64, body string, interna
 	}
 	var out struct {
 		Ticket Ticket `json:"ticket"`
+		// The update's own audit — this is where the account puts the comment it
+		// just created. It is asked for because the ticket beside it does not
+		// carry one: a ticket object has no thread, which is why the branch below
+		// it never ran and reply answered with comment_id 0 on every live account
+		// (#36, same assumption as #31 and #34).
+		Audit audit `json:"audit"`
 	}
 	if err := c.do(ctx, http.MethodPut, fmt.Sprintf("/tickets/%d.json", ticketID), nil,
 		map[string]any{"ticket": map[string]any{"comment": comment}}, &out); err != nil {
 		return Comment{}, err
 	}
-	// The response carries the ticket with its thread, oldest comment first — so
-	// the newest one is the answer that was just written, and the caller sees the id
-	// and timestamp the account gave it rather than what this plugin guessed.
+	// Where an account does inline the thread, the newest comment is the answer
+	// just written and carries the account's own timestamp.
 	if n := len(out.Ticket.Comments); n > 0 {
 		last := out.Ticket.Comments[n-1]
 		c.namesFor(ctx, map[int64]struct{}{last.AuthorID: {}})
 		last.Author = c.userName(last.AuthorID)
 		last.AuthorRole = c.userRole(last.AuthorID)
 		return last, nil
+	}
+	// The ordinary case: read the id off the audit event. An agent that gets an
+	// id back can point at what it wrote — "my note on this ticket" — instead of
+	// reading the whole thread again to find itself in it.
+	for i := len(out.Audit.Events) - 1; i >= 0; i-- {
+		e := out.Audit.Events[i]
+		if !isComment(e.Type) || e.ID == 0 {
+			continue
+		}
+		wrote := Comment{ID: e.ID, Public: e.Public, Body: body, AuthorID: e.AuthorID,
+			CreatedAt: out.Audit.CreatedAt}
+		if e.AuthorID != 0 {
+			c.namesFor(ctx, map[int64]struct{}{e.AuthorID: {}})
+			wrote.Author = c.userName(e.AuthorID)
+			wrote.AuthorRole = c.userRole(e.AuthorID)
+		}
+		return wrote, nil
 	}
 	return Comment{ID: out.Ticket.LatestComment, Public: !internal, Body: body}, nil
 }

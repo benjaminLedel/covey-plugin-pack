@@ -45,16 +45,20 @@ type fake struct {
 	fields  []map[string]any
 	metrics map[int64]map[string]any
 
-	requests      []string          // "METHOD path?query", in the order they arrived
-	authSeen      []string          // Authorization header of each API call
-	mints         int               // POSTs to /oauth/tokens
-	tokenSeq      int               // which minted token number we are on
-	nextCommentID int64             // the id the next written comment gets
-	reject        bool              // answer every API call with 401
-	rejectMint    bool              // answer the token endpoint with 401
-	lastBody      map[string]any    // last request body with a JSON object in it
-	deleted       string            // path of the last DELETE
-	noAuth        map[string]string // path → auth header seen, for the foreign-host check
+	requests      []string // "METHOD path?query", in the order they arrived
+	authSeen      []string // Authorization header of each API call
+	mints         int      // POSTs to /oauth/tokens
+	tokenSeq      int      // which minted token number we are on
+	nextCommentID int64    // the id the next written comment gets
+	// wieInEcht: answer an update the way a live account does — the ticket
+	// WITHOUT its thread, and the comment that was just created in the update's
+	// own audit. The default keeps the inlined shape the older tests rely on.
+	wieInEcht  bool
+	reject     bool              // answer every API call with 401
+	rejectMint bool              // answer the token endpoint with 401
+	lastBody   map[string]any    // last request body with a JSON object in it
+	deleted    string            // path of the last DELETE
+	noAuth     map[string]string // path → auth header seen, for the foreign-host check
 }
 
 func newFake(t *testing.T) *fake {
@@ -398,6 +402,37 @@ func (f *fake) applyUpdate(w http.ResponseWriter, id int64) {
 			}
 			tk["comments"] = append(commentsOf(tk), newComment)
 			tk["comment_id"] = next
+			if f.wieInEcht {
+				// What a live account sends back: the ticket WITHOUT its thread,
+				// and the comment that was just created in the update's own audit.
+				// The fake keeps the thread for itself, so list_messages still
+				// works — only the response drops it, as the API does.
+				for _, key := range []string{"status", "priority", "group_id", "tags", "subject", "assignee_id"} {
+					if v, ok := ticket[key]; ok {
+						tk[key] = v
+					}
+				}
+				ohneVerlauf := map[string]any{}
+				for k, v := range tk {
+					if k == "comments" || k == "comment_id" {
+						continue
+					}
+					ohneVerlauf[k] = v
+				}
+				writeJSON(w, map[string]any{
+					"ticket": ohneVerlauf,
+					"audit": map[string]any{
+						"id": next * 10, "ticket_id": id, "author_id": 7,
+						"created_at": "2026-02-03T10:00:00Z",
+						"events": []any{
+							map[string]any{"type": "Notification", "id": next * 11},
+							map[string]any{"type": "Comment", "id": next, "public": comment["public"] == true,
+								"author_id": 7, "body": body, "plain_body": body},
+						},
+					},
+				})
+				return
+			}
 		}
 		for _, key := range []string{"status", "priority", "group_id", "tags", "subject", "assignee_id"} {
 			if v, ok := ticket[key]; ok {
@@ -1260,6 +1295,30 @@ func TestSearchPutsTypeTicketInFront(t *testing.T) {
 // TestReplyIsAnUpdateAndSettlesTheStatus: Zendesk has no "add a comment" endpoint, so
 // a reply is a ticket update carrying a comment — and an answer that went out to the
 // customer leaves the ticket pending, which is what the queue means by "answered".
+// TestReplyReportsTheIdTheAccountGave is #36: reply answered with comment_id 0
+// on every live account, because it read the id off the ticket object of the
+// update response — and a ticket object carries no comments. The id is in the
+// update's own audit, which is what the account actually sends.
+func TestReplyReportsTheIdTheAccountGave(t *testing.T) {
+	f := newFake(t)
+	f.wieInEcht = true
+	f.addTicket(42, 101, 9, "open", "Frage")
+
+	cm, err := f.client("tok").Reply(context.Background(), 42, "ANALYSE (covey): geprueft", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.ID == 0 {
+		t.Fatal("reply reported comment_id 0 — the agent cannot point at what it wrote")
+	}
+	if cm.Public {
+		t.Error("an internal note must not come back as public")
+	}
+	if cm.Body != "ANALYSE (covey): geprueft" {
+		t.Errorf("body: %q", cm.Body)
+	}
+}
+
 func TestReplyIsAnUpdateAndSettlesTheStatus(t *testing.T) {
 	f := newFake(t)
 	f.addTicket(42, 101, 9, "open", "Login kaputt")
