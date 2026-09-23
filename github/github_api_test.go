@@ -230,24 +230,57 @@ func TestListBranchesMarksDefault(t *testing.T) {
 
 // TestListCommitsPassesFilters: the filters are how an agent checks whether a
 // reported fault has been fixed since — they must reach GitHub, not be dropped.
+// The limit is one of them (#43): it narrows the page GitHub sends, and it caps
+// what a page that ignored it would hand on.
 func TestListCommitsPassesFilters(t *testing.T) {
 	var q url.Values
 	c, _ := serve(t, routes{
 		"GET /repos/acme/support/commits": func(w http.ResponseWriter, r *http.Request) {
 			q = r.URL.Query()
-			w.Write([]byte(`[{"sha":"a1","commit":{"message":"fix login","author":{"name":"m","date":"2026-01-01T00:00:00Z"}}}]`))
+			w.Write([]byte(`[{"sha":"a1","commit":{"message":"fix login","author":{"name":"m","date":"2026-01-01T00:00:00Z"}}},
+				{"sha":"a2","commit":{"message":"older","author":{"name":"m","date":"2025-12-31T00:00:00Z"}}},
+				{"sha":"a3","commit":{"message":"oldest","author":{"name":"m","date":"2025-12-30T00:00:00Z"}}}]`))
 		},
 	})
-	commits, err := c.ListCommits(context.Background(), "acme/support", "main", "internal/auth.go", "2026-01-01T00:00:00Z")
-	if err != nil || len(commits) != 1 {
+	commits, err := c.ListCommits(context.Background(), "acme/support", "main", "internal/auth.go", "2026-01-01T00:00:00Z", 2)
+	if err != nil || len(commits) != 2 || commits[0].SHA != "a1" {
 		t.Fatalf("ListCommits: %v %+v", err, commits)
 	}
 	for key, want := range map[string]string{
-		"sha": "main", "path": "internal/auth.go", "since": "2026-01-01T00:00:00Z",
+		"sha": "main", "path": "internal/auth.go", "since": "2026-01-01T00:00:00Z", "per_page": "2",
 	} {
 		if got := q.Get(key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
+	}
+	// No limit, or one past the page: the full page, as before.
+	if _, err := c.ListCommits(context.Background(), "acme/support", "", "", "", 0); err != nil || q.Get("per_page") != "100" {
+		t.Errorf("without a limit per_page = %q (%v)", q.Get("per_page"), err)
+	}
+	if _, err := c.ListCommits(context.Background(), "acme/support", "", "", "", 5000); err != nil || q.Get("per_page") != "100" {
+		t.Errorf("a limit past the page is the page: per_page = %q (%v)", q.Get("per_page"), err)
+	}
+}
+
+// TestListCommitsActionReadsTheLimit: the parameter reaches the action — the
+// bug was that the prompt doc did not list it and the params struct dropped it.
+func TestListCommitsActionReadsTheLimit(t *testing.T) {
+	var q url.Values
+	c, _ := serve(t, routes{
+		"GET /repos/acme/support/commits": func(w http.ResponseWriter, r *http.Request) {
+			q = r.URL.Query()
+			w.Write([]byte(`[]`))
+		},
+	})
+	var in actionParams
+	if err := json.Unmarshal([]byte(`{"repo":"acme/support","limit":3}`), &in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := actions["list_commits"](context.Background(), c, in); err != nil {
+		t.Fatal(err)
+	}
+	if q.Get("per_page") != "3" {
+		t.Errorf("limit:3 reached GitHub as per_page=%q", q.Get("per_page"))
 	}
 }
 

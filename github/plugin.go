@@ -428,6 +428,7 @@ type actionParams struct {
 	Recursive    bool     `json:"recursive"`
 	SHA          string   `json:"sha"`
 	Since        string   `json:"since"`
+	Limit        int      `json:"limit"`
 	Base         string   `json:"base"`
 	Username     string   `json:"username"`
 	// The developer workflow: commit + create_pull_request.
@@ -608,7 +609,7 @@ var actions = map[string]action{
 		return gc.ListBranches(ctx, in.Repo, in.Search)
 	}),
 	"list_commits": repoAction(func(ctx context.Context, gc *Client, in actionParams) (any, error) {
-		return gc.ListCommits(ctx, in.Repo, in.Ref, in.Path, in.Since)
+		return gc.ListCommits(ctx, in.Repo, in.Ref, in.Path, in.Since, in.Limit)
 	}),
 	"get_commit": repoAction(func(ctx context.Context, gc *Client, in actionParams) (any, error) {
 		return gc.GetCommitDiff(ctx, in.Repo, in.SHA)
@@ -873,8 +874,9 @@ func (System) PromptDoc() string {
    repo is too large, work without a checkout: list_tree {"repo":"…","path":"…","ref":"…","recursive":true|false}
    lists the repository tree (max. 100 entries — narrow it with path), read_file {"repo":"…","file_path":"path/to/file","ref":"…"}
    reads a single file, list_branches {"repo":"…","search":"…"} lists branches (the default branch is marked — do not
-   guess branch names), list_commits {"repo":"…","ref":"…","path":"file/or/directory","since":"ISO date"} lists the
-   commit history (all filters optional), get_commit {"repo":"…","sha":"…"} returns a commit's diff.
+   guess branch names), list_commits {"repo":"…","ref":"…","path":"file/or/directory","since":"ISO date","limit":N}
+   lists the commit history newest first (all filters optional; limit caps the answer, max. 100),
+   get_commit {"repo":"…","sha":"…"} returns a commit's diff.
    Pull requests: list_pull_requests {"repo":"…","state":"open"|"closed"|"merged"|"all","search":"…","base":"main"},
    get_pull_request {"repo":"…","pr_number":N} returns a single PR with its merge state (mergeable, mergeable_state)
    AND the CI checks on its head commit — mergeable says nothing about whether the tests are green, so read both,

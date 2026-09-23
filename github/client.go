@@ -682,10 +682,16 @@ type Commit struct {
 }
 
 // ListCommits — GET …/commits. All filters are optional: sha (branch/tag/SHA),
-// path (only commits touching that file) and since (an ISO date).
-func (c *Client) ListCommits(ctx context.Context, repo, ref, path, since string) ([]Commit, error) {
+// path (only commits touching that file), since (an ISO date) and limit (how
+// many, at most perPage). The limit narrows the request, not only the answer —
+// asking for a full page to hand three of it on is the same cost as ignoring
+// the parameter (#43).
+func (c *Client) ListCommits(ctx context.Context, repo, ref, path, since string, limit int) ([]Commit, error) {
+	if limit <= 0 || limit > perPage {
+		limit = perPage
+	}
 	q := url.Values{}
-	q.Set("per_page", strconv.Itoa(perPage))
+	q.Set("per_page", strconv.Itoa(limit))
 	if ref != "" {
 		q.Set("sha", ref)
 	}
@@ -700,8 +706,13 @@ func (c *Client) ListCommits(ctx context.Context, repo, ref, path, since string)
 		return nil, err
 	}
 	out := []Commit{}
-	err = c.do(ctx, http.MethodGet, p, nil, &out)
-	return out, err
+	if err := c.do(ctx, http.MethodGet, p, nil, &out); err != nil {
+		return nil, err
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // maxDiffBytesPerFile caps a single file's patch — a generated file's diff
