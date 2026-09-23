@@ -915,9 +915,13 @@ func (c *Client) GetTicket(ctx context.Context, id int64) (Ticket, error) {
 // list endpoint covers: what did we tell this customer before, which tickets carry
 // this tag, what is waiting on a whole organization.
 //
-// The rows are not ticket objects. The search index names its columns differently
-// (tid, createtime, submitter_id), so they are read under those names and reported
-// as what they are: search hits by relevance, not a queue listing.
+// A hit is the same object as a list row. The search index has its own column
+// names for some of them (tid, title, createtime, gid), and it used to be
+// reported under those: an agent that piped a search and a list through the same
+// jq got null ids and null dates from the search, and could not check a tag on a
+// hit even though the query had filtered by that tag (#42). Now the row reads
+// under both spellings and reports the list's, with the index's beside it for one
+// release.
 func (c *Client) SearchTickets(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	q := url.Values{}
 	q.Set("query", ensureTicketType(strings.TrimSpace(query)))
@@ -927,9 +931,15 @@ func (c *Client) SearchTickets(ctx context.Context, query string, limit int) ([]
 	if err != nil {
 		return nil, err
 	}
+	rows := make([]*Ticket, len(hits))
 	for i := range hits {
-		hits[i].Group = c.groupName(ctx, hits[i].GroupID)
-		hits[i].InIntakeScope = inIntakeScope(hits[i].Group)
+		rows[i] = &hits[i].Ticket
+	}
+	c.resolveNames(ctx, rows)
+	for i := range hits {
+		hits[i].Description = ""
+		hits[i].TicketID, hits[i].Title = hits[i].ID, hits[i].Subject
+		hits[i].CreateTime, hits[i].UpdateTime = hits[i].CreatedAt, hits[i].UpdatedAt
 	}
 	return hits, nil
 }
@@ -949,51 +959,79 @@ func ensureTicketType(q string) string {
 	return "type:ticket " + q
 }
 
-// SearchHit is one row of the search index, in the index's own column names, with
-// the id and the title under the names the rest of this plugin uses.
+// SearchHit is one row of the search: a ticket as list_tickets reports it, with
+// what the index adds (result_type, submitter_id).
+//
+// The four fields at the end are the index's own names for id, subject and the
+// two dates. They are filled from the row and stay for one release, so that a
+// playbook written against them keeps working while it is moved to the list's
+// names; they are not read from the answer under those names any more — the
+// UnmarshalJSON below does that.
 type SearchHit struct {
-	TicketID      int64     `json:"ticket_id"`
-	Title         string    `json:"title"`
-	Status        string    `json:"status,omitempty"`
-	Priority      string    `json:"priority,omitempty"`
-	TicketType    string    `json:"ticket_type,omitempty"`
-	GroupID       int64     `json:"group_id,omitempty"`
-	SubmitterID   int64     `json:"submitter_id,omitempty"`
-	AssigneeID    int64     `json:"assignee_id,omitempty"`
-	CreatedAt     looseTime `json:"createtime,omitempty"`
-	UpdatedAt     looseTime `json:"update_time,omitempty"`
-	ResultType    string    `json:"result_type,omitempty"`
-	Group         string    `json:"group,omitempty"`
-	InIntakeScope bool      `json:"in_intake_scope"`
+	Ticket
+	ResultType  string `json:"result_type,omitempty"`
+	SubmitterID int64  `json:"submitter_id,omitempty"`
+
+	// Deprecated: the list's names (id, subject, created_at, updated_at) are the
+	// ones to read; these four go with the next release.
+	TicketID   int64  `json:"ticket_id,omitempty"`
+	Title      string `json:"title,omitempty"`
+	CreateTime string `json:"createtime,omitempty"`
+	UpdateTime string `json:"update_time,omitempty"`
 }
 
-// UnmarshalJSON reads the index's own names alongside the plain ones: the search
-// endpoint calls the ticket id `tid` where every other endpoint calls it `id`.
+// UnmarshalJSON reads the row under the ticket's names first and the index's own
+// beside them: the search endpoint may call the ticket id `tid`, the subject
+// `title`, the dates `createtime`/`update_time` and the group `gid`, where every
+// other endpoint uses the ticket's names. Whichever spelling is there wins; a
+// blank under one is filled from the other.
 func (h *SearchHit) UnmarshalJSON(raw []byte) error {
+	type plain SearchHit // no method set: no recursion into this one
+	var row plain
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return err
+	}
 	var s struct {
-		TID         json.Number `json:"tid"`
-		ID          json.Number `json:"id"`
-		Title       string      `json:"title"`
-		Status      string      `json:"status"`
-		Priority    string      `json:"priority"`
-		TicketType  string      `json:"ticket_type"`
-		GroupID     json.Number `json:"gid"`
-		SubmitterID json.Number `json:"submitter_id"`
-		AssigneeID  json.Number `json:"assignee_id"`
-		CreatedAt   looseTime   `json:"createtime"`
-		UpdatedAt   looseTime   `json:"update_time"`
-		ResultType  string      `json:"result_type"`
+		TID        json.Number `json:"tid"`
+		Title      string      `json:"title"`
+		TicketType string      `json:"ticket_type"`
+		GID        json.Number `json:"gid"`
+		CreateTime looseTime   `json:"createtime"`
+		UpdateTime looseTime   `json:"update_time"`
+		CreatedAt  looseTime   `json:"created_at"`
+		UpdatedAt  looseTime   `json:"updated_at"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return err
 	}
-	h.TicketID = num(s.TID, s.ID)
-	h.Title, h.Status, h.Priority, h.TicketType = s.Title, s.Status, s.Priority, s.TicketType
-	h.GroupID = num(s.GroupID, "")
-	h.SubmitterID = num(s.SubmitterID, "")
-	h.AssigneeID = num(s.AssigneeID, "")
-	h.CreatedAt, h.UpdatedAt, h.ResultType = s.CreatedAt, s.UpdatedAt, s.ResultType
+	*h = SearchHit(row)
+	if h.ID == 0 {
+		h.ID = num(s.TID, "")
+	}
+	if h.Subject == "" {
+		h.Subject = s.Title
+	}
+	if h.Type == "" {
+		h.Type = s.TicketType
+	}
+	if h.GroupID == 0 {
+		h.GroupID = num(s.GID, "")
+	}
+	// The dates go through looseTime under both names: the index writes them
+	// with a space where the tickets endpoint writes a T.
+	h.CreatedAt = string(firstOf(s.CreatedAt, s.CreateTime))
+	h.UpdatedAt = string(firstOf(s.UpdatedAt, s.UpdateTime))
 	return nil
+}
+
+// firstOf is the first of the given values that is not blank.
+func firstOf(values ...looseTime) looseTime {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // num reads a JSON number that may also be absent, with a fallback.
@@ -1020,7 +1058,9 @@ func (t *looseTime) UnmarshalJSON(raw []byte) error {
 		*t = ""
 		return nil
 	}
-	if spaced := strings.Replace(s, " ", "T", 1); strings.Contains(s, " ") {
+	// "2026-09-01 10:00:00 UTC": the zone is a word, not an offset, and the
+	// parser wants the letter.
+	if spaced := strings.Replace(strings.TrimSuffix(s, " UTC"), " ", "T", 1); strings.Contains(s, " ") {
 		if parsed, err := time.Parse(time.RFC3339, spaced+"Z"); err == nil {
 			*t = looseTime(parsed.UTC().Format(time.RFC3339))
 			return nil

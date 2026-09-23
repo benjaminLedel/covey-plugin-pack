@@ -1241,10 +1241,10 @@ func TestPaginationFollowsWhicheverDialectTheAnswerCarries(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("%d hits", len(hits))
 	}
-	if hits[0].Title != "x" || hits[0].TicketID != 42 {
-		t.Errorf("hit not read from the index's own field names: %+v", hits[0])
+	if hits[0].Subject != "x" || hits[0].ID != 42 {
+		t.Errorf("hit not read as a ticket row: %+v", hits[0])
 	}
-	if !strings.HasPrefix(string(hits[0].UpdatedAt), "2026") {
+	if !strings.HasPrefix(hits[0].UpdatedAt, "2026") {
 		t.Errorf("the index's own timestamp not read: %q", hits[0].UpdatedAt)
 	}
 
@@ -1264,6 +1264,53 @@ func TestPaginationFollowsWhicheverDialectTheAnswerCarries(t *testing.T) {
 	}
 	if !secondPage {
 		t.Error("the second page was never asked for")
+	}
+}
+
+// TestSearchHitIsAListRow is #42: a search hit was reported under the index's
+// own column names (ticket_id, title, createtime, update_time) and without its
+// tags, so an agent that piped a search and a list through the same jq got null
+// ids and null dates from the search, and could not confirm a tag on a hit that
+// the query had filtered by. A hit now reads under both spellings — the index's
+// and the ticket's, whichever the account sends — and reports the list's, with
+// the old names beside them for one release.
+func TestSearchHitIsAListRow(t *testing.T) {
+	f := newFake(t)
+	tk := f.addTicket(42, 101, 9, "open", "x")
+	tk["tags"] = []string{"covey", "rüdi"}
+	hits, err := f.client("tok").SearchTickets(context.Background(), "tags:rüdi", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("%v, %d hits", err, len(hits))
+	}
+	raw, _ := json.Marshal(hits[0])
+	var row map[string]any
+	json.Unmarshal(raw, &row)
+	for key, want := range map[string]string{
+		"id": "42", "subject": "x", "status": "open", "created_at": "2026-02-01T09:00:00Z",
+		"updated_at": "2026-02-02T09:00:00Z", "group": "Support L1", "assignee": "J. Mensch", "requester": "K. Kunde",
+		// the index's spellings, for a playbook written against them
+		"ticket_id": "42", "title": "x", "createtime": "2026-02-01T09:00:00Z", "update_time": "2026-02-02T09:00:00Z",
+	} {
+		if got := fmt.Sprint(row[key]); got != want {
+			t.Errorf("hit.%s = %q, want %q", key, got, want)
+		}
+	}
+	if got := fmt.Sprint(row["tags"]); got != "[covey rüdi]" {
+		t.Errorf("hit.tags = %s — the tag the query filtered by has to be on the hit", got)
+	}
+	if _, there := row["description"]; there {
+		t.Error("a hit carries the customer's opening mail — a list row does not, and a hit is a list row")
+	}
+
+	// The index's own spellings alone, as an account may send them: they fill
+	// the ticket's names rather than being lost.
+	var h SearchHit
+	if err := json.Unmarshal([]byte(`{"tid":"7","title":"index only","gid":101,"createtime":"2026-03-01 08:00:00 UTC","update_time":"2026-03-02 08:00:00 UTC","ticket_type":"problem","result_type":"ticket"}`), &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.ID != 7 || h.Subject != "index only" || h.GroupID != 101 || h.Type != "problem" ||
+		h.CreatedAt != "2026-03-01T08:00:00Z" || h.UpdatedAt != "2026-03-02T08:00:00Z" {
+		t.Errorf("index-only spellings not read into the row: %+v", h)
 	}
 }
 
