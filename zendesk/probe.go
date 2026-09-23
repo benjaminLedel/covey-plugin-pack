@@ -20,6 +20,11 @@ import (
 // dashboard, because the account in the URL is the same whichever user created the
 // OAuth client.
 //
+// The answer names the identity and, where the identity sees less than the whole
+// account, what it sees (Me.Describe): a restricted role is not an error, but
+// "ok" for a Light Agent that can see no untouched ticket was a probe that said
+// nothing about the one thing that mattered (#41).
+//
 // A rejected credential is reported as a CredentialRejectedError (see refused in
 // client.go), which is what turns a broken secret into a re-auth prompt instead of a
 // task that failed for reasons.
@@ -32,14 +37,7 @@ func (System) Probe(ctx context.Context, cred target.Credential) (string, error)
 	if err != nil {
 		return "", err
 	}
-	switch {
-	case me.Email != "" && me.Name != "":
-		return fmt.Sprintf("%s (%s)", me.Name, me.Email), nil
-	case me.Name != "":
-		return me.Name, nil
-	default:
-		return fmt.Sprintf("user %d", me.ID), nil
-	}
+	return me.Describe(), nil
 }
 
 // Inspect (target.CredentialInspector) is the same question from the operator's side:
@@ -67,18 +65,11 @@ func (System) Inspect(ctx context.Context, cred target.Credential, _ json.RawMes
 	if err != nil {
 		return info, err
 	}
-	if me, err := c.Me(ctx); err == nil {
-		switch {
-		case me.Email != "" && me.Name != "":
-			info.Identity = fmt.Sprintf("%s (%s)", me.Name, me.Email)
-		case me.Name != "":
-			info.Identity = me.Name
-		default:
-			info.Identity = fmt.Sprintf("user %d", me.ID)
-		}
-	} else {
+	me, err := c.Me(ctx)
+	if err != nil {
 		return info, err
 	}
+	info.Identity = me.Describe()
 	// Asked of the CLIENT, not of the Config parsed at the top of this function:
 	// NewClient parses the credential again for itself, and the token this call has
 	// just minted lives in that one. Asked of the outer copy the answer is always "no

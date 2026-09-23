@@ -54,6 +54,7 @@ type fake struct {
 	// WITHOUT its thread, and the comment that was just created in the update's
 	// own audit. The default keeps the inlined shape the older tests rely on.
 	wieInEcht  bool
+	restricted bool              // users/me is a Light Agent pinned to its groups (#41)
 	reject     bool              // answer every API call with 401
 	rejectMint bool              // answer the token endpoint with 401
 	lastBody   map[string]any    // last request body with a JSON object in it
@@ -80,6 +81,7 @@ func newFake(t *testing.T) *fake {
 	mux.HandleFunc("/api/v2/tickets/", f.handleTicketChild)
 	mux.HandleFunc("/api/v2/search.json", f.handleSearch)
 	mux.HandleFunc("/api/v2/users/me.json", f.handleMe)
+	mux.HandleFunc("/api/v2/custom_roles/", f.handleCustomRole)
 	mux.HandleFunc("/api/v2/users/show_many.json", f.handleShowMany)
 	mux.HandleFunc("/api/v2/views.json", func(w http.ResponseWriter, r *http.Request) {
 		f.record(r)
@@ -562,8 +564,29 @@ func (f *fake) handleMe(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
-	writeJSON(w, map[string]any{"user": map[string]any{
+	user := map[string]any{
 		"id": 7, "name": "Covey Bot", "email": "bot@acme.example", "role": "agent",
+		"custom_role_id": nil, "restricted_agent": false, "ticket_restriction": nil,
+	}
+	if f.restricted {
+		user["custom_role_id"], user["restricted_agent"], user["ticket_restriction"] = 360001, true, "groups"
+	}
+	writeJSON(w, map[string]any{"user": user})
+}
+
+// handleCustomRole answers custom_roles/{id} the way an account does for its
+// Light Agent role.
+func (f *fake) handleCustomRole(w http.ResponseWriter, r *http.Request) {
+	if !f.guard(w, r) {
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, "/360001.json") {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]any{"custom_role": map[string]any{
+		"id": 360001, "name": "Light agent", "role_type": 1,
+		"configuration": map[string]any{"ticket_access": "within-groups", "ticket_comment_access": "none"},
 	}})
 }
 
@@ -2304,6 +2327,58 @@ func TestProbeNamesTheIdentity(t *testing.T) {
 	}
 	if static.ExpiresAt != nil {
 		t.Errorf("a token that was not minted here reports a minted expiry: %v", static.ExpiresAt)
+	}
+}
+
+// TestProbeSaysWhatTheCredentialCanSee is #41: the probe answered "ok" and a
+// name for a Light Agent whose role hides every ticket without a group — in an
+// account that assigns groups by hand, every untouched one — and the cause took
+// a day to find. The probe names the restriction, the role's word for it comes
+// from one read of custom_roles, and Inspect says the same sentence.
+func TestProbeSaysWhatTheCredentialCanSee(t *testing.T) {
+	f := newFake(t)
+	f.restricted = true
+	who, err := (System{}).Probe(context.Background(), f.cred("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Covey Bot (bot@acme.example)",
+		"light agent: reads tickets and writes internal notes only",
+		"sees only tickets in its groups — a ticket without a group",
+	} {
+		if !strings.Contains(who, want) {
+			t.Errorf("probe said %q — missing %q", who, want)
+		}
+	}
+	info, err := (System{}).Inspect(context.Background(), f.cred("tok"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Identity != who {
+		t.Errorf("Inspect says %q, Probe says %q", info.Identity, who)
+	}
+	var roleReads int
+	for _, r := range f.requests {
+		if strings.Contains(r, "custom_roles/360001") {
+			roleReads++
+		}
+	}
+	if roleReads != 2 {
+		t.Errorf("one role read per probe expected, saw %d", roleReads)
+	}
+
+	// The user's own fields carry the restriction even where the role cannot be
+	// read — a Light Agent is not allowed to list roles on some accounts.
+	var me Me
+	if err := json.Unmarshal([]byte(`{"id":7,"name":"Rüdiger","ticket_restriction":"assigned","restricted_agent":true}`), &me); err != nil {
+		t.Fatal(err)
+	}
+	if got := me.Describe(); !strings.Contains(got, "sees only tickets assigned to it") {
+		t.Errorf("Describe from /users/me alone: %q", got)
+	}
+	if got := (Me{ID: 7, Name: "Plain"}).Describe(); got != "Plain" {
+		t.Errorf("an unrestricted identity carries no note: %q", got)
 	}
 }
 

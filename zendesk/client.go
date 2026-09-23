@@ -703,14 +703,76 @@ type person struct {
 	Email          string `json:"email,omitempty"`
 	Role           string `json:"role,omitempty"`
 	OrganizationID int64  `json:"organization_id,omitempty"`
+	// The three below say what the user can SEE; /users/me carries them, and
+	// the probe reads them (#41). ticket_restriction is "groups", "assigned",
+	// "organization", "requested" or null.
+	CustomRoleID      int64  `json:"custom_role_id,omitempty"`
+	RestrictedAgent   bool   `json:"restricted_agent,omitempty"`
+	TicketRestriction string `json:"ticket_restriction,omitempty"`
 }
 
-// Me is who the credential acts as.
+// Me is who the credential acts as — and what that identity is allowed to see.
+//
+// The second half is the one an operator cannot tell from the dashboard: a
+// probe that answered "ok, Rüdiger Eifrig" for a Light Agent restricted to its
+// groups, in an account where a ticket gets a group only when a human first
+// touches it, hid the reason the agent never found a new ticket for a day (#41).
 type Me struct {
 	ID    int64  `json:"id"`
 	Name  string `json:"name"`
 	Email string `json:"email,omitempty"`
 	Role  string `json:"role,omitempty"`
+
+	// TicketRestriction is the user's own (groups/assigned/organization/
+	// requested, "" for everything); TicketAccess the custom role's word for the
+	// same thing (all/within-groups/within-groups-and-public-groups/
+	// within-organization/assigned-only), where the user has a custom role.
+	CustomRoleID      int64  `json:"custom_role_id,omitempty"`
+	RestrictedAgent   bool   `json:"restricted_agent,omitempty"`
+	TicketRestriction string `json:"ticket_restriction,omitempty"`
+	TicketAccess      string `json:"ticket_access,omitempty"`
+	// LightAgent: a role that reads tickets and writes internal notes only —
+	// no reply the customer sees, whatever the playbook says.
+	LightAgent bool `json:"light_agent,omitempty"`
+}
+
+// Restricted says whether the identity sees less than the whole account.
+func (m Me) Restricted() bool {
+	return m.RestrictedAgent || m.TicketRestriction != "" || (m.TicketAccess != "" && m.TicketAccess != "all")
+}
+
+// Describe is the probe's sentence: who, and — where it is less than everything
+// — what that identity can see. The visibility goes into the same string
+// because it is the one fact an operator needs before wondering why the agent
+// finds nothing, and the probe has no second channel for it.
+func (m Me) Describe() string {
+	who := fmt.Sprintf("user %d", m.ID)
+	switch {
+	case m.Email != "" && m.Name != "":
+		who = fmt.Sprintf("%s (%s)", m.Name, m.Email)
+	case m.Name != "":
+		who = m.Name
+	}
+	var notes []string
+	if m.LightAgent {
+		notes = append(notes, "light agent: reads tickets and writes internal notes only — no reply the customer sees")
+	}
+	switch access := m.TicketAccess; {
+	case access == "within-groups" || access == "within-groups-and-public-groups" || (access == "" && m.TicketRestriction == "groups"):
+		notes = append(notes, "sees only tickets in its groups — a ticket without a group (every untouched one in an account that assigns groups by hand) is invisible to it")
+	case access == "assigned-only" || (access == "" && m.TicketRestriction == "assigned"):
+		notes = append(notes, "sees only tickets assigned to it — nothing it has not been handed reaches it")
+	case access == "within-organization" || (access == "" && m.TicketRestriction == "organization"):
+		notes = append(notes, "sees only tickets of its own organization")
+	case access == "" && m.TicketRestriction == "requested":
+		notes = append(notes, "sees only tickets it requested itself — an end user's view, not an agent's")
+	case access == "" && m.RestrictedAgent:
+		notes = append(notes, "a restricted agent — it does not see the whole account")
+	}
+	if len(notes) == 0 {
+		return who
+	}
+	return who + " — " + strings.Join(notes, "; ")
 }
 
 // openStatuses are the states a ticket can still be waiting in. Solved, closed
@@ -1698,7 +1760,7 @@ func (c *Client) myID(ctx context.Context) (int64, error) {
 	if out.User.ID == 0 {
 		return 0, fmt.Errorf("zendesk /users/me returned no user id")
 	}
-	me := &person{ID: out.User.ID, Name: out.User.Name, Email: out.User.Email, Role: out.User.Role}
+	me := &out.User
 	c.mu.Lock()
 	c.who = me
 	c.users[me.ID] = *me
@@ -1706,16 +1768,51 @@ func (c *Client) myID(ctx context.Context) (int64, error) {
 	return me.ID, nil
 }
 
-// Me is who the credential acts as — the probe's read.
+// Me is who the credential acts as — the probe's read. A user with a custom
+// role costs one more request, for what the role lets it see; a role the
+// account will not show (a 403 on custom_roles is what a Light Agent gets) is
+// not an error, the user's own restriction fields still say the most of it.
 func (c *Client) Me(ctx context.Context) (Me, error) {
 	id, err := c.myID(ctx)
 	if err != nil {
 		return Me{}, err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	p := c.users[id]
-	return Me{ID: id, Name: p.Name, Email: p.Email, Role: p.Role}, nil
+	c.mu.Unlock()
+	me := Me{ID: id, Name: p.Name, Email: p.Email, Role: p.Role,
+		CustomRoleID: p.CustomRoleID, RestrictedAgent: p.RestrictedAgent, TicketRestriction: p.TicketRestriction}
+	if p.CustomRoleID != 0 {
+		if role, err := c.customRole(ctx, p.CustomRoleID); err == nil {
+			me.TicketAccess = role.Configuration.TicketAccess
+			me.LightAgent = role.RoleType == 1 || role.Configuration.LightAgent
+		}
+	}
+	return me, nil
+}
+
+// customRole is one read of /custom_roles/{id}: what the role lets its holders
+// see and write. role_type 1 is Zendesk's number for a Light Agent; the older
+// accounts say the same thing as configuration.light_agent.
+type customRole struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	RoleType      int    `json:"role_type"`
+	Configuration struct {
+		TicketAccess        string `json:"ticket_access"`
+		TicketCommentAccess string `json:"ticket_comment_access"`
+		LightAgent          bool   `json:"light_agent"`
+	} `json:"configuration"`
+}
+
+func (c *Client) customRole(ctx context.Context, id int64) (customRole, error) {
+	var out struct {
+		Role customRole `json:"custom_role"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/custom_roles/%d.json", id), nil, nil, &out); err != nil {
+		return customRole{}, err
+	}
+	return out.Role, nil
 }
 
 // ---------------------------------------------------------------- WRITES
