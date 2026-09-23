@@ -88,18 +88,21 @@ func runErr(t *testing.T, c *Client, name string, in actionParams) error {
 
 // TestListTreeTakesTwoRoutes: GitHub splits the job. Non-recursively the
 // contents API answers for one directory; recursively the git trees API
-// answers for the whole repo and the path prefix filters afterwards.
+// answers for the folder's own subtree — found by its sha in the parent's
+// listing — and never for the whole repository (#40).
 func TestListTreeTakesTwoRoutes(t *testing.T) {
 	c, calls := serve(t, routes{
 		"GET /repos/acme/support/contents/internal": jsonOK(`[
-			{"path":"internal/auth.go","type":"file","size":120,"sha":"a1"},
-			{"path":"internal/db","type":"dir","sha":"b2"}]`),
-		"GET /repos/acme/support": jsonOK(`{"full_name":"acme/support","default_branch":"main"}`),
-		"GET /repos/acme/support/git/trees/main": jsonOK(`{"truncated":false,"tree":[
-			{"path":"README.md","type":"blob","size":10},
-			{"path":"internal","type":"tree"},
-			{"path":"internal/auth.go","type":"blob","size":120},
-			{"path":"web/app.tsx","type":"blob","size":40}]}`),
+			{"name":"auth.go","path":"internal/auth.go","type":"file","size":120,"sha":"a1"},
+			{"name":"db","path":"internal/db","type":"dir","sha":"b2"}]`),
+		"GET /repos/acme/support/contents/": jsonOK(`[
+			{"name":"README.md","path":"README.md","type":"file","size":10,"sha":"r0"},
+			{"name":"internal","path":"internal","type":"dir","sha":"t1"},
+			{"name":"web","path":"web","type":"dir","sha":"w1"}]`),
+		"GET /repos/acme/support/git/trees/t1": jsonOK(`{"truncated":false,"tree":[
+			{"path":"auth.go","type":"blob","size":120},
+			{"path":"db","type":"tree"},
+			{"path":"db/schema.sql","type":"blob","size":300}]}`),
 	})
 	ctx := context.Background()
 
@@ -111,22 +114,81 @@ func TestListTreeTakesTwoRoutes(t *testing.T) {
 		t.Fatalf("the contents API's file/dir must become blob/tree: %+v", flat)
 	}
 
-	// Without a ref the recursive route has to look the default branch up
-	// first — it cannot address a tree without one.
-	deep, err := c.ListTree(ctx, "acme/support", "internal", "", true)
+	deep, err := c.ListTree(ctx, "acme/support", "internal/", "", true)
 	if err != nil {
 		t.Fatalf("ListTree recursive: %v", err)
 	}
-	if len(deep) != 2 {
-		t.Fatalf("the path prefix must filter (internal + internal/auth.go): %+v", deep)
+	if len(deep) != 3 {
+		t.Fatalf("the folder's subtree, nothing else: %+v", deep)
 	}
 	for _, e := range deep {
-		if !strings.HasPrefix(e.Path, "internal") {
-			t.Errorf("entry outside the prefix: %q", e.Path)
+		if !strings.HasPrefix(e.Path, "internal/") {
+			t.Errorf("a subtree path must be reported repository-relative: %q", e.Path)
 		}
 	}
-	if !strings.Contains(strings.Join(*calls, " "), "GET /repos/acme/support/git/trees/main") {
-		t.Errorf("the recursive route must use the git trees API: %v", *calls)
+	joined := strings.Join(*calls, " ")
+	if !strings.Contains(joined, "GET /repos/acme/support/git/trees/t1") {
+		t.Errorf("the recursive route must ask for the folder's tree by its sha: %v", *calls)
+	}
+	if strings.Contains(joined, "git/trees/main") {
+		t.Errorf("the whole repository's tree was fetched: %v", *calls)
+	}
+}
+
+// TestListTreeRecursiveWithoutPathTakesTheDefaultBranch: without a folder there
+// is no parent to ask, so the tree is addressed by ref — and without a ref by
+// the default branch, which has to be looked up first.
+func TestListTreeRecursiveWithoutPathTakesTheDefaultBranch(t *testing.T) {
+	c, calls := serve(t, routes{
+		"GET /repos/acme/support": jsonOK(`{"full_name":"acme/support","default_branch":"main"}`),
+		"GET /repos/acme/support/git/trees/main": jsonOK(`{"truncated":false,"tree":[
+			{"path":"README.md","type":"blob","size":10},
+			{"path":"internal","type":"tree"}]}`),
+	})
+	deep, err := c.ListTree(context.Background(), "acme/support", "", "", true)
+	if err != nil || len(deep) != 2 {
+		t.Fatalf("ListTree recursive at the root: %v %+v", err, deep)
+	}
+	if deep[0].Path != "README.md" {
+		t.Errorf("root paths are already repository-relative: %+v", deep)
+	}
+	if !strings.Contains(strings.Join(*calls, " "), "git/trees/main") {
+		t.Errorf("the default branch must address the tree: %v", *calls)
+	}
+}
+
+// TestListTreeNamesTheWayOut is #40: a tree past the body cap answered
+// "unexpected end of JSON input", and an agent that followed the action doc
+// ("narrow it with path") burned its call budget on retries that could never
+// succeed. Both ceilings — ours and GitHub's own truncated flag — have to name
+// the folder and the way out; a path that is not a directory has to say so too.
+func TestListTreeNamesTheWayOut(t *testing.T) {
+	c, _ := serve(t, routes{
+		"GET /repos/acme/support/contents/apps": jsonOK(`[
+			{"name":"core","path":"apps/core","type":"dir","sha":"big"},
+			{"name":"legacy","path":"apps/legacy","type":"dir","sha":"cut"},
+			{"name":"NOTES.md","path":"apps/NOTES.md","type":"file","sha":"n1","size":5}]`),
+		"GET /repos/acme/support/git/trees/big": func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(`{"truncated":false,"tree":[`))
+			row := []byte(`{"path":"x","type":"blob","size":1},`)
+			for n := 0; n < maxBodyBytes+len(row); n += len(row) {
+				w.Write(row)
+			}
+			w.Write([]byte(`{"path":"y","type":"blob","size":1}]}`))
+		},
+		"GET /repos/acme/support/git/trees/cut": jsonOK(`{"truncated":true,"tree":[{"path":"a","type":"blob"}]}`),
+	})
+	ctx := context.Background()
+	for _, tc := range []struct{ path, want string }{
+		{"apps/core", "the tree of apps/core exceeds 8 MB — list it without recursive or pick a subfolder"},
+		{"apps/legacy", "the tree of apps/legacy is larger than GitHub returns in one answer — list it without recursive or pick a subfolder"},
+		{"apps/NOTES.md", "apps/NOTES.md is a file, not a directory — read it with read_file"},
+		{"apps/missing", "no directory apps/missing in the repository — check the path with list_tree on its parent"},
+	} {
+		_, err := c.ListTree(ctx, "acme/support", tc.path, "", true)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("list_tree %s recursive:\n got %v\nwant %s", tc.path, err, tc.want)
+		}
 	}
 }
 
@@ -1613,19 +1675,23 @@ func TestHasWorkWithNothingOpen(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // TestListTreeCapsBothRoutes: a whole repository tree does not belong in an
-// agent's context. Both routes stop at the cap.
+// agent's context. Both routes stop at the cap — and the recursive one asks the
+// parent listing at the caller's ref, or it would name a folder's sha from the
+// default branch.
 func TestListTreeCapsBothRoutes(t *testing.T) {
 	var flat, deep []map[string]any
 	for i := range perPage + 20 {
-		flat = append(flat, map[string]any{"path": fmt.Sprintf("f%d.go", i), "type": "file"})
-		deep = append(deep, map[string]any{"path": fmt.Sprintf("src/f%d.go", i), "type": "blob"})
+		flat = append(flat, map[string]any{"name": fmt.Sprintf("f%d.go", i), "path": fmt.Sprintf("f%d.go", i), "type": "file"})
+		deep = append(deep, map[string]any{"path": fmt.Sprintf("f%d.go", i), "type": "blob"})
 	}
+	var parentRef string
 	c, _ := serve(t, routes{
-		"GET /repos/acme/support/contents/": func(w http.ResponseWriter, _ *http.Request) {
-			json.NewEncoder(w).Encode(flat)
+		"GET /repos/acme/support/contents/": func(w http.ResponseWriter, r *http.Request) {
+			parentRef = r.URL.Query().Get("ref")
+			json.NewEncoder(w).Encode(append([]map[string]any{{"name": "src", "path": "src", "type": "dir", "sha": "s1"}}, flat...))
 		},
-		"GET /repos/acme/support/git/trees/main": func(w http.ResponseWriter, _ *http.Request) {
-			json.NewEncoder(w).Encode(map[string]any{"truncated": true, "tree": deep})
+		"GET /repos/acme/support/git/trees/s1": func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{"truncated": false, "tree": deep})
 		},
 	})
 	ctx := context.Background()
@@ -1637,6 +1703,9 @@ func TestListTreeCapsBothRoutes(t *testing.T) {
 	got, err = c.ListTree(ctx, "acme/support", "src", "main", true)
 	if err != nil || len(got) != perPage {
 		t.Fatalf("the trees route must cap at %d: %v %d", perPage, err, len(got))
+	}
+	if parentRef != "main" {
+		t.Errorf("the folder's sha was looked up at ref %q, not at the caller's", parentRef)
 	}
 }
 

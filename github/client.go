@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -80,15 +81,29 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	// One byte past the cap tells a truncated answer from one that fits exactly.
+	// Cut mid-document, the JSON decoder would report "unexpected end of JSON
+	// input" — a message that names neither the cause nor the way out (#40).
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > maxBodyBytes {
+		return fmt.Errorf("github %s %s: %w", method, path, errBodyTooLarge)
 	}
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		return json.Unmarshal(data, out)
 	}
 	return nil
 }
+
+// maxBodyBytes caps a JSON answer. An agent's context is the reason for the
+// number; the binary bodies (archive, job log) take their own route in raw.
+const maxBodyBytes = 8 << 20
+
+// errBodyTooLarge is what do reports past the cap — a sentinel, so that a caller
+// who knows a smaller request (a subtree instead of the tree) can say so.
+var errBodyTooLarge = errors.New("the answer exceeds 8 MB")
 
 // raw carries out a request and hands the still-open response back — for binary
 // bodies (the repository archive, a job log) that do not belong in memory. The
@@ -767,24 +782,18 @@ type TreeEntry struct {
 
 // ListTree lists the repository tree. Two routes, because GitHub splits the
 // job: non-recursively the contents API (one directory), recursively the git
-// trees API filtered by the path prefix. Both are capped at perPage entries —
-// a whole tree does not belong in an agent's context.
+// trees API. Both are capped at perPage entries — a whole tree does not belong
+// in an agent's context.
+//
+// The recursive route asks for the tree of the folder named by path, not for
+// the repository's tree filtered afterwards: on a monorepo the whole tree runs
+// past the body cap, and a path that narrows the answer but not the request
+// could never succeed (#40). The folder's sha comes from its parent's listing —
+// the contents API names a directory's sha only there.
 func (c *Client) ListTree(ctx context.Context, repo, path, ref string, recursive bool) ([]TreeEntry, error) {
 	if !recursive {
-		p, err := repoPath(repo, "/contents/"+escapePath(path))
+		raw, err := c.listContents(ctx, repo, path, ref)
 		if err != nil {
-			return nil, err
-		}
-		if ref != "" {
-			p += "?ref=" + url.QueryEscape(ref)
-		}
-		var raw []struct {
-			Path string `json:"path"`
-			Type string `json:"type"` // file | dir
-			Size int    `json:"size"`
-			SHA  string `json:"sha"`
-		}
-		if err := c.do(ctx, http.MethodGet, p, nil, &raw); err != nil {
 			return nil, err
 		}
 		out := []TreeEntry{}
@@ -792,23 +801,30 @@ func (c *Client) ListTree(ctx context.Context, repo, path, ref string, recursive
 			if i >= perPage {
 				break
 			}
-			kind := "blob"
-			if e.Type == "dir" {
-				kind = "tree"
-			}
-			out = append(out, TreeEntry{Path: e.Path, Type: kind, Size: e.Size, SHA: e.SHA})
+			out = append(out, TreeEntry{Path: e.Path, Type: e.kind(), Size: e.Size, SHA: e.SHA})
 		}
 		return out, nil
 	}
 
-	if ref == "" {
-		r, err := c.GetRepo(ctx, repo)
+	folder := strings.Trim(strings.TrimSpace(path), "/")
+	var root string
+	if folder == "" {
+		if ref == "" {
+			r, err := c.GetRepo(ctx, repo)
+			if err != nil {
+				return nil, err
+			}
+			ref = r.DefaultBranch
+		}
+		root = ref
+	} else {
+		sha, err := c.dirSHA(ctx, repo, folder, ref)
 		if err != nil {
 			return nil, err
 		}
-		ref = r.DefaultBranch
+		root = sha
 	}
-	p, err := repoPath(repo, "/git/trees/"+url.PathEscape(ref)+"?recursive=1")
+	p, err := repoPath(repo, "/git/trees/"+url.PathEscape(root)+"?recursive=1")
 	if err != nil {
 		return nil, err
 	}
@@ -816,21 +832,91 @@ func (c *Client) ListTree(ctx context.Context, repo, path, ref string, recursive
 		Tree      []TreeEntry `json:"tree"`
 		Truncated bool        `json:"truncated"`
 	}
+	where := "the repository"
+	if folder != "" {
+		where = folder
+	}
 	if err := c.do(ctx, http.MethodGet, p, nil, &tree); err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			return nil, fmt.Errorf("the tree of %s exceeds 8 MB — list it without recursive or pick a subfolder", where)
+		}
 		return nil, err
 	}
-	prefix := strings.Trim(strings.TrimSpace(path), "/")
+	if tree.Truncated {
+		// GitHub cut the tree itself (its own ceiling is 100,000 entries); a
+		// listing from a tree with holes in it is not the folder's tree.
+		return nil, fmt.Errorf("the tree of %s is larger than GitHub returns in one answer — list it without recursive or pick a subfolder", where)
+	}
 	out := []TreeEntry{}
 	for _, e := range tree.Tree {
-		if prefix != "" && !strings.HasPrefix(e.Path, prefix+"/") && e.Path != prefix {
-			continue
-		}
 		if len(out) >= perPage {
 			break
+		}
+		// The subtree's paths are relative to the folder; the caller asked by
+		// the repository-relative path and reads the answer the same way.
+		if folder != "" {
+			e.Path = folder + "/" + e.Path
 		}
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// contentEntry is one row of the contents API's directory listing.
+type contentEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Type string `json:"type"` // file | dir | symlink | submodule
+	Size int    `json:"size"`
+	SHA  string `json:"sha"`
+}
+
+// kind maps the contents API's file/dir onto the tree API's blob/tree, so that
+// both routes of ListTree answer in one vocabulary.
+func (e contentEntry) kind() string {
+	if e.Type == "dir" {
+		return "tree"
+	}
+	return "blob"
+}
+
+// listContents — GET …/contents/{path}: one directory's entries.
+func (c *Client) listContents(ctx context.Context, repo, path, ref string) ([]contentEntry, error) {
+	p, err := repoPath(repo, "/contents/"+escapePath(path))
+	if err != nil {
+		return nil, err
+	}
+	if ref != "" {
+		p += "?ref=" + url.QueryEscape(ref)
+	}
+	var raw []contentEntry
+	if err := c.do(ctx, http.MethodGet, p, nil, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// dirSHA finds the git sha of a directory: it is named in the listing of the
+// parent, and nowhere else the contents API answers.
+func (c *Client) dirSHA(ctx context.Context, repo, folder, ref string) (string, error) {
+	parent, name := "", folder
+	if i := strings.LastIndex(folder, "/"); i >= 0 {
+		parent, name = folder[:i], folder[i+1:]
+	}
+	entries, err := c.listContents(ctx, repo, parent, ref)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.Name != name {
+			continue
+		}
+		if e.Type != "dir" {
+			return "", fmt.Errorf("%s is a %s, not a directory — read it with read_file", folder, e.Type)
+		}
+		return e.SHA, nil
+	}
+	return "", fmt.Errorf("no directory %s in the repository — check the path with list_tree on its parent", folder)
 }
 
 // escapePath escapes a repository-relative path segment by segment — the

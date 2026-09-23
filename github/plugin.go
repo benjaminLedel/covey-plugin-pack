@@ -872,7 +872,9 @@ func (System) PromptDoc() string {
    Reading the code: checkout {"repo":"…","ref":"branch|tag|sha (optional, default: the default branch)"} loads the
    source into your sandbox and returns the local path. GitHub's archive cannot be narrowed to a subdirectory — if a
    repo is too large, work without a checkout: list_tree {"repo":"…","path":"…","ref":"…","recursive":true|false}
-   lists the repository tree (max. 100 entries — narrow it with path), read_file {"repo":"…","file_path":"path/to/file","ref":"…"}
+   lists one directory, or with recursive the whole subtree below path (max. 100 entries either way — narrow it
+   with path; a folder whose subtree is too large to answer says so in its error, then list it flat or pick a
+   subfolder), read_file {"repo":"…","file_path":"path/to/file","ref":"…"}
    reads a single file, list_branches {"repo":"…","search":"…"} lists branches (the default branch is marked — do not
    guess branch names), list_commits {"repo":"…","ref":"…","path":"file/or/directory","since":"ISO date","limit":N}
    lists the commit history newest first (all filters optional; limit caps the answer, max. 100),
