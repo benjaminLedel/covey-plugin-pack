@@ -54,6 +54,7 @@ type fake struct {
 	// WITHOUT its thread, and the comment that was just created in the update's
 	// own audit. The default keeps the inlined shape the older tests rely on.
 	wieInEcht  bool
+	restricted bool              // users/me is a Light Agent pinned to its groups (#41)
 	reject     bool              // answer every API call with 401
 	rejectMint bool              // answer the token endpoint with 401
 	lastBody   map[string]any    // last request body with a JSON object in it
@@ -80,6 +81,7 @@ func newFake(t *testing.T) *fake {
 	mux.HandleFunc("/api/v2/tickets/", f.handleTicketChild)
 	mux.HandleFunc("/api/v2/search.json", f.handleSearch)
 	mux.HandleFunc("/api/v2/users/me.json", f.handleMe)
+	mux.HandleFunc("/api/v2/custom_roles/", f.handleCustomRole)
 	mux.HandleFunc("/api/v2/users/show_many.json", f.handleShowMany)
 	mux.HandleFunc("/api/v2/views.json", func(w http.ResponseWriter, r *http.Request) {
 		f.record(r)
@@ -562,8 +564,29 @@ func (f *fake) handleMe(w http.ResponseWriter, r *http.Request) {
 	if !f.guard(w, r) {
 		return
 	}
-	writeJSON(w, map[string]any{"user": map[string]any{
+	user := map[string]any{
 		"id": 7, "name": "Covey Bot", "email": "bot@acme.example", "role": "agent",
+		"custom_role_id": nil, "restricted_agent": false, "ticket_restriction": nil,
+	}
+	if f.restricted {
+		user["custom_role_id"], user["restricted_agent"], user["ticket_restriction"] = 360001, true, "groups"
+	}
+	writeJSON(w, map[string]any{"user": user})
+}
+
+// handleCustomRole answers custom_roles/{id} the way an account does for its
+// Light Agent role.
+func (f *fake) handleCustomRole(w http.ResponseWriter, r *http.Request) {
+	if !f.guard(w, r) {
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, "/360001.json") {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]any{"custom_role": map[string]any{
+		"id": 360001, "name": "Light agent", "role_type": 1,
+		"configuration": map[string]any{"ticket_access": "within-groups", "ticket_comment_access": "none"},
 	}})
 }
 
@@ -1241,10 +1264,10 @@ func TestPaginationFollowsWhicheverDialectTheAnswerCarries(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("%d hits", len(hits))
 	}
-	if hits[0].Title != "x" || hits[0].TicketID != 42 {
-		t.Errorf("hit not read from the index's own field names: %+v", hits[0])
+	if hits[0].Subject != "x" || hits[0].ID != 42 {
+		t.Errorf("hit not read as a ticket row: %+v", hits[0])
 	}
-	if !strings.HasPrefix(string(hits[0].UpdatedAt), "2026") {
+	if !strings.HasPrefix(hits[0].UpdatedAt, "2026") {
 		t.Errorf("the index's own timestamp not read: %q", hits[0].UpdatedAt)
 	}
 
@@ -1264,6 +1287,53 @@ func TestPaginationFollowsWhicheverDialectTheAnswerCarries(t *testing.T) {
 	}
 	if !secondPage {
 		t.Error("the second page was never asked for")
+	}
+}
+
+// TestSearchHitIsAListRow is #42: a search hit was reported under the index's
+// own column names (ticket_id, title, createtime, update_time) and without its
+// tags, so an agent that piped a search and a list through the same jq got null
+// ids and null dates from the search, and could not confirm a tag on a hit that
+// the query had filtered by. A hit now reads under both spellings — the index's
+// and the ticket's, whichever the account sends — and reports the list's, with
+// the old names beside them for one release.
+func TestSearchHitIsAListRow(t *testing.T) {
+	f := newFake(t)
+	tk := f.addTicket(42, 101, 9, "open", "x")
+	tk["tags"] = []string{"covey", "rüdi"}
+	hits, err := f.client("tok").SearchTickets(context.Background(), "tags:rüdi", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("%v, %d hits", err, len(hits))
+	}
+	raw, _ := json.Marshal(hits[0])
+	var row map[string]any
+	json.Unmarshal(raw, &row)
+	for key, want := range map[string]string{
+		"id": "42", "subject": "x", "status": "open", "created_at": "2026-02-01T09:00:00Z",
+		"updated_at": "2026-02-02T09:00:00Z", "group": "Support L1", "assignee": "J. Mensch", "requester": "K. Kunde",
+		// the index's spellings, for a playbook written against them
+		"ticket_id": "42", "title": "x", "createtime": "2026-02-01T09:00:00Z", "update_time": "2026-02-02T09:00:00Z",
+	} {
+		if got := fmt.Sprint(row[key]); got != want {
+			t.Errorf("hit.%s = %q, want %q", key, got, want)
+		}
+	}
+	if got := fmt.Sprint(row["tags"]); got != "[covey rüdi]" {
+		t.Errorf("hit.tags = %s — the tag the query filtered by has to be on the hit", got)
+	}
+	if _, there := row["description"]; there {
+		t.Error("a hit carries the customer's opening mail — a list row does not, and a hit is a list row")
+	}
+
+	// The index's own spellings alone, as an account may send them: they fill
+	// the ticket's names rather than being lost.
+	var h SearchHit
+	if err := json.Unmarshal([]byte(`{"tid":"7","title":"index only","gid":101,"createtime":"2026-03-01 08:00:00 UTC","update_time":"2026-03-02 08:00:00 UTC","ticket_type":"problem","result_type":"ticket"}`), &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.ID != 7 || h.Subject != "index only" || h.GroupID != 101 || h.Type != "problem" ||
+		h.CreatedAt != "2026-03-01T08:00:00Z" || h.UpdatedAt != "2026-03-02T08:00:00Z" {
+		t.Errorf("index-only spellings not read into the row: %+v", h)
 	}
 }
 
@@ -2257,6 +2327,58 @@ func TestProbeNamesTheIdentity(t *testing.T) {
 	}
 	if static.ExpiresAt != nil {
 		t.Errorf("a token that was not minted here reports a minted expiry: %v", static.ExpiresAt)
+	}
+}
+
+// TestProbeSaysWhatTheCredentialCanSee is #41: the probe answered "ok" and a
+// name for a Light Agent whose role hides every ticket without a group — in an
+// account that assigns groups by hand, every untouched one — and the cause took
+// a day to find. The probe names the restriction, the role's word for it comes
+// from one read of custom_roles, and Inspect says the same sentence.
+func TestProbeSaysWhatTheCredentialCanSee(t *testing.T) {
+	f := newFake(t)
+	f.restricted = true
+	who, err := (System{}).Probe(context.Background(), f.cred("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Covey Bot (bot@acme.example)",
+		"light agent: reads tickets and writes internal notes only",
+		"sees only tickets in its groups — a ticket without a group",
+	} {
+		if !strings.Contains(who, want) {
+			t.Errorf("probe said %q — missing %q", who, want)
+		}
+	}
+	info, err := (System{}).Inspect(context.Background(), f.cred("tok"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Identity != who {
+		t.Errorf("Inspect says %q, Probe says %q", info.Identity, who)
+	}
+	var roleReads int
+	for _, r := range f.requests {
+		if strings.Contains(r, "custom_roles/360001") {
+			roleReads++
+		}
+	}
+	if roleReads != 2 {
+		t.Errorf("one role read per probe expected, saw %d", roleReads)
+	}
+
+	// The user's own fields carry the restriction even where the role cannot be
+	// read — a Light Agent is not allowed to list roles on some accounts.
+	var me Me
+	if err := json.Unmarshal([]byte(`{"id":7,"name":"Rüdiger","ticket_restriction":"assigned","restricted_agent":true}`), &me); err != nil {
+		t.Fatal(err)
+	}
+	if got := me.Describe(); !strings.Contains(got, "sees only tickets assigned to it") {
+		t.Errorf("Describe from /users/me alone: %q", got)
+	}
+	if got := (Me{ID: 7, Name: "Plain"}).Describe(); got != "Plain" {
+		t.Errorf("an unrestricted identity carries no note: %q", got)
 	}
 }
 

@@ -185,8 +185,8 @@ func TestLiveSearch(t *testing.T) {
 	if len(hits) == 0 {
 		t.Skip("account has no open ticket to search for")
 	}
-	t.Logf("%d hits, first: ticket_id=%d title given=%v group=%q in_intake_scope=%v",
-		len(hits), hits[0].TicketID, hits[0].Title != "", hits[0].Group, hits[0].InIntakeScope)
+	t.Logf("%d hits, first: id=%d subject given=%v tags=%v group=%q in_intake_scope=%v",
+		len(hits), hits[0].ID, hits[0].Subject != "", hits[0].Tags, hits[0].Group, hits[0].InIntakeScope)
 
 	tickets, err := c.ListTickets(context.Background(), ListOptions{Limit: 1})
 	if err != nil || len(tickets) == 0 {

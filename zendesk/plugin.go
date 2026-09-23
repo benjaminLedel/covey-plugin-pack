@@ -459,7 +459,8 @@ func (System) PromptDoc() string {
    what the customer wrote; that is get_ticket. And "status" takes exactly ONE value: a ticket nobody
    has picked up yet is "new", not "open", so a queue is read as new AND open),
    search_tickets {"query":"status:open tag:billing login problem","limit":10} (the account's own
-   search — how was this answered before?),
+   search — how was this answered before? A hit is the same object as a list_tickets row: id, subject,
+   status, tags, group, assignee, created_at, updated_at — one jq reads both),
    list_messages {"ticket_id":123} (the thread oldest first; internal notes are marked),
    list_attachments {"ticket_id":123"}, download_attachment {"ticket_id":123,"attachment_id":"…"},
    attach_file {"ticket_id":123,"path":"screenshot.png","body":"…"},
