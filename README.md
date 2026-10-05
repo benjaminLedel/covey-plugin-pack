@@ -10,7 +10,7 @@ These used to live inside Covey's own repository, compiled in from `internal/`. 
 
 | | System | |
 |---|---|---|
-| `zammad/` | Zammad | helpdesk: read tickets, reply, set state, escalate; webhook intake |
+| `zammad/` | Zammad | helpdesk: the tickets assigned to the agent, full-text search, read, reply, set state, assign, escalate; intake by polling (`nur-wenn: zammad:assigned`) or webhook |
 | `salesforce/` | Salesforce Service Cloud | support cases: read the case and its whole conversation, look at the screenshot the customer attached, look up how the question was answered before, reply as a note, a portal comment or a mail, escalate. Heartbeat intake; a webhook where a flow posts one |
 | `zendesk/` | Zendesk Support | the same job on the other helpdesk: read a ticket with its whole thread (rebuilt from the audit trail, so an agent cannot miss an older answer), look at the screenshot the customer attached, look up how this customer's question was answered before, reply as a public answer or an internal note, move the status, escalate into the escalation group. Heartbeat intake with a pre-check that costs one call; a webhook where the account posts one |
 | `gitlab/` · `github/` | GitLab, GitHub | issues and merge/pull requests as the working set: check out, fix, commit, open an MR/PR, live the review loop |
