@@ -186,11 +186,29 @@ func (c *Client) Reply(ctx context.Context, ticketID int, body string, internal 
 	err := c.do(ctx, http.MethodPost, "/ticket_articles", map[string]any{
 		"ticket_id":    ticketID,
 		"body":         body,
-		"content_type": "text/plain",
+		"content_type": BodyContentType(body, ""),
 		"type":         articleType,
 		"internal":     internal,
 	}, &out)
 	return out, err
+}
+
+// BodyContentType names the article's content type: what the caller said, or
+// a guess from the body. Zammad renders text/plain verbatim, so a body that is
+// markup would show its tags to everyone who reads the ticket. Starts with a
+// tag and closes one: HTML. Anything else: plain text.
+func BodyContentType(body, override string) string {
+	switch strings.ToLower(strings.TrimSpace(override)) {
+	case "text/html", "html":
+		return "text/html"
+	case "text/plain", "plain", "text":
+		return "text/plain"
+	}
+	t := strings.TrimSpace(body)
+	if strings.HasPrefix(t, "<") && (strings.Contains(t, "</") || strings.Contains(strings.ToLower(t), "<br")) {
+		return "text/html"
+	}
+	return "text/plain"
 }
 
 // SetState — PUT /tickets/{id}. "pending reminder" maps Covey's blocked.
