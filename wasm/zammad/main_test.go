@@ -362,3 +362,20 @@ func TestAssignResolvesTheOwner(t *testing.T) {
 		t.Fatal("assign without ticket_id must fail")
 	}
 }
+
+func TestReplyContentTypeFollowsTheBody(t *testing.T) {
+	cases := map[string]string{
+		"Hallo Elke,\n\nzwei Absätze.\n\nViele Grüße\nLena": "text/plain",
+		"<p>Hallo Elke,</p><p>zwei Absätze.</p>":            "text/html",
+		"<p>Hallo<br>Lena": "text/html",
+		"<3 Danke":         "text/plain",
+	}
+	for body, want := range cases {
+		if got := bodyContentType(body, ""); got != want {
+			t.Errorf("%q: got %s, want %s", body, got, want)
+		}
+	}
+	if bodyContentType("<p>x</p>", "text/plain") != "text/plain" || bodyContentType("x", "html") != "text/html" {
+		t.Error("an explicit content_type wins over the guess")
+	}
+}

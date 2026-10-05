@@ -432,3 +432,15 @@ func TestWritesWorkSignature(t *testing.T) {
 		}
 	}
 }
+
+func TestBodyContentType(t *testing.T) {
+	if BodyContentType("Hallo,\n\nzwei Absätze.", "") != "text/plain" {
+		t.Error("plain text stays plain")
+	}
+	if BodyContentType("<p>Hallo</p><p>zwei Absätze.</p>", "") != "text/html" {
+		t.Error("markup is sent as HTML")
+	}
+	if BodyContentType("<p>x</p>", "plain") != "text/plain" {
+		t.Error("an explicit content type wins")
+	}
+}

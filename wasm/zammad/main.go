@@ -49,7 +49,7 @@ func (plugin) Describe() covey.Description {
 			{Name: "search_tickets", Scope: "read", Doc: `{"query":"…","limit":N} — full-text search over title, number and articles, for "has the house answered this before".`},
 			{Name: "get_ticket", Scope: "read", Doc: `{"ticket_id":N} — the ticket with state, group, priority, owner and customer.`},
 			{Name: "list_articles", Scope: "read", Doc: `{"ticket_id":N} — the whole conversation, oldest first. Sender tells a customer message from your own.`},
-			{Name: "reply", Scope: "comment", Doc: `{"ticket_id":N,"body":"...","internal":true|false,"reply_type":"email"|"web"} — internal defaults to true (a note only agents see). internal:false goes to the customer; reply_type picks how (default email, "web" for a chat instance).`},
+			{Name: "reply", Scope: "comment", Doc: `{"ticket_id":N,"body":"...","internal":true|false,"reply_type":"email"|"web"} — internal defaults to true (a note only agents see). internal:false goes to the customer; reply_type picks how (default email, "web" for a chat instance). Write the body as plain text with blank lines between paragraphs; a body that is HTML is sent as HTML.`},
 			{Name: "set_state", Scope: "write", Doc: `{"ticket_id":N,"state":"open"|"closed"|"pending reminder"|...} — a pending state gets a reminder 48h out.`},
 			{Name: "assign", Scope: "write", Doc: `{"ticket_id":N,"owner":"me"|"<login or e-mail>"} — takes a ticket or hands it to a person. The state stays as it is: taking a ticket is not answering it.`},
 			{Name: "escalate", Scope: "write", Doc: `{"ticket_id":N,"note":"..."} — leaves an internal note and puts the ticket back to the group unassigned, so a human picks it up.`},
@@ -73,9 +73,11 @@ func (p plugin) Execute(action string, params json.RawMessage) (any, error) {
 		State     string `json:"state"`
 		Note      string `json:"note"`
 		ReplyType string `json:"reply_type"`
-		Owner     string `json:"owner"`
-		Query     string `json:"query"`
-		Limit     int    `json:"limit"`
+		// ContentType overrides the guess in reply: "text/plain" or "text/html".
+		ContentType string `json:"content_type"`
+		Owner       string `json:"owner"`
+		Query       string `json:"query"`
+		Limit       int    `json:"limit"`
 	}
 	if len(params) > 0 {
 		if err := json.Unmarshal(params, &in); err != nil {
@@ -106,7 +108,7 @@ func (p plugin) Execute(action string, params json.RawMessage) (any, error) {
 		return get[[]article](fmt.Sprintf("/api/v1/ticket_articles/by_ticket/%d", in.TicketID))
 	case "reply":
 		internal := in.Internal == nil || *in.Internal
-		return reply(in.TicketID, in.Body, internal, in.ReplyType)
+		return reply(in.TicketID, in.Body, internal, in.ReplyType, in.ContentType)
 	case "set_state":
 		if strings.TrimSpace(in.State) == "" {
 			return nil, fmt.Errorf("state missing")
@@ -303,7 +305,7 @@ func get[T any](path string) (T, error) {
 // customer-visible answer goes out as type "email" by default, because an
 // external "note" would show in the ticket and send no mail — the failure mode
 // where the agent believes it answered and the customer never heard.
-func reply(ticketID int, body string, internal bool, replyType string) (article, error) {
+func reply(ticketID int, body string, internal bool, replyType, contentType string) (article, error) {
 	articleType := "note"
 	if !internal {
 		articleType = strings.TrimSpace(replyType)
@@ -315,7 +317,7 @@ func reply(ticketID int, body string, internal bool, replyType string) (article,
 	resp := fetch(covey.Request{Method: "POST", Path: path, Body: mustJSON(map[string]any{
 		"ticket_id":    ticketID,
 		"body":         body,
-		"content_type": "text/plain",
+		"content_type": bodyContentType(body, contentType),
 		"type":         articleType,
 		"internal":     internal,
 	})})
@@ -335,6 +337,25 @@ func reply(ticketID int, body string, internal bool, replyType string) (article,
 //
 // This is the line the frozen clock would have broken silently: a module built
 // against wazero's default would have sent a reminder date in 2022.
+// bodyContentType names the article's content type: what the caller said, or
+// a guess from the body. Zammad renders text/plain verbatim, so a body that
+// is markup — a model told to write paragraphs reaches for <p> often enough —
+// would show its tags to everyone who reads the ticket. Starts with a tag and
+// closes one: HTML. Anything else: plain text, where blank lines are paragraphs.
+func bodyContentType(body, override string) string {
+	switch strings.ToLower(strings.TrimSpace(override)) {
+	case "text/html", "html":
+		return "text/html"
+	case "text/plain", "plain", "text":
+		return "text/plain"
+	}
+	t := strings.TrimSpace(body)
+	if strings.HasPrefix(t, "<") && (strings.Contains(t, "</") || strings.Contains(strings.ToLower(t), "<br")) {
+		return "text/html"
+	}
+	return "text/plain"
+}
+
 func setState(ticketID int, state string) error {
 	body := map[string]any{"state": state}
 	if strings.HasPrefix(state, "pending") {
@@ -347,7 +368,7 @@ func setState(ticketID int, state string) error {
 // escalate leaves the reason where the next person will read it, then puts the
 // ticket back to the group. owner_id 1 is Zammad's unassigned.
 func escalate(ticketID int, note string) error {
-	if _, err := reply(ticketID, note, true, ""); err != nil {
+	if _, err := reply(ticketID, note, true, "", ""); err != nil {
 		return err
 	}
 	path := fmt.Sprintf("/api/v1/tickets/%d", ticketID)
