@@ -139,8 +139,13 @@ func (c *Client) raw(ctx context.Context, method, path string, body any, hc *htt
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
+		// The full URL, not just path, because a 404 from a misconfigured
+		// github_url (one that normalizeBaseURL silently turned into
+		// something GitHub never serves) looks identical to a genuine
+		// token-scope or repo-access 404 otherwise — the base URL is the
+		// one piece of evidence that tells them apart.
 		return nil, fmt.Errorf("github %s %s: HTTP %d%s: %.300s",
-			method, path, resp.StatusCode, rateLimitHint(resp), data)
+			method, c.BaseURL+path, resp.StatusCode, rateLimitHint(resp), data)
 	}
 	return resp, nil
 }
