@@ -1062,6 +1062,30 @@ func (c *Client) GetMRApprovals(ctx context.Context, projectID, mrIID int) (MRAp
 	return out, err
 }
 
+// mrCommitsPage is how many commits ListMRCommits asks for. A merge request
+// that holds more is not judged by the author exception in merge_mr — it
+// refuses rather than reason about a list it has only seen part of.
+const mrCommitsPage = 100
+
+// ListMRCommits — GET /projects/{id}/merge_requests/{iid}/commits: the
+// commits a merge request brings, one page of mrCommitsPage.
+func (c *Client) ListMRCommits(ctx context.Context, projectID, mrIID int) ([]Commit, error) {
+	var out []Commit
+	err := c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/projects/%d/merge_requests/%d/commits?per_page=%d", projectID, mrIID, mrCommitsPage), nil, &out)
+	return out, err
+}
+
+// CommitMergeRequests — GET /projects/{id}/repository/commits/{sha}/merge_requests:
+// the merge requests a commit belongs to, the merge commit of a merged one
+// included.
+func (c *Client) CommitMergeRequests(ctx context.Context, projectID int, sha string) ([]MergeRequest, error) {
+	var out []MergeRequest
+	err := c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/projects/%d/repository/commits/%s/merge_requests", projectID, url.PathEscape(sha)), nil, &out)
+	return out, err
+}
+
 // MergeMR — PUT /projects/{id}/merge_requests/{iid}/merge. sha pins the state
 // to be merged: GitLab merges only if the head is still that commit, so a
 // commit pushed after the review can never be merged unseen. Passing an empty

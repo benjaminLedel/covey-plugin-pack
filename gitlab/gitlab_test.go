@@ -2374,6 +2374,12 @@ type mergeGateServer struct {
 	// between read and call), "nothing" neither — an answer whose MR is
 	// unchanged, which does happen and must not be sold as a success.
 	autoMergeOutcome string
+	// commits and commitMRs answer the author exception: the commits the MR
+	// brings, and per sha the merge requests GitLab links to it. commitsErr
+	// makes the commit list fail.
+	commits    []Commit
+	commitMRs  map[string][]MergeRequest
+	commitsErr bool
 }
 
 func (g *mergeGateServer) start(t *testing.T) *httptest.Server {
@@ -2386,6 +2392,20 @@ func (g *mergeGateServer) start(t *testing.T) *httptest.Server {
 			json.NewEncoder(w).Encode(g.mr)
 		case r.URL.Path == "/api/v4/projects/40/merge_requests/1685/approvals":
 			json.NewEncoder(w).Encode(g.approvals)
+		case r.URL.Path == "/api/v4/projects/40/merge_requests/1685/commits":
+			if g.commitsErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			json.NewEncoder(w).Encode(g.commits)
+		case strings.HasPrefix(r.URL.Path, "/api/v4/projects/40/repository/commits/") &&
+			strings.HasSuffix(r.URL.Path, "/merge_requests"):
+			sha := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v4/projects/40/repository/commits/"), "/merge_requests")
+			mrs := g.commitMRs[sha]
+			if mrs == nil {
+				mrs = []MergeRequest{}
+			}
+			json.NewEncoder(w).Encode(mrs)
 		case r.URL.Path == "/api/v4/projects/40/merge_requests/1685/merge" && r.Method == http.MethodPut:
 			json.NewDecoder(r.Body).Decode(&g.mergeBody)
 			result := g.mr
@@ -2474,6 +2494,103 @@ func TestMergeMRKeepsSourceBranchOnRequest(t *testing.T) {
 		if g.mergeBody["should_remove_source_branch"] != false {
 			t.Fatalf("%s: the source branch has to be kept: %+v", name, g.mergeBody)
 		}
+	}
+}
+
+// promotionMR is greenMR as an agent's own promotion: integration → test,
+// opened by the caller, and nobody has approved it — the author cannot.
+func promotionMR() MergeRequestDetail {
+	mr := greenMR()
+	mr.SourceBranch, mr.TargetBranch = "integration", "test"
+	mr.Author.Username = "egon.rastlos"
+	return mr
+}
+
+// merged is a merge request GitLab links to a commit: merged into into.
+func merged(iid int, into string) MergeRequest {
+	return MergeRequest{IID: iid, State: "merged", SourceBranch: "fix/x", TargetBranch: into}
+}
+
+// TestMergeMRAuthorMergesPromotion: the author cannot approve, and does not
+// have to when every commit already reached the source branch through a
+// merged merge request — the promotion brings no work of its own.
+func TestMergeMRAuthorMergesPromotion(t *testing.T) {
+	g := &mergeGateServer{mr: promotionMR(), me: "egon.rastlos",
+		commits: []Commit{{ID: "aaa1", ShortID: "aaa1"}, {ID: "bbb2", ShortID: "bbb2"}},
+		commitMRs: map[string][]MergeRequest{
+			// the open promotion itself is listed too, and does not count
+			"aaa1": {{IID: 1685, State: "opened", TargetBranch: "test"}, merged(1684, "integration")},
+			"bbb2": {merged(1684, "integration")},
+		}}
+	srv := g.start(t)
+
+	sys := System{}
+	cred := target.Credential{BaseURL: srv.URL, Token: "test-token"}
+	out, err := sys.Execute(context.Background(), "merge_mr",
+		[]byte(`{"project_id":40,"mr_iid":1685,"keep_source_branch":true}`), cred)
+	if err != nil {
+		t.Fatalf("the author's promotion of merged work must merge: %v", err)
+	}
+	if m := out.(map[string]any); m["merged"] != true {
+		t.Fatalf("the merge result is wrong: %+v", out)
+	}
+}
+
+// TestMergeMRAuthorRefusedForOwnWork: the exception is not a way round the
+// gate. A commit that reached the source branch through no merged merge
+// request — or through one into another branch — is unreviewed, and so is
+// everything the gate cannot read.
+func TestMergeMRAuthorRefusedForOwnWork(t *testing.T) {
+	full := make([]Commit, mrCommitsPage)
+	fullMRs := map[string][]MergeRequest{}
+	for i := range full {
+		full[i] = Commit{ID: fmt.Sprintf("c%d", i), ShortID: fmt.Sprintf("c%d", i)}
+		fullMRs[full[i].ID] = []MergeRequest{merged(1684, "integration")}
+	}
+	cases := map[string]struct {
+		mutate func(*mergeGateServer)
+		want   string
+	}{
+		"a feature branch, only in this MR": {func(g *mergeGateServer) {
+			g.mr.SourceBranch, g.mr.TargetBranch = "fix/own", "integration"
+			g.commits = []Commit{{ID: "own1", ShortID: "own1", Title: "my fix"}}
+			g.commitMRs = map[string][]MergeRequest{"own1": {{IID: 1685, State: "opened", TargetBranch: "integration"}}}
+		}, "own1"},
+		"one commit pushed straight onto the branch": {func(g *mergeGateServer) {
+			g.commits = []Commit{{ID: "aaa1", ShortID: "aaa1"}, {ID: "dir1", ShortID: "dir1"}}
+			g.commitMRs = map[string][]MergeRequest{"aaa1": {merged(1684, "integration")}}
+		}, "dir1"},
+		"merged, but into another branch": {func(g *mergeGateServer) {
+			g.commits = []Commit{{ID: "aaa1", ShortID: "aaa1"}}
+			g.commitMRs = map[string][]MergeRequest{"aaa1": {merged(1684, "main")}}
+		}, "aaa1"},
+		"commits unreadable": {func(g *mergeGateServer) { g.commitsErr = true }, "could not be read"},
+		"no commits listed":  {func(g *mergeGateServer) { g.commits = []Commit{} }, "no commits"},
+		"a full page": {func(g *mergeGateServer) {
+			g.commits, g.commitMRs = full, fullMRs
+		}, "too many"},
+		"approvals still required": {func(g *mergeGateServer) {
+			g.commits = []Commit{{ID: "aaa1", ShortID: "aaa1"}}
+			g.commitMRs = map[string][]MergeRequest{"aaa1": {merged(1684, "integration")}}
+			g.approvals.ApprovalsLeft = 1
+		}, "further approval"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := &mergeGateServer{mr: promotionMR(), me: "egon.rastlos"}
+			c.mutate(g)
+			srv := g.start(t)
+
+			sys := System{}
+			cred := target.Credential{BaseURL: srv.URL, Token: "test-token"}
+			_, err := sys.Execute(context.Background(), "merge_mr", []byte(`{"project_id":40,"mr_iid":1685}`), cred)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("merge_mr must refuse naming %q: %v", c.want, err)
+			}
+			if g.merges != 0 || g.queued != 0 {
+				t.Fatalf("nothing may be merged: merges=%d queued=%d", g.merges, g.queued)
+			}
+		})
 	}
 }
 

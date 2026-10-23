@@ -603,10 +603,12 @@ func (System) ActionSubject(action string, params json.RawMessage) string {
 //   - the agent's OWN approval is on record.
 //
 // The last one is what keeps a developer agent from merging its own work: in
-// GitLab nobody can approve their own MR, so an author never gets past this
-// point — quite apart from the tool assignment (ACCESS.md tools:) and the
-// guard-rail subject gitlab:merge_mr, with which the merge can additionally be
-// denied or put behind an approval gate for the whole organization.
+// GitLab nobody can approve their own MR, so an author does not get past this
+// point, unless every commit in the MR already arrived through a merged MR
+// (unreviewedCommitReason) — a promotion, not their own work. That is quite
+// apart from the tool assignment (ACCESS.md tools:) and the guard-rail subject
+// gitlab:merge_mr, with which the merge can additionally be denied or put
+// behind an approval gate for the whole organization.
 func mergeBlockedReason(ctx context.Context, gc *Client, projectID int, mr MergeRequestDetail) string {
 	if reason := mergePreflightReason(mr); reason != "" {
 		return reason
@@ -692,10 +694,57 @@ func approvalGapReason(ctx context.Context, gc *Client, projectID int, mr MergeR
 		}
 	}
 	if !approvedByMe {
-		return "your own approval is not on record — test first, then approve_mr, only then merge"
+		if mr.Author.Username != me.Username {
+			return "your own approval is not on record — test first, then approve_mr, only then merge"
+		}
+		// The author cannot approve in GitLab, so for them the condition
+		// above could never be met. It exists to keep an agent from merging
+		// its own unreviewed work — and a promotion (integration → test) the
+		// agent opened holds none: every commit in it already arrived through
+		// a merged merge request. Only then does the missing approval not
+		// block.
+		if reason := unreviewedCommitReason(ctx, gc, projectID, mr); reason != "" {
+			return "you are the author and cannot approve this merge request yourself, and " + reason
+		}
 	}
 	if approvals.ApprovalsLeft > 0 {
 		return fmt.Sprintf("the project still requires %d further approval(s)", approvals.ApprovalsLeft)
+	}
+	return ""
+}
+
+// unreviewedCommitReason answers whether a merge request brings a commit that
+// did not reach its source branch through a merged merge request — the work
+// nobody has reviewed yet. Empty means every commit was merged into the source
+// branch by another merge request. Fail-closed: a read error, an empty list or
+// a full page (there may be more) is a reason.
+func unreviewedCommitReason(ctx context.Context, gc *Client, projectID int, mr MergeRequestDetail) string {
+	commits, err := gc.ListMRCommits(ctx, projectID, mr.IID)
+	if err != nil {
+		return "its commits could not be read (fail-closed): " + err.Error()
+	}
+	if len(commits) == 0 {
+		return "GitLab lists no commits for it (fail-closed)"
+	}
+	if len(commits) >= mrCommitsPage {
+		return fmt.Sprintf("it holds %d or more commits, too many to check that each was merged before (fail-closed)", mrCommitsPage)
+	}
+	for _, c := range commits {
+		mrs, err := gc.CommitMergeRequests(ctx, projectID, c.ID)
+		if err != nil {
+			return fmt.Sprintf("the merge requests of commit %s could not be read (fail-closed): %v", c.ShortID, err)
+		}
+		reviewed := false
+		for _, m := range mrs {
+			if m.IID != mr.IID && m.State == "merged" && m.TargetBranch == mr.SourceBranch {
+				reviewed = true
+				break
+			}
+		}
+		if !reviewed {
+			return fmt.Sprintf("commit %s (%q) did not reach %s through a merged merge request — that is unreviewed work, "+
+				"and its author does not merge it", c.ShortID, c.Title, mr.SourceBranch)
+		}
 	}
 	return ""
 }
@@ -1561,6 +1610,9 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    source branch — unless keep_source_branch is set, which you do when the source is a long-lived branch (a merge
    request that carries an integration branch into a test branch, say) rather than a feature branch. Only for the
    REVIEWER after their own acceptance, never for the author of the MR — and only if your ACCESS.md carries the tool.
+   One exception to the author rule: a merge request you opened only to carry already merged work onward (an
+   integration branch into a test branch) — every commit in it reached the source branch through a merged merge
+   request. GitLab does not let you approve it, and merge_mr does not ask you to; it checks the commits itself.
    The action checks fail-closed before merging: MR open and free of conflicts, every blocking discussion resolved,
    pipeline of the head commit green, your OWN approval on record. If one of them does not hold, it refuses with the
    reason instead of merging — write that reason per comment_mr and leave the merge to the human. EXCEPTION: if the
