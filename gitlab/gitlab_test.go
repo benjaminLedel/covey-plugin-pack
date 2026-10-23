@@ -1303,6 +1303,17 @@ func TestCreateMergeRequestAction(t *testing.T) {
 		}
 	}
 
+	// A long-lived source branch: the MR's own "delete source branch" setting
+	// must come out unticked, or a person merging in the web UI deletes it.
+	if _, err := sys.Execute(ctx, "create_merge_request", []byte(`{"project_id":15,
+		"source_branch":"integration","target_branch":"test","title":"Promote","assignee":"leaddev",
+		"keep_source_branch":true}`), cred); err != nil {
+		t.Fatalf("create_merge_request with keep_source_branch: %v", err)
+	}
+	if mrBody["remove_source_branch"] != false {
+		t.Fatalf("keep_source_branch must reach GitLab as remove_source_branch false: %+v", mrBody)
+	}
+
 	for name, p := range map[string]string{
 		"without assignee":         `{"project_id":15,"source_branch":"fix/x","title":"Fix"}`,
 		"unknown user":             `{"project_id":15,"source_branch":"fix/x","title":"Fix","assignee":"gibtsnicht"}`,
@@ -2439,6 +2450,30 @@ func TestMergeMROnlyAfterOwnApproval(t *testing.T) {
 	}
 	if g.mergeBody["should_remove_source_branch"] != true {
 		t.Fatalf("the source branch is removed after the merge: %+v", g.mergeBody)
+	}
+}
+
+// TestMergeMRKeepsSourceBranchOnRequest: a long-lived source branch survives
+// the merge, both the immediate one and the one queued behind a pipeline.
+func TestMergeMRKeepsSourceBranchOnRequest(t *testing.T) {
+	for name, running := range map[string]bool{"immediate": false, "queued": true} {
+		g := &mergeGateServer{mr: greenMR(), me: "egon.rastlos",
+			approvals: MRApprovals{UserHasApproved: true}}
+		if running {
+			g.mr.HeadPipeline = &Pipeline{ID: 1, Status: "running"}
+			g.mr.DetailedMergeStatus = "ci_still_running"
+		}
+		srv := g.start(t)
+
+		sys := System{}
+		cred := target.Credential{BaseURL: srv.URL, Token: "test-token"}
+		if _, err := sys.Execute(context.Background(), "merge_mr",
+			[]byte(`{"project_id":40,"mr_iid":1685,"keep_source_branch":true}`), cred); err != nil {
+			t.Fatalf("%s: merge_mr with keep_source_branch: %v", name, err)
+		}
+		if g.mergeBody["should_remove_source_branch"] != false {
+			t.Fatalf("%s: the source branch has to be kept: %+v", name, g.mergeBody)
+		}
 	}
 }
 

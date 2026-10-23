@@ -884,6 +884,12 @@ type aktionsParams struct {
 	Description  string   `json:"description"`
 	Assignee     string   `json:"assignee"`
 	Reviewer     string   `json:"reviewer"`
+	// KeepSourceBranch exempts a long-lived source branch from the removal
+	// that create_merge_request and merge_mr otherwise do: a merge request
+	// from an integration branch into a test branch must not delete the
+	// integration branch. Phrased as "keep" so the omitted field keeps the
+	// default, which is right for feature branches.
+	KeepSourceBranch bool `json:"keep_source_branch"`
 	// The comment window: limit is the number of comments per call, page counts
 	// backwards into the history (1 = the newest window), note_id fetches a
 	// single comment in full.
@@ -1069,7 +1075,7 @@ var aktionen = map[string]aktion{
 			if gapReason := approvalGapReason(ctx, gc, in.ProjectID, mr); gapReason != "" {
 				return nil, fmt.Errorf("merge refused: %s — report the state per comment_mr and leave the merge to the human", gapReason)
 			}
-			queued, err := gc.SetAutoMerge(ctx, in.ProjectID, in.MRIID, mr.SHA, true)
+			queued, err := gc.SetAutoMerge(ctx, in.ProjectID, in.MRIID, mr.SHA, !in.KeepSourceBranch)
 			if err != nil {
 				return nil, err
 			}
@@ -1094,7 +1100,7 @@ var aktionen = map[string]aktion{
 		if reason := mergeBlockedReason(ctx, gc, in.ProjectID, mr); reason != "" {
 			return nil, fmt.Errorf("merge refused: %s — report the state per comment_mr and leave the merge to the human", reason)
 		}
-		merged, err := gc.MergeMR(ctx, in.ProjectID, in.MRIID, mr.SHA, true)
+		merged, err := gc.MergeMR(ctx, in.ProjectID, in.MRIID, mr.SHA, !in.KeepSourceBranch)
 		if err != nil {
 			return nil, err
 		}
@@ -1189,7 +1195,7 @@ var aktionen = map[string]aktion{
 			reviewerID = ru.ID
 		}
 		return gc.CreateMergeRequest(ctx, in.ProjectID, in.SourceBranch, targetBranch,
-			in.Title, in.Description, u.ID, reviewerID)
+			in.Title, in.Description, u.ID, reviewerID, !in.KeepSourceBranch)
 	},
 	"create_issue": func(ctx context.Context, gc *Client, in aktionsParams) (any, error) {
 		if in.ProjectID == 0 || strings.TrimSpace(in.Title) == "" {
@@ -1551,7 +1557,9 @@ const promptDocActions = `Available GitLab actions: list_projects {}, list_issue
    as a developer you hand the MR over to the QA/test agent from the team directory with it, for instance; explain the
    handover in a comment_mr, approve_mr {"project_id":N,"mr_iid":N} formally approves an MR (as reviewer/QA — the green
    signal after a completed acceptance),
-   merge_mr {"project_id":N,"mr_iid":N} merges the merge request and removes the source branch. Only for the
+   merge_mr {"project_id":N,"mr_iid":N,"keep_source_branch":true (optional)} merges the merge request and removes the
+   source branch — unless keep_source_branch is set, which you do when the source is a long-lived branch (a merge
+   request that carries an integration branch into a test branch, say) rather than a feature branch. Only for the
    REVIEWER after their own acceptance, never for the author of the MR — and only if your ACCESS.md carries the tool.
    The action checks fail-closed before merging: MR open and free of conflicts, every blocking discussion resolved,
    pipeline of the head commit green, your OWN approval on record. If one of them does not hold, it refuses with the
@@ -1586,11 +1594,12 @@ const promptDocDeveloper = `   Writing developer actions:
    start_branch. Direct commits onto the default branch are forbidden — the route there goes through:
    create_merge_request {"project_id":N,"source_branch":"fix/…","target_branch":"main (optional, default: the default branch)",
    "title":"...","description":"...","assignee":"gitlab-username (optional)","issue_iid":N (optional),
-   "reviewer":"gitlab-username (optional)"} — opens the merge request. What the two fields
+   "reviewer":"gitlab-username (optional)","keep_source_branch":true (optional)} — opens the merge request. What the two fields
    MEAN: the assignee owns the merge request and decides on the merge; the reviewer is whoever looks at
    it next, and setting one REPLACES the reviewer list. Pass issue_iid and the issue's reporter is
    entered as the assignee for you. Without a reviewer the assignee reviews as well (as before). The
-   source branch is removed automatically after the merge.
+   source branch is removed automatically after the merge — set keep_source_branch when it is a
+   long-lived branch (an integration branch carried into a test branch) that has to survive the merge.
    What is USUAL, where your own config says nothing else: the merge request goes to whoever registered
    the need, and a QA/test agent from the section "Team (AI colleagues)" — from your own department if
    there is one there — becomes the reviewer, tests the feature and gives feedback. Do not enter your

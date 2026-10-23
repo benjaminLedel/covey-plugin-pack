@@ -1283,15 +1283,16 @@ func (c *Client) CommitFiles(ctx context.Context, projectID int, branch, startBr
 
 // CreateMergeRequest — POST /projects/{id}/merge_requests: opens the MR for a
 // pushed feature branch. assigneeID/reviewerID (as a rule the agent's manager)
-// are optional (0 = do not set); the source branch is removed automatically
-// after the merge.
-func (c *Client) CreateMergeRequest(ctx context.Context, projectID int, sourceBranch, targetBranch, title, description string, assigneeID, reviewerID int) (MergeRequest, error) {
+// are optional (0 = do not set). removeSourceBranch becomes the MR's own
+// "delete source branch" setting — the box a person finds ticked or unticked
+// when merging in the web UI.
+func (c *Client) CreateMergeRequest(ctx context.Context, projectID int, sourceBranch, targetBranch, title, description string, assigneeID, reviewerID int, removeSourceBranch bool) (MergeRequest, error) {
 	body := map[string]any{
 		"source_branch":        sourceBranch,
 		"target_branch":        targetBranch,
 		"title":                title,
 		"description":          description,
-		"remove_source_branch": true,
+		"remove_source_branch": removeSourceBranch,
 	}
 	if assigneeID != 0 {
 		body["assignee_ids"] = []int{assigneeID}
