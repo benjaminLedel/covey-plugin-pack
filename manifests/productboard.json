@@ -1,7 +1,7 @@
 {
   "name": "productboard",
   "label": "Productboard",
-  "description": "Product management: read features, products and customer feedback, file and link feedback, update features.",
+  "description": "Product management: read features, products and customer feedback; file, tag, attribute and link feedback and mark it processed; create and update features.",
   "category": "other",
   "auth": {
     "header": "Authorization",
@@ -32,6 +32,12 @@
       "scope": "read",
       "doc": "find features, products, components, releases; params: type[] (e.g. [\"feature\"]), name (exact), status[name], parent[id], owner[email], archived, fields[] ([\"all\"] or names), pageCursor (from links.next)"
     },
+    "get_entity_type": {
+      "method": "GET",
+      "path": "/v2/entities/configurations/{type}",
+      "scope": "read",
+      "doc": "the fields one entity type has in this workspace — which are required, and the UUIDs of custom fields (a company's revenue or plan); params: type (feature, component, product, company, …)"
+    },
     "get_entity": {
       "method": "GET",
       "path": "/v2/entities/{id}",
@@ -56,6 +62,12 @@
       "scope": "read",
       "doc": "read one note; params: id"
     },
+    "get_note_fields": {
+      "method": "GET",
+      "path": "/v2/notes/configurations",
+      "scope": "read",
+      "doc": "the fields notes have in this workspace and which can be changed; no params"
+    },
     "list_note_relationships": {
       "method": "GET",
       "path": "/v2/notes/{id}/relationships",
@@ -74,6 +86,30 @@
       "scope": "notes",
       "doc": "link a note to the feature it asks for; params: id (the note), data={\"type\":\"link\",\"target\":{\"id\":\"<entity id>\",\"type\":\"link\"}}"
     },
+    "update_note": {
+      "method": "PATCH",
+      "path": "/v2/notes/{id}",
+      "scope": "notes",
+      "doc": "change a note; params: id, data={\"patch\":[{\"op\":\"set\",\"path\":\"processed\",\"value\":true},{\"op\":\"addItems\",\"path\":\"tags\",\"value\":[{\"name\":\"…\"}]}]} — ops: set (name, content, owner {\"email\":\"…\"}, archived, processed), addItems/removeItems/clear (tags); or data={\"fields\":{\"name\":\"…\"}} to overwrite values — never both. The content of a note with highlights is read-only (422)"
+    },
+    "set_note_customer": {
+      "method": "PUT",
+      "path": "/v2/notes/{id}/relationships/customer",
+      "scope": "notes",
+      "doc": "say whom a note is from, replacing any customer it had; params: id (the note), data={\"target\":{\"type\":\"company\",\"id\":\"<company id>\"}} or {\"target\":{\"type\":\"user\",\"email\":\"…\"}}"
+    },
+    "unlink_note": {
+      "method": "DELETE",
+      "path": "/v2/notes/{id}/relationships/link/{target}",
+      "scope": "notes",
+      "doc": "remove a note's link to a feature that was wrong; params: id (the note), target (the feature id)"
+    },
+    "create_entity": {
+      "method": "POST",
+      "path": "/v2/entities",
+      "scope": "write",
+      "doc": "create a feature (or another entity) under a parent; params: data={\"type\":\"feature\",\"fields\":{\"name\":\"…\",\"description\":\"<p>…</p>\"},\"relationships\":[{\"type\":\"parent\",\"target\":{\"id\":\"<component or product id>\"}}]} — get_entity_type says which fields are required"
+    },
     "update_entity": {
       "method": "PATCH",
       "path": "/v2/entities/{id}",
@@ -81,5 +117,5 @@
       "doc": "change an entity; params: id, data={\"fields\":{\"name\":\"…\"}} to overwrite values, or data={\"patch\":[{\"op\":\"addItems\",\"path\":\"tags\",\"value\":[…]}]} for list fields (set, addItems, removeItems, clear) — never both"
     }
   },
-  "prompt_doc": "Productboard is where the product team keeps its features and the customer feedback behind them. The API key comes from the platform — you never see it.\n\nLists come in pages: when links.next is set, call the same action again with pageCursor taken from that URL. Filters are query parameters with Productboard's own names, brackets included (type[], status[name]). Field names differ per workspace — list_entity_types tells you which exist before you write one.\n\nRequest bodies are wrapped in a single \"data\" object; pass it as one parameter. Read a feature before you change it, and link feedback to an existing feature rather than describing it again."
+  "prompt_doc": "Productboard is where the product team keeps its features and the customer feedback behind them. The API key comes from the platform — you never see it.\n\nLists come in pages: when links.next is set, call the same action again with pageCursor taken from that URL. Filters are query parameters with Productboard's own names, brackets included (type[], status[name]). Field names differ per workspace — list_entity_types tells you which exist before you write one.\n\nRequest bodies are wrapped in a single \"data\" object; pass it as one parameter. Read a feature before you change it, and link feedback to an existing feature rather than describing it again.\n\nA note you have handled is marked processed (update_note, op set, path processed) — the poll wakes you for every unprocessed note, so one left open wakes you again. Search before you create: list_entities with the parent you were given, and create_entity only under that parent and only when nothing there fits. A wrong link is undone with unlink_note, not left standing beside the right one."
 }
