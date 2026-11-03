@@ -26,10 +26,10 @@ func init() {
 		},
 		Name:        "salesforce",
 		Label:       "Salesforce Service Cloud",
-		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), see which queues the org routes cases to (list_queues), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), look at the screenshot the customer attached (list_files/download_file + vision) and put its own evidence on the case (attach_file), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
+		Description: "Support cases as the working set: read a case with its whole conversation (get_case/list_messages), find the ones waiting for an answer (list_cases), see which queues the org routes cases to (list_queues), look up how the same question was answered before (search_cases), reply — as an internal note, as a portal-visible comment or as a real mail to the customer (reply), look at the screenshot the customer attached (list_files/download_file + vision) and put its own evidence on the case (attach_file), move the case on (set_status) and hand it to a human when it does not belong to an agent (escalate). With the accounts scope it also reads the customer behind a case — the account with the org's own fields such as ARR (get_account/search_accounts) — and the calls, mails and meetings people have logged with them (list_activities). Intake by heartbeat (polling) or, where a flow posts one, by webhook. Auth is a connected app with the OAuth client-credentials flow, or a user name and password where no app can be had (secrets salesforce_url + salesforce_token).",
 		Kind:        "builtin",
 		Category:    target.CategoryTicketing,
-		Scopes:      []string{"read", "write", "comment"},
+		Scopes:      []string{"read", "write", "comment", "accounts"},
 		System:      System{},
 		SetupDoc: `1. Create the identity the agent acts as. In Salesforce: a user of its own
    (an integration user is enough) with access to the case queues it is to
@@ -74,6 +74,17 @@ func init() {
 
 4. Enable it in the agent's ACCESS.md:
    - system: salesforce scope: read,write,comment
+
+   An agent that is to read customers rather than work cases (feedback,
+   account health) takes the accounts scope instead — or on top:
+   - system: salesforce scope: accounts
+   It reads accounts (get_account, search_accounts) and the logged calls,
+   mails and meetings (list_activities); it writes nothing. The run-as user
+   needs read on Account, Task and Event. The org's own account fields are
+   named in the URL, by API name:
+     salesforce_url = https://acme.my.salesforce.com account_fields="ARR__c,Brand__c"
+   A credential pinned to a queue (queue=) does not reach accounts or
+   activities at all — the pin is a wall around that queue's cases.
 
 5. Intake — one of the two, or both:
    a) By heartbeat (works without any setup in Salesforce). In HEARTBEAT.md:
@@ -224,6 +235,9 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		return AttachFileFromSandbox(ctx, c, in.CaseID, in.Path, target.Workdir(ctx))
 
 	default:
+		if res, ok, err := executeAccounts(ctx, c, action, params); ok {
+			return res, err
+		}
 		return nil, fmt.Errorf("unknown action %q", strings.TrimSpace(action))
 	}
 }
@@ -299,8 +313,10 @@ func escalate(ctx context.Context, c *Client, caseID, note string) (any, error) 
 	return map[string]any{"case_id": caseID, "escalated": true, "queue": queue}, nil
 }
 
-func (System) PromptDoc() string {
-	return `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
+// The doc in parts, by scope: a support agent that works cases does not carry
+// the account procedures through every turn, and an agent that only reads
+// customers does not carry the case ones.
+const docCases = `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
    {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
    (plus "queue":"Support Tier 1" for only what that queue owns — the name comes from list_queues;
    queue and assigned exclude each other. Is your credential pinned to a queue, that queue is a
@@ -317,6 +333,43 @@ func (System) PromptDoc() string {
    reply with internal=true writes an internal note; internal=false answers the customer — depending on the
    instance as a portal-visible comment or as a mail (the result says which one it was).
    Correlation key for status blocked: salesforce:case:<case_id>.`
+
+const docAccounts = `Available Salesforce account actions (read-only): get_account {"account_id":"001…"} (or {"name":"…"} for
+   the exact name; two accounts with that name come back as an error naming both ids),
+   search_accounts {"query":"part of a name","limit":10},
+   list_activities {"account_id":"001…","since":"2026-10-01","kind":"call,email,meeting","limit":50} — logged
+   calls, mails, to-dos (kind task) and meetings; account_id is optional, kind defaults to call,email,meeting
+   ("all" adds the to-dos). With since the list runs OLDEST first and says more/next: call again with
+   since=next for the following page — the record at the boundary comes back once, skip it by id.
+   An account's "fields" are the org's own ones (an ARR field, a brand field) under their API names; null
+   means the customer has none recorded, not that the field is missing.`
+
+func (System) PromptDoc() string { return docCases + "\n" + docAccounts }
+
+// PromptDocForScopes (target.ScopedDocSystem) narrows the doc to the scopes
+// granted in ACCESS.md. An empty list answers the full doc — a missing entry
+// must never silently take a capability away from an agent.
+func (System) PromptDocForScopes(scopes []string) string {
+	if len(scopes) == 0 {
+		return System{}.PromptDoc()
+	}
+	granted := map[string]bool{}
+	for _, sc := range scopes {
+		granted[strings.ToLower(strings.TrimSpace(sc))] = true
+	}
+	var parts []string
+	if granted["read"] || granted["write"] || granted["comment"] {
+		parts = append(parts, docCases)
+	}
+	if granted["accounts"] {
+		parts = append(parts, docAccounts)
+	}
+	if len(parts) == 0 {
+		// Only scopes this plugin does not know: the full doc rather than none,
+		// for the same reason as the empty list.
+		return System{}.PromptDoc()
+	}
+	return strings.Join(parts, "\n")
 }
 
 // Ensure the optional interfaces stay implemented — a missing method would
@@ -326,4 +379,5 @@ var (
 	_ target.Prober          = System{}
 	_ target.SignatureWriter = System{}
 	_ target.Webhooker       = System{}
+	_ target.ScopedDocSystem = System{}
 )

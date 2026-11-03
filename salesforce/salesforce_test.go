@@ -56,6 +56,9 @@ type fakeOrg struct {
 	legacy   []map[string]any // Attachment (the old world)
 	blobs    map[string][]byte
 	uploaded []map[string]any // what attach_file posted
+	accounts []map[string]any
+	tasks    []map[string]any
+	events   []map[string]any
 
 	srv *httptest.Server
 }
@@ -134,6 +137,12 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 			writeRecords(w, f.versions)
 		case strings.Contains(q, "FROM Attachment"):
 			writeRecords(w, f.legacy)
+		case strings.Contains(q, "FROM Account"):
+			writeRecords(w, f.accounts)
+		case strings.Contains(q, "FROM Task"):
+			writeRecords(w, f.tasks)
+		case strings.Contains(q, "FROM Event"):
+			writeRecords(w, f.events)
 		case strings.Contains(q, "FROM QueueSobject"):
 			writeRecords(w, f.queues)
 		case strings.Contains(q, "FROM Group"):
@@ -149,7 +158,12 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case strings.HasSuffix(r.URL.Path, "/search/"):
-		f.queries = append(f.queries, r.URL.Query().Get("q"))
+		q := r.URL.Query().Get("q")
+		f.queries = append(f.queries, q)
+		if strings.Contains(q, "RETURNING Account") {
+			json.NewEncoder(w).Encode(map[string]any{"searchRecords": f.accounts})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"searchRecords": f.cases})
 
 	case strings.HasSuffix(r.URL.Path, "/VersionData"), strings.HasSuffix(r.URL.Path, "/Body"):

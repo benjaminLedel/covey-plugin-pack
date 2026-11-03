@@ -24,6 +24,7 @@ import (
 //	                   [api=v60.0]
 //	                   [login=https://test.salesforce.com]
 //	                   [queue="Support Tier 1"]
+//	                   [account_fields="ARR__c,Brand__c"]
 //	salesforce_token = consumer-key:consumer-secret
 //	                 | user:<username>:<password+security token>
 //	                 | <a ready-made access token>
@@ -71,6 +72,11 @@ type Config struct {
 	// installation, and "which queue is mine" is a property of the employee,
 	// not of the machine they run on.
 	Queue string
+	// AccountFields are the org's own account fields (an ARR field, a brand
+	// field) that get_account and search_accounts read on top of the standard
+	// ones. In the credential for the same reason as the queue: which fields
+	// exist is a property of that org's schema, not of the machine.
+	AccountFields []string
 
 	// The client-credentials pair of a connected app.
 	ClientID     string
@@ -127,10 +133,16 @@ func ParseConfig(baseURL, token string) (Config, error) {
 			cfg.LoginURL = strings.TrimRight(strings.TrimPrefix(part, "login="), "/")
 		case strings.HasPrefix(part, "queue="):
 			cfg.Queue = strings.TrimSpace(strings.Trim(strings.TrimPrefix(part, "queue="), `"`))
+		case strings.HasPrefix(part, "account_fields="):
+			fields, err := parseAccountFields(strings.Trim(strings.TrimPrefix(part, "account_fields="), `"`))
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.AccountFields = fields
 		case cfg.InstanceURL == "":
 			cfg.InstanceURL = strings.TrimRight(part, "/")
 		default:
-			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…] [queue=\"…\"])", part)
+			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…] [queue=\"…\"] [account_fields=\"…\"])", part)
 		}
 	}
 	if cfg.InstanceURL == "" {
