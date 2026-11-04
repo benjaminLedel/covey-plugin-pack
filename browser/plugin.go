@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
@@ -279,21 +280,21 @@ func resolveSelector(sel string) (string, error) {
 	if !ok {
 		return sel, nil
 	}
-	c, _ := json.Marshal(css)
-	n, _ := json.Marshal(needle)
-	js := fmt.Sprintf(`(() => {
-  const hits = Array.from(document.querySelectorAll(%s))
-    .filter(e => (e.innerText || e.textContent || '').includes(%s));
+	// The selector and the text go in as ARGUMENTS of the function, not
+	// spliced into its source: whatever they contain, they stay values.
+	js := `function (css, needle, attr) {
+  const hits = Array.from(document.querySelectorAll(css))
+    .filter(e => (e.innerText || e.textContent || '').includes(needle));
   if (!hits.length) return 0;
   const vis = hits.filter(e => e.offsetParent !== null || e.getClientRects().length);
   const pool = vis.length ? vis : hits;
   const inner = pool.filter(e => !pool.some(o => o !== e && e.contains(o)));
   const el = inner[0] || pool[0];
-  document.querySelectorAll('[%s]').forEach(x => x.removeAttribute('%s'));
-  el.setAttribute('%s', '1');
+  document.querySelectorAll('[' + attr + ']').forEach(x => x.removeAttribute(attr));
+  el.setAttribute(attr, '1');
   return hits.length;
-})()`, c, n, hitAttr, hitAttr, hitAttr)
-	count, err := run(super, chromedp.Evaluate[int](js))
+}`
+	count, err := run(super, callWithArgs[int](js, css, needle, hitAttr))
 	if err != nil {
 		return "", fmt.Errorf("resolving :has-text: %w", err)
 	}
@@ -301,6 +302,25 @@ func resolveSelector(sel string) (string, error) {
 		return "", fmt.Errorf("no element with text %q found", needle)
 	}
 	return fmt.Sprintf("[%s=\"1\"]", hitAttr), nil
+}
+
+// callWithArgs calls a JavaScript function on the page with its arguments
+// passed through the DevTools protocol as values — the alternative, splicing
+// them into the source as JSON literals, is safe only as long as every splice
+// point stays outside a string, which is a property of the template nobody
+// checks when changing it. The function runs on the page's global object; a
+// call without an object or context id is refused by the protocol.
+func callWithArgs[T any](fn string, args ...any) chromedp.Action[T] {
+	return func(ctx context.Context, t *chromedp.Target) (T, error) {
+		global, err := chromedp.Evaluate[*runtime.RemoteObject]("globalThis")(ctx, t)
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		return chromedp.CallFunctionOn[T](fn, func(p *runtime.CallFunctionOnParams) {
+			p.ObjectID = global.ObjectID
+		}, args...)(ctx, t)
+	}
 }
 
 // annotate draws a red frame (and optionally a label) around the highlight hit
@@ -312,10 +332,8 @@ func annotate(highlight, label string) error {
 	if err != nil {
 		return err
 	}
-	s, _ := json.Marshal(eff)
-	l, _ := json.Marshal(label)
-	js := fmt.Sprintf(`(() => {
-  const el = document.querySelector(%s);
+	js := `function (sel, text) {
+  const el = document.querySelector(sel);
   if (!el) return false;
   el.scrollIntoView({block:'center',inline:'center'});
   const r = el.getBoundingClientRect();
@@ -326,7 +344,6 @@ func annotate(highlight, label string) error {
   const box = document.createElement('div');
   box.style.cssText = 'position:absolute;border:3px solid #e5484d;border-radius:4px;box-shadow:0 0 0 3px rgba(229,72,77,.35);left:'+(r.left-3)+'px;top:'+(r.top-3)+'px;width:'+(r.width+6)+'px;height:'+(r.height+6)+'px';
   c.appendChild(box);
-  const text = %s;
   if (text) {
     const lab = document.createElement('div');
     lab.textContent = text;
@@ -336,8 +353,8 @@ func annotate(highlight, label string) error {
   }
   document.body.appendChild(c);
   return true;
-})()`, s, l)
-	ok, err := run(super, chromedp.Evaluate[bool](js))
+}`
+	ok, err := run(super, callWithArgs[bool](js, eff, label))
 	if err != nil {
 		return err
 	}
