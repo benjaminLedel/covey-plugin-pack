@@ -47,8 +47,8 @@ func newAuthProxy(t *testing.T) *authProxy {
 				return
 			}
 			io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n") //nolint:errcheck
-			go func() { io.Copy(dst, c); dst.Close() }()                    //nolint:errcheck
-			io.Copy(c, dst)                                                 //nolint:errcheck
+			go func() { io.Copy(dst, c); dst.Close() }()                     //nolint:errcheck
+			io.Copy(c, dst)                                                  //nolint:errcheck
 			c.Close()
 			return
 		}
