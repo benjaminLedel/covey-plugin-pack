@@ -56,6 +56,10 @@ type manager struct {
 	allocCancel   context.CancelFunc
 	browserCtx    context.Context
 	browserCancel context.CancelFunc
+	// relay forwards Chromium's traffic to an egress proxy that wants
+	// credentials (#92); nil where the environment names no such proxy. It
+	// lives as long as the browser does.
+	relay *relay
 	// sicht ist die Fenstergröße, in der gerade gerendert wird. Sie gehört an
 	// die Sitzung und nicht an die einzelne Aktion: ein Szenario wird einmal
 	// durchlaufen, und was dabei gefunden wird, gilt für diese Breite.
@@ -126,6 +130,21 @@ func (m *manager) ensureLocked() (context.Context, error) {
 	}
 	if p := strings.TrimSpace(os.Getenv("COVEY_BROWSER_CHROME_PATH")); p != "" {
 		opts = append(opts, chromedp.ExecPath(p))
+	}
+	// An egress proxy with credentials in the URL is one Chromium cannot use
+	// itself (#92) — it goes through the relay instead.
+	if up, noProxy := envProxy(); needsRelay(up) {
+		if m.relay == nil {
+			r, err := startRelay(up)
+			if err != nil {
+				return nil, fmt.Errorf("browser: start the proxy relay: %w", err)
+			}
+			m.relay = r
+		}
+		opts = append(opts, chromedp.ProxyServer(m.relay.Addr()))
+		if bl := bypassList(noProxy); bl != "" {
+			opts = append(opts, chromedp.Flag("proxy-bypass-list", bl))
+		}
 	}
 	// A cold start is attempted twice before it counts as broken.
 	//
@@ -198,6 +217,10 @@ func (m *manager) shutdown() {
 		m.allocCancel()
 	}
 	m.browserCtx, m.browserCancel, m.allocCancel = nil, nil, nil
+	if m.relay != nil {
+		m.relay.Close()
+		m.relay = nil
+	}
 }
 
 // setzeSicht stellt die Fenstergröße um und merkt sie sich für die Sitzung.
