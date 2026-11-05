@@ -268,3 +268,45 @@ func TestPluginRegistersItself(t *testing.T) {
 		t.Error("confluence reports a webhook — Cloud has none an admin can enter")
 	}
 }
+
+// TestStorageWritesATable is #94: a GitHub-style table becomes a storage
+// table, header row as th, cells through the inline translation, an escaped
+// pipe stays in its cell.
+func TestStorageWritesATable(t *testing.T) {
+	got := Storage("Stand: KW45\n\n| # | Thema | Quelle |\n|---|:---|--:|\n| 1 | **Noten** fehlen | [DLEN-1](https://jira.example/DLEN-1) |\n| 2 | a \\| b | `x` |\n\nDanach Text.")
+	for _, want := range []string{
+		"<p>Stand: KW45</p>",
+		"<table><tbody><tr><th><p>#</p></th><th><p>Thema</p></th><th><p>Quelle</p></th></tr>",
+		"<td><p><strong>Noten</strong> fehlen</p></td>",
+		`<td><p><a href="https://jira.example/DLEN-1">DLEN-1</a></p></td>`,
+		"<td><p>a | b</p></td>",
+		"<td><p><code>x</code></p></td></tr></tbody></table>",
+		"<p>Danach Text.</p>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("storage body is missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "|---") {
+		t.Errorf("the delimiter row reached the page:\n%s", got)
+	}
+}
+
+// Pipes without a delimiter row are text, not a table.
+func TestStorageLeavesPipesWithoutDelimiterAlone(t *testing.T) {
+	got := Storage("| nur | Text |\n| noch | mehr |")
+	if strings.Contains(got, "<table>") {
+		t.Errorf("a block of pipes without a delimiter row became a table:\n%s", got)
+	}
+}
+
+// Reading a table and writing it back keeps it a table.
+func TestRoundTripKeepsATable(t *testing.T) {
+	page := "<table><tbody><tr><th><p>Marke</p></th><th><p>Sterne</p></th></tr><tr><td><p>Sdui</p></td><td><p>4</p></td></tr></tbody></table>"
+	back := Storage(Flatten(page))
+	for _, want := range []string{"<table>", "<th><p>Marke</p></th>", "<td><p>Sdui</p></td>", "<td><p>4</p></td>"} {
+		if !strings.Contains(back, want) {
+			t.Errorf("round trip lost %q:\n%s", want, back)
+		}
+	}
+}

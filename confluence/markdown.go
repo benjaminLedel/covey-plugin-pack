@@ -10,7 +10,8 @@ import (
 //
 // The Markdown understood here is the subset an agent actually writes:
 // paragraphs, headings, bullet and numbered lists, task lists, fenced code
-// blocks, block quotes, horizontal rules, and inline code/bold/italic/links.
+// blocks, block quotes, horizontal rules, tables (GitHub style, with a
+// delimiter row), and inline code/bold/italic/links.
 // Anything else survives as its own text — the sentence is what matters, and a
 // formatting that was not recognised is a smaller loss than a page that does
 // not get written.
@@ -55,6 +56,20 @@ func Storage(markdown string) string {
 			}
 			tag := "h" + strconv.Itoa(level)
 			out.WriteString("<" + tag + ">" + inlineStorage(strings.TrimSpace(trimmed[level:])) + "</" + tag + ">")
+
+		case isTableRow(trimmed) && i+1 < len(lines) && isDelimiterRow(strings.TrimSpace(lines[i+1])):
+			flushPara()
+			out.WriteString("<table><tbody>")
+			out.WriteString(tableRow(trimmed, "th"))
+			for i += 2; i < len(lines); i++ {
+				t := strings.TrimSpace(lines[i])
+				if !isTableRow(t) {
+					i--
+					break
+				}
+				out.WriteString(tableRow(t, "td"))
+			}
+			out.WriteString("</tbody></table>")
 
 		case trimmed == "---" || trimmed == "***" || trimmed == "___":
 			flushPara()
@@ -123,6 +138,65 @@ func Storage(markdown string) string {
 	}
 	flushPara()
 	return out.String()
+}
+
+// isTableRow reports whether a line is a row of a GitHub-style table.
+func isTableRow(line string) bool {
+	return strings.HasPrefix(line, "|") && len(line) > 1
+}
+
+// isDelimiterRow reports whether a line is the |---|:--:| row under a table's
+// header. Without it a block of pipes is not a table but text with pipes in it.
+func isDelimiterRow(line string) bool {
+	cells := tableCells(line)
+	if len(cells) == 0 {
+		return false
+	}
+	for _, c := range cells {
+		c = strings.TrimSpace(c)
+		c = strings.TrimPrefix(c, ":")
+		c = strings.TrimSuffix(c, ":")
+		if len(c) < 1 || strings.Trim(c, "-") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// tableCells splits a row at its unescaped pipes; an escaped pipe (\|) stays in
+// its cell as a plain pipe.
+func tableCells(line string) []string {
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "|")
+	if strings.HasSuffix(line, "|") && !strings.HasSuffix(line, `\|`) {
+		line = strings.TrimSuffix(line, "|")
+	}
+	var cells []string
+	var cur strings.Builder
+	for i := 0; i < len(line); i++ {
+		switch {
+		case line[i] == '\\' && i+1 < len(line) && line[i+1] == '|':
+			cur.WriteByte('|')
+			i++
+		case line[i] == '|':
+			cells = append(cells, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(line[i])
+		}
+	}
+	return append(cells, cur.String())
+}
+
+// tableRow writes one row; tag is th for the header row, td for the rest.
+func tableRow(line, tag string) string {
+	var b strings.Builder
+	b.WriteString("<tr>")
+	for _, cell := range tableCells(line) {
+		b.WriteString("<" + tag + "><p>" + inlineStorage(strings.TrimSpace(cell)) + "</p></" + tag + ">")
+	}
+	b.WriteString("</tr>")
+	return b.String()
 }
 
 // codeMacro is the one place where storage format stops being XHTML: a code
