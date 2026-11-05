@@ -1,9 +1,9 @@
 github.com/benjaminLedel/covey-plugin-sdk v0.6.0 h1:rjkc6ZbZt0JySwmKpXOrIM6n+iuLbgoSmZxCZ79gWyo=
 github.com/benjaminLedel/covey-plugin-sdk v0.6.0/go.mod h1:Jchr0Mi5pKJ57o+TnTRcIUXFpS8Ij6ALcdqsN1FbbX4=
-github.com/chromedp/cdproto v0.157.8 h1:Tkq0AjsUlC3Z4sJfHBzV/uAAxnTF/AZyuSTjfV/1gvk=
-github.com/chromedp/cdproto v0.157.8/go.mod h1:h68JaIuFr9o3yiayxEYhBdvaxgYO3shDrPSYhNlyfu0=
-github.com/chromedp/chromedp v0.21.0 h1:nVHgS2LHyhZJ1l3BWRbG2eFIFYiJMnvkJbELbd8WBoQ=
-github.com/chromedp/chromedp v0.21.0/go.mod h1:6z1Y5FdKUxRzxx2qcC5h1xjaBJrSWrZp1mjgITfNZig=
+github.com/chromedp/cdproto v0.159.1 h1:k0ACb4pnDcuz30dgr1kdou0t0U+VW/4HDQm17mOdXxo=
+github.com/chromedp/cdproto v0.159.1/go.mod h1:h68JaIuFr9o3yiayxEYhBdvaxgYO3shDrPSYhNlyfu0=
+github.com/chromedp/chromedp v0.22.0 h1:LmiA4TMBsfNG5ZwioC4n+aInRdnu9NCtHryKab2N3Aw=
+github.com/chromedp/chromedp v0.22.0/go.mod h1:hJcPsoPrgxu4ulIXhO1WmtKjosCD8jbZh0+TeVFsod8=
 github.com/emersion/go-imap/v2 v2.0.0-beta.8 h1:5IXZK1E33DyeP526320J3RS7eFlCYGFgtbrfapqDPug=
 github.com/emersion/go-imap/v2 v2.0.0-beta.8/go.mod h1:dhoFe2Q0PwLrMD7oZw8ODuaD0vLYPe5uj2wcOMnvh48=
 github.com/emersion/go-message v0.18.2 h1:rl55SQdjd9oJcIoQNhubD2Acs1E6IzlZISRTK7x/Lpg=

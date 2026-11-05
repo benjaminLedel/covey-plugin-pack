@@ -240,6 +240,12 @@ func TestBrowserEndToEnd(t *testing.T) {
 		t.Error("annotation overlay was not removed after the screenshot")
 	}
 
+	// Quotes in the label stay a value: label and selector go in as arguments
+	// of the page function, not into its source.
+	if _, err = exec2(t, ctx, "screenshot", `{"to":"quotes.png","highlight":"button:has-text(\"Klick\")","label":"it's \"broken\" ');//"}`); err != nil {
+		t.Fatalf("label with quotes: %v", err)
+	}
+
 	// highlight without a hit → clear error
 	if _, err = exec2(t, ctx, "screenshot", `{"to":"x.png","highlight":"button:has-text(\"gibtsnicht\")"}`); err == nil {
 		t.Error("highlight without a hit: expected an error")
