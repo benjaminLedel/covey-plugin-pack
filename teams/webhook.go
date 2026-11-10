@@ -35,6 +35,60 @@ type Activity struct {
 	// fileConsent/invoke: the recipient's answer to the consent card.
 	Name  string      `json:"name"`
 	Value InvokeValue `json:"value"`
+	// ChannelData is what Teams adds beyond the Bot Framework: the tenant,
+	// and for channel traffic the team and channel. A router serving several
+	// organisations needs it to find where an activity came from.
+	ChannelData ChannelData `json:"channelData"`
+	// MembersAdded is set on conversationUpdate: who joined — the bot itself
+	// when the app was just installed into a team or chat.
+	MembersAdded []ChannelAccount `json:"membersAdded"`
+}
+
+// ChannelData is the Teams-specific block of an activity.
+type ChannelData struct {
+	Tenant struct {
+		ID string `json:"id"`
+	} `json:"tenant"`
+	Team      *TeamInfo    `json:"team,omitempty"`
+	Channel   *ChannelInfo `json:"channel,omitempty"`
+	EventType string       `json:"eventType,omitempty"`
+}
+
+// TeamInfo names the team a channel activity belongs to.
+type TeamInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// ChannelInfo names a channel. In a team the general channel's ID equals the
+// team's ID and Teams sends it without a name.
+type ChannelInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// TenantID is the Microsoft tenant the activity came from: the conversation's
+// tenantId, or channelData.tenant.id where the conversation lacks it.
+func (a Activity) TenantID() string {
+	if t := strings.TrimSpace(a.Conversation.TenantID); t != "" {
+		return t
+	}
+	return strings.TrimSpace(a.ChannelData.Tenant.ID)
+}
+
+// BotAdded says whether this is the conversationUpdate announcing that the
+// bot itself joined (the app was installed into a team, group chat or
+// personal scope).
+func (a Activity) BotAdded() bool {
+	if !strings.EqualFold(a.Type, "conversationUpdate") {
+		return false
+	}
+	for _, m := range a.MembersAdded {
+		if m.ID != "" && m.ID == a.Recipient.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // InvokeValue is the value block of a fileConsent/invoke activity: what the
@@ -288,17 +342,24 @@ type tokenVerifier struct {
 }
 
 func (v *tokenVerifier) verify(appID, tokenStr string) error {
+	_, err := v.claims(appID, tokenStr)
+	return err
+}
+
+// claims verifies the token and returns its claims.
+func (v *tokenVerifier) claims(appID, tokenStr string) (jwt.MapClaims, error) {
 	kf := v.keyFunc
 	if kf == nil {
 		kf = v.jwksKeyFunc
 	}
-	_, err := jwt.Parse(tokenStr, kf,
+	claims := jwt.MapClaims{}
+	_, err := jwt.ParseWithClaims(tokenStr, claims, kf,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(botFrameworkIssuer),
 		jwt.WithAudience(appID),
 		jwt.WithExpirationRequired(),
 	)
-	return err
+	return claims, err
 }
 
 // jwksKeyFunc resolves the kid from the token header against the (cached) Bot
