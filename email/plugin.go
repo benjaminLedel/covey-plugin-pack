@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/benjaminLedel/covey-plugin-sdk/target"
 )
@@ -25,7 +26,7 @@ func init() {
 		},
 		Name:        "email",
 		Label:       "Email (IMAP/SMTP)",
-		Description: "A mail account of its own for the agent: sift through the inbox by IMAP (list_unread/get_message), load attachments into the sandbox and read them (get_attachment), reply or send by SMTP (reply/send), file mail by mark_seen/move. Intake by HEARTBEAT.md (polling, no webhook). Auth by the secrets email_url (mail server host, e.g. mail.example.com) and email_token (address:password).",
+		Description: "A mail account of its own for the agent: sift through the inbox by IMAP (list_unread/get_message), load attachments into the sandbox and read them (get_attachment), reply or send by SMTP (reply/send) or leave a draft in the Drafts folder for a person to send (draft), file mail by mark_seen/mark_handled/move. Intake by HEARTBEAT.md (polling, no webhook). Auth by the secrets email_url (mail server host, e.g. mail.example.com) and email_token (address:password).",
 		Kind:        "builtin",
 		Category:    target.CategoryComms,
 		Scopes:      []string{"read", "write"},
@@ -67,6 +68,15 @@ func init() {
 
 6. The IMAP/SMTP hosts have to be reachable from the sandbox
    (egress clearance for both hosts).
+
+7. Drafts in a person's mailbox instead of sending: point email_token at
+   that person's account (an app password), let the agent use draft and
+   mark_handled, and deny it email:send, email:reply, email:mark_seen,
+   email:mark_unseen and email:move by guard rail (deny_action). The read
+   status stays the person's; handled mail carries the IMAP keyword
+   $CoveyHandled and leaves the working set. Servers without custom
+   keywords (Exchange) keep such mail in list_unread until it is read —
+   the draft is not stored twice, but the agent is woken again.
 
 Details: docs/ops-email.md in the repository.`,
 	})
@@ -216,6 +226,62 @@ var actions = map[string]actionFunc{
 		return map[string]any{"replied_to": o.To, "cc": o.Cc, "subject": o.Subject,
 			"marked_seen": seenErr == nil}, nil
 	},
+	"draft": func(ctx context.Context, cfg Config, action string, in actionParams) (any, error) {
+		if strings.TrimSpace(in.Body) == "" {
+			return nil, fmt.Errorf("body missing")
+		}
+		var o outgoing
+		if in.UID != 0 {
+			// A reply draft: built exactly as reply builds its message.
+			orig, err := getMessage(cfg, in.Mailbox, in.UID)
+			if err != nil {
+				return nil, err
+			}
+			if o, err = buildReply(cfg, orig, in.Body, in.ReplyAll); err != nil {
+				return nil, err
+			}
+			if o.Cc, err = mergeCc(cfg, o.To, o.Cc, in.Cc, cfg.Cc); err != nil {
+				return nil, err
+			}
+		} else {
+			if len(in.To) == 0 || strings.TrimSpace(in.Subject) == "" {
+				return nil, fmt.Errorf("uid, or to and subject, missing")
+			}
+			to, err := parseAddrs("to", in.To)
+			if err != nil {
+				return nil, err
+			}
+			if len(to) == 0 {
+				return nil, fmt.Errorf("to: no valid address")
+			}
+			o = outgoing{From: cfg.From, To: to, Subject: in.Subject, Body: in.Body}
+			if o.Cc, err = mergeCc(cfg, o.To, in.Cc, cfg.Cc); err != nil {
+				return nil, err
+			}
+		}
+		res, err := storeDraft(cfg, o, strings.TrimSpace(in.ToMailbox), time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if in.UID != 0 {
+			// Drafted = processed, but the read flag stays the owner's.
+			if err := markHandled(cfg, in.Mailbox, in.UID); err != nil {
+				res.Hint = err.Error() + " — the mail stays in list_unread; the existing draft keeps a second one from being stored"
+			} else {
+				res.MarkedHandled = true
+			}
+		}
+		return res, nil
+	},
+	"mark_handled": func(ctx context.Context, cfg Config, action string, in actionParams) (any, error) {
+		if in.UID == 0 {
+			return nil, fmt.Errorf("uid missing")
+		}
+		if err := markHandled(cfg, in.Mailbox, in.UID); err != nil {
+			return nil, err
+		}
+		return map[string]any{"uid": in.UID, "mailbox": in.Mailbox, "handled": true}, nil
+	},
 }
 
 // Second names of the same action: case labels folded together in the switch,
@@ -331,11 +397,20 @@ func (System) PromptDoc() string {
    send {"to":["a@example.com"],"cc":["..."],"subject":"...","body":"..."} sends a new mail,
    (a copy the installation configured is added to every reply and send by itself),
    mark_seen {"uid":N,"mailbox":"..."} / mark_unseen {...} sets or clears the read flag,
-   move {"uid":N,"mailbox":"INBOX","to_mailbox":"Archive"} moves a mail into another folder.
+   move {"uid":N,"mailbox":"INBOX","to_mailbox":"Archive"} moves a mail into another folder,
+   draft {"uid":N,"mailbox":"INBOX","body":"...","reply_all":true|false,"cc":["..."]} builds the reply as reply
+   would, but stores it in the Drafts folder instead of sending it (nothing leaves the mailbox); without uid,
+   draft {"to":["..."],"subject":"...","body":"..."} stores a new mail as draft. The answered mail is marked as
+   handled (not as read) and leaves list_unread; a second draft for the same mail is not stored
+   (already_exists). to_mailbox overrides the drafts folder,
+   mark_handled {"uid":N,"mailbox":"INBOX"} takes a mail out of list_unread WITHOUT marking it read — for mail
+   that needs no draft when the mailbox belongs to a person.
    How to work: your working set is the unread mail (list_unread). Work every mail individually:
    read get_message, answer factually by reply, after which it is marked as read automatically by reply;
    mail that needs no answer you tick off explicitly with mark_seen or file with move.
    The text (body) is plain text — no HTML, no Markdown syntax.
+   If you are allowed draft but not reply, the mailbox belongs to a person: write drafts, never touch
+   the read flag, tick off with mark_handled.
    NEVER answer obvious machine-generated mail (newsletters, delivery failures, out-of-office notices) —
    tick it off with mark_seen. Replies to your own sender address are blocked (echo protection).
    WAITING for an answer: email has no webhook — do NOT use the blocked status for mail threads.

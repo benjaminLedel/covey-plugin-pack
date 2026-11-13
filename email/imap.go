@@ -116,7 +116,9 @@ func listMessages(cfg Config, mailbox string, unseenOnly bool, limit int) ([]Mes
 		}
 		criteria := &imap.SearchCriteria{}
 		if unseenOnly {
-			criteria.NotFlag = []imap.Flag{imap.FlagSeen}
+			// Mail the agent marked as handled (draft/mark_handled) is out of
+			// the working set while still unread for the mailbox's owner.
+			criteria.NotFlag = []imap.Flag{imap.FlagSeen, keywordHandled}
 		}
 		data, err := c.UIDSearch(criteria, nil).Wait()
 		if err != nil {
