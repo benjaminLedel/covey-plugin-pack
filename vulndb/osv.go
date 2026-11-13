@@ -36,6 +36,7 @@ const (
 	EcosystemNPM       = "npm"
 	EcosystemPackagist = "Packagist"
 	EcosystemPub       = "Pub"
+	EcosystemMaven     = "Maven"
 )
 
 // osvBatchSize begrenzt eine Stapelanfrage. Ein großes Monorepo bringt
@@ -53,8 +54,10 @@ func normalizeEcosystem(name string) (string, error) {
 		return EcosystemPackagist, nil
 	case "pub", "dart", "flutter":
 		return EcosystemPub, nil
+	case "maven", "gradle", "java", "kotlin":
+		return EcosystemMaven, nil
 	default:
-		return "", fmt.Errorf("unknown ecosystem %q — supported: npm, Packagist (composer/php), Pub (dart/flutter)", name)
+		return "", fmt.Errorf("unknown ecosystem %q — supported: npm, Packagist (composer/php), Pub (dart/flutter), Maven (gradle/java/kotlin)", name)
 	}
 }
 
@@ -229,7 +232,7 @@ func toFinding(p Package, v osvVuln) Finding {
 		if f.Severity == "" {
 			f.Severity = strings.ToUpper(a.DatabaseSpecific.Severity)
 		}
-		fixed, candidates, rangeText := resolveFix(a.Ranges, p.Version)
+		fixed, candidates, rangeText := resolveFix(p.Ecosystem, a.Ranges, p.Version)
 		f.Fixed, f.FixedCandidates, f.AffectedRange = fixed, candidates, rangeText
 		break
 	}
@@ -250,7 +253,7 @@ func toFinding(p Package, v osvVuln) Finding {
 // melden. Lässt sich das nicht entscheiden — weil eine der Versionen keine
 // Punktversion ist —, werden ALLE Fix-Versionen als Kandidaten gemeldet.
 // Lieber eine offene Frage im Ticket als eine falsche Zahl darin.
-func resolveFix(ranges []osvRange, version string) (fixed string, candidates []string, rangeText string) {
+func resolveFix(ecosystem string, ranges []osvRange, version string) (fixed string, candidates []string, rangeText string) {
 	var all []string
 	var texts []string
 	certain := true
@@ -278,7 +281,7 @@ func resolveFix(ranges []osvRange, version string) (fixed string, candidates []s
 			}
 			all = append(all, v)
 			texts = append(texts, rangeLabel(introduced, v, ""))
-			if inInterval(version, introduced, v) {
+			if inInterval(ecosystem, version, introduced, v) {
 				fixed = v
 			}
 			introduced = ""
@@ -288,7 +291,7 @@ func resolveFix(ranges []osvRange, version string) (fixed string, candidates []s
 		}
 	}
 	for _, v := range all {
-		if _, ok := compareVersions(version, v); !ok {
+		if _, ok := compareVersionsFor(ecosystem, version, v); !ok {
 			certain = false
 		}
 	}
@@ -301,14 +304,14 @@ func resolveFix(ranges []osvRange, version string) (fixed string, candidates []s
 
 // inInterval: liegt version in [introduced, fixed)? Unvergleichbare Versionen
 // zählen als „nicht sicher enthalten".
-func inInterval(version, introduced, fixed string) bool {
+func inInterval(ecosystem, version, introduced, fixed string) bool {
 	if introduced != "" && introduced != "0" {
-		c, ok := compareVersions(version, introduced)
+		c, ok := compareVersionsFor(ecosystem, version, introduced)
 		if !ok || c < 0 {
 			return false
 		}
 	}
-	c, ok := compareVersions(version, fixed)
+	c, ok := compareVersionsFor(ecosystem, version, fixed)
 	return ok && c < 0
 }
 

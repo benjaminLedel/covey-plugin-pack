@@ -39,7 +39,7 @@ func TestCompareVersions(t *testing.T) {
 
 func TestSortVersions(t *testing.T) {
 	in := []string{"1.10.0", "1.9.0", "dev-master", "2.0.0-rc1", "2.0.0", "1.9.1"}
-	sortVersions(in)
+	sortVersions(EcosystemNPM, in)
 	want := []string{"1.9.0", "1.9.1", "1.10.0", "2.0.0-rc1", "2.0.0", "dev-master"}
 	for i := range want {
 		if in[i] != want[i] {
