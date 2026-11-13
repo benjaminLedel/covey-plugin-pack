@@ -13,6 +13,8 @@ func TestNormalizeEcosystem(t *testing.T) {
 		"npm": EcosystemNPM, "NPM": EcosystemNPM, "node": EcosystemNPM,
 		"composer": EcosystemPackagist, "php": EcosystemPackagist, "Packagist": EcosystemPackagist,
 		"dart": EcosystemPub, "flutter": EcosystemPub, "pub": EcosystemPub,
+		"maven": EcosystemMaven, "Maven": EcosystemMaven, "gradle": EcosystemMaven,
+		"Gradle": EcosystemMaven, "java": EcosystemMaven, "KOTLIN": EcosystemMaven,
 	}
 	for in, want := range cases {
 		got, err := normalizeEcosystem(in)
@@ -20,7 +22,7 @@ func TestNormalizeEcosystem(t *testing.T) {
 			t.Errorf("normalizeEcosystem(%q) = %q,%v — want %q", in, got, err, want)
 		}
 	}
-	if _, err := normalizeEcosystem("maven"); err == nil {
+	if _, err := normalizeEcosystem("rubygems"); err == nil {
 		t.Error("an unknown ecosystem must fail loudly — a silent miss looks like an all-clear")
 	}
 }
@@ -36,7 +38,7 @@ func TestResolveFixPicksTheBranch(t *testing.T) {
 		},
 	}}
 
-	fixed, candidates, text := resolveFix(ranges, "2.3.0")
+	fixed, candidates, text := resolveFix(EcosystemNPM, ranges, "2.3.0")
 	if fixed != "2.4.5" {
 		t.Errorf("version 2.3.0 → fixed = %q, want 2.4.5 (the 2.x branch)", fixed)
 	}
@@ -47,7 +49,7 @@ func TestResolveFixPicksTheBranch(t *testing.T) {
 		t.Errorf("range text = %q", text)
 	}
 
-	if fixed, _, _ := resolveFix(ranges, "3.0.5"); fixed != "3.1.2" {
+	if fixed, _, _ := resolveFix(EcosystemNPM, ranges, "3.0.5"); fixed != "3.1.2" {
 		t.Errorf("version 3.0.5 → fixed = %q, want 3.1.2 (the 3.x branch)", fixed)
 	}
 }
@@ -55,7 +57,7 @@ func TestResolveFixPicksTheBranch(t *testing.T) {
 // Ohne Obergrenze ist der Zweig offen: es gibt keinen Fix.
 func TestResolveFixWithoutFix(t *testing.T) {
 	ranges := []osvRange{{Type: "ECOSYSTEM", Events: []map[string]string{{"introduced": "0"}}}}
-	fixed, _, text := resolveFix(ranges, "1.0.0")
+	fixed, _, text := resolveFix(EcosystemNPM, ranges, "1.0.0")
 	if fixed != "" {
 		t.Errorf("fixed = %q, want empty", fixed)
 	}
@@ -71,7 +73,7 @@ func TestResolveFixUncomparableVersion(t *testing.T) {
 		Type:   "ECOSYSTEM",
 		Events: []map[string]string{{"introduced": "0"}, {"fixed": "2.4.5"}},
 	}}
-	fixed, candidates, _ := resolveFix(ranges, "dev-master")
+	fixed, candidates, _ := resolveFix(EcosystemNPM, ranges, "dev-master")
 	if fixed != "" {
 		t.Errorf("fixed = %q — an uncomparable version must not produce a claim", fixed)
 	}
@@ -86,7 +88,7 @@ func TestResolveFixIgnoresGitRanges(t *testing.T) {
 		{Type: "GIT", Events: []map[string]string{{"introduced": "abc123"}, {"fixed": "def456"}}},
 		{Type: "ECOSYSTEM", Events: []map[string]string{{"introduced": "0"}, {"fixed": "1.2.3"}}},
 	}
-	fixed, candidates, _ := resolveFix(ranges, "1.0.0")
+	fixed, candidates, _ := resolveFix(EcosystemNPM, ranges, "1.0.0")
 	if fixed != "1.2.3" {
 		t.Errorf("fixed = %q, want 1.2.3", fixed)
 	}
