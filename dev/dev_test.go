@@ -456,7 +456,7 @@ func TestProcessesDoNotInheritTheDaemonCredentials(t *testing.T) {
 	t.Setenv("COVEY_ACTION_PORT", "41234")
 	dir := t.TempDir()
 
-	res := execute(t, dir, "exec", `{"cmd":"env"}`).(map[string]any)
+	res := execute(t, dir, "exec", `{"cmd":"env | grep ^COVEY_"}`).(map[string]any)
 	out := res["output"].(string)
 	if strings.Contains(out, "daemon-secret") || strings.Contains(out, "COVEY_WS_URL") {
 		t.Fatalf("exec passed the daemon's credentials on:\n%s", out)
@@ -465,14 +465,14 @@ func TestProcessesDoNotInheritTheDaemonCredentials(t *testing.T) {
 		t.Fatalf("exec dropped COVEY_ACTION_PORT:\n%s", out)
 	}
 
-	execute(t, dir, "start", `{"name":"envdump","cmd":"env; sleep 30"}`)
+	execute(t, dir, "start", `{"name":"envdump","cmd":"env | grep ^COVEY_; echo env-done; sleep 30"}`)
 	t.Cleanup(func() { super.shutdown() })
 	// env runs in the background: wait until its output is in the log rather
 	// than guessing how long a slow runner needs.
 	var logs string
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		logs = execute(t, dir, "logs", `{"name":"envdump"}`).(map[string]any)["logs"].(string)
-		if strings.Contains(logs, "PATH=") {
+		if strings.Contains(logs, "env-done") {
 			break
 		}
 	}
