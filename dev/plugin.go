@@ -141,6 +141,14 @@ const (
 	maxExecTimeout     = 900 * time.Second
 )
 
+// childEnv is the environment of every process dev starts: the daemon's own
+// without its connection to the control plane. The command is whatever the
+// agent or the repository it works on asks for — an install script, a test
+// suite, the application itself — and none of that may hold the daemon's
+// credentials. COVEY_ACTION_PORT stays: it is how such a process reaches a
+// target system, through the action proxy and its guard rails.
+func childEnv() []string { return target.ChildEnv("COVEY_ACTION_PORT") }
+
 // runExec runs a shell command synchronously. An exit code other than 0 is a
 // result, not an error — the agent is meant to read test failures, not to
 // guess at an action error. The timeout kills the whole process group so that
@@ -161,6 +169,7 @@ func runExec(ctx context.Context, command, dir string, timeoutSecs int) (any, er
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir
+	cmd.Env = childEnv()
 	buf := &logBuffer{}
 	cmd.Stdout, cmd.Stderr = buf, buf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

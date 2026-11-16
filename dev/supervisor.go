@@ -282,6 +282,7 @@ func (s *supervisor) start(name, command, dir, home string) (map[string]any, err
 
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = dir
+	cmd.Env = childEnv()
 	buf := &logBuffer{}
 	// The log file next to the buffer: it is what the next run reads. A job
 	// starting anew overwrites its predecessor's log — the record belongs to the

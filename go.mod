@@ -14,7 +14,7 @@ go 1.26
 toolchain go1.26.6
 
 require (
-	github.com/benjaminLedel/covey-plugin-sdk v0.6.0
+	github.com/benjaminLedel/covey-plugin-sdk v0.7.0
 	github.com/chromedp/cdproto v0.159.1
 	github.com/chromedp/chromedp v0.22.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
