@@ -467,8 +467,15 @@ func TestProcessesDoNotInheritTheDaemonCredentials(t *testing.T) {
 
 	execute(t, dir, "start", `{"name":"envdump","cmd":"env; sleep 30"}`)
 	t.Cleanup(func() { super.shutdown() })
-	time.Sleep(200 * time.Millisecond)
-	logs := execute(t, dir, "logs", `{"name":"envdump"}`).(map[string]any)["logs"].(string)
+	// env runs in the background: wait until its output is in the log rather
+	// than guessing how long a slow runner needs.
+	var logs string
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		logs = execute(t, dir, "logs", `{"name":"envdump"}`).(map[string]any)["logs"].(string)
+		if strings.Contains(logs, "PATH=") {
+			break
+		}
+	}
 	execute(t, dir, "stop", `{"name":"envdump"}`)
 	if strings.Contains(logs, "daemon-secret") || strings.Contains(logs, "COVEY_WS_URL") {
 		t.Fatalf("start passed the daemon's credentials on:\n%s", logs)
