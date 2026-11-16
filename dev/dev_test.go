@@ -446,3 +446,34 @@ func TestDevImplementsScopedDocSystem(t *testing.T) {
 		t.Fatal("dev must implement ScopedDocSystem")
 	}
 }
+
+// TestProcessesDoNotInheritTheDaemonCredentials: whatever dev starts runs
+// code nobody reviewed, so it must not see the daemon's connection to the
+// control plane. The action port is handed on on purpose.
+func TestProcessesDoNotInheritTheDaemonCredentials(t *testing.T) {
+	t.Setenv("COVEY_DAEMON_TOKEN", "daemon-secret")
+	t.Setenv("COVEY_WS_URL", "wss://control.example.org/daemon")
+	t.Setenv("COVEY_ACTION_PORT", "41234")
+	dir := t.TempDir()
+
+	res := execute(t, dir, "exec", `{"cmd":"env"}`).(map[string]any)
+	out := res["output"].(string)
+	if strings.Contains(out, "daemon-secret") || strings.Contains(out, "COVEY_WS_URL") {
+		t.Fatalf("exec passed the daemon's credentials on:\n%s", out)
+	}
+	if !strings.Contains(out, "COVEY_ACTION_PORT=41234") {
+		t.Fatalf("exec dropped COVEY_ACTION_PORT:\n%s", out)
+	}
+
+	execute(t, dir, "start", `{"name":"envdump","cmd":"env; sleep 30"}`)
+	t.Cleanup(func() { super.shutdown() })
+	time.Sleep(200 * time.Millisecond)
+	logs := execute(t, dir, "logs", `{"name":"envdump"}`).(map[string]any)["logs"].(string)
+	execute(t, dir, "stop", `{"name":"envdump"}`)
+	if strings.Contains(logs, "daemon-secret") || strings.Contains(logs, "COVEY_WS_URL") {
+		t.Fatalf("start passed the daemon's credentials on:\n%s", logs)
+	}
+	if !strings.Contains(logs, "COVEY_ACTION_PORT=41234") {
+		t.Fatalf("start dropped COVEY_ACTION_PORT:\n%s", logs)
+	}
+}
