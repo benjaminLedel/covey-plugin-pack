@@ -11,7 +11,7 @@
 // plugin used to carry itself.
 //
 // It is the odd one among the three in a way worth stating: it has no brokered
-// system at all. All six sources are public, so the module declares them as
+// system at all. All seven sources are public, so the module declares them as
 // hosts and runs with no credential — there is nothing here to leak.
 package main
 
@@ -32,7 +32,7 @@ func (plugin) Describe() covey.Description {
 	return covey.Description{
 		Name:        "vulndb",
 		Label:       "Vulnerability databases",
-		Description: "Known vulnerabilities in declared package dependencies: scan a lock file (package-lock.json, composer.lock, pubspec.lock) against OSV.dev in one batch (scan_lockfile), check individual packages (query/query_batch), fetch an advisory merged from OSV, the GitHub Advisory Database and NVD (advisory), and look up the next safe version in the registry (latest_version). Covers npm, Packagist (Composer) and Pub (Dart/Flutter). Needs no credentials — every source is public.",
+		Description: "Known vulnerabilities in declared package dependencies: scan a lock file (package-lock.json, composer.lock, pubspec.lock, gradle.lockfile) against OSV.dev in one batch (scan_lockfile), check individual packages (query/query_batch), fetch an advisory merged from OSV, the GitHub Advisory Database and NVD (advisory), and look up the next safe version in the registry (latest_version). Covers npm, Packagist (Composer), Pub (Dart/Flutter) and Maven (Java/Kotlin, Gradle). Needs no credentials — every source is public.",
 		Category:    "dev",
 		Scopes:      []string{"read"},
 		// Declared, not reached at runtime: an operator sees the whole list
@@ -46,16 +46,17 @@ func (plugin) Describe() covey.Description {
 			"registry.npmjs.org",
 			"repo.packagist.org",
 			"pub.dev",
+			"repo1.maven.org",
 		},
 		// scan_lockfile reads the agent's checkout. Without the declaration a
 		// read_file is refused.
 		Workdir: true,
 		Actions: []covey.ActionDesc{
 			{Name: "scan_lockfile", Scope: "read", Doc: `{"path":"repo/package-lock.json"} — the main action: read the lock file out of your checkout and match every installed version against OSV.dev in one batch.`},
-			{Name: "query_batch", Scope: "read", Doc: `{"packages":[{"ecosystem":"npm","name":"lodash","version":"4.17.20"}]} — the same check for pairs you determined yourself. The way for yarn.lock and pnpm-lock.yaml.`},
+			{Name: "query_batch", Scope: "read", Doc: `{"packages":[{"ecosystem":"npm","name":"lodash","version":"4.17.20"}]} — the same check for pairs you determined yourself. The way for yarn.lock, pnpm-lock.yaml and a Gradle build without a lock file (ecosystem "maven", name "groupId:artifactId").`},
 			{Name: "query", Scope: "read", Doc: `{"ecosystem":"npm","name":"lodash","version":"4.17.20"} — a single package.`},
 			{Name: "advisory", Scope: "read", Doc: `{"id":"CVE-2021-23337"} — one advisory in full, merged from OSV, the GitHub Advisory Database and NVD. Also takes GHSA-… and OSV ids.`},
-			{Name: "latest_version", Scope: "read", Doc: `{"ecosystem":"npm","name":"lodash"} — the registry's version list: does the proposed fix version exist, and what has appeared since?`},
+			{Name: "latest_version", Scope: "read", Doc: `{"ecosystem":"npm","name":"lodash"} — the registry's version list: does the proposed fix version exist, and what has appeared since? Maven packages are looked up on Maven Central (repo1.maven.org).`},
 		},
 	}
 }
@@ -318,15 +319,23 @@ func lookupAdvisory(id string) (*Advisory, error) {
 // an agent reporting a false all-clear ("clean":true versus an empty list with
 // notes) are the ones that would be missing.
 func (plugin) PromptDoc(scopes []string) string {
-	return `Available vulndb actions — the known vulnerabilities of declared package dependencies.
-   Covered ecosystems: npm, Packagist (Composer/PHP), Pub (Dart/Flutter). Write them exactly like
-   that or in their common form (composer/php, dart/flutter) — the plugin normalises it.
+	return promptDoc
+}
+
+// promptDoc is a constant so that a test can hold it against what the plugin
+// actually does.
+const promptDoc = `Available vulndb actions — the known vulnerabilities of declared package dependencies.
+   Covered ecosystems: npm, Packagist (Composer/PHP), Pub (Dart/Flutter), Maven (Java/Kotlin, Gradle).
+   Write them exactly like that or in their common form (composer/php, dart/flutter, gradle/java/kotlin)
+   — the plugin normalises it. A Maven package is named "groupId:artifactId", e.g.
+   "com.fasterxml.jackson.core:jackson-databind".
    scan_lockfile {"path":"<the path to the lock file, relative to your working directory>"} —
-   THE main action. Reads package-lock.json, npm-shrinkwrap.json, composer.lock or pubspec.lock,
-   determines the installed versions and matches ALL of them against OSV.dev in one batch. The result:
+   THE main action. Reads package-lock.json, npm-shrinkwrap.json, composer.lock, pubspec.lock or
+   gradle.lockfile, determines the installed versions and matches ALL of them against OSV.dev in one
+   batch. The result:
    {"lockfile":…,"ecosystem":…,"packages_scanned":812,"clean":false,"findings":[…],"notes":[…]}.
    Use it after a checkout — the path is the checkout path plus the lock file. A monorepo has several;
-   scan each one.
+   scan each one (a multi-project Gradle build has one gradle.lockfile per subproject).
    Every finding carries what a ticket needs: package, version, dependency (direct/dev/transitive),
    id, cve, summary, severity, cvss_vector, affected_range, fixed and reference.
    READ "fixed" CAREFULLY: it is the fix version of the branch YOUR version sits on. An advisory often
@@ -340,6 +349,13 @@ func (plugin) PromptDoc(scopes []string) string {
    pnpm-lock.yaml (they are deliberately not parsed: their format changes between major versions, and a
    half-read lock file reports fewer packages than there are) — pull the pairs out with the dev tool
    and send them through here.
+   It is also the way for a Gradle project WITHOUT a gradle.lockfile: run
+   "./gradlew dependencies --configuration runtimeClasspath" (and testRuntimeClasspath; on Android
+   releaseRuntimeClasspath) with the dev tool and take the RESOLVED version of every module:
+   "group:artifact:1.0 -> 1.2" means 1.2. Skip lines marked "(c)" (a constraint, not a dependency) and
+   "(n)" (not resolved); "(*)" only repeats a module listed above. Send the pairs as
+   {"ecosystem":"maven","name":"group:artifact","version":"1.2"}. The versions declared in
+   build.gradle(.kts) or a version catalog are not enough — Gradle's conflict resolution changes them.
    query {"ecosystem":"npm","name":"lodash","version":"4.17.20"} — a single package, the same result.
    advisory {"id":"CVE-2021-23337"} — the details of ONE advisory, merged from OSV, the GitHub Advisory
    Database and NVD: description, severity, cvss_vector, cvss_score, the affected packages with their
@@ -349,10 +365,14 @@ func (plugin) PromptDoc(scopes []string) string {
    a scan over hundreds of packages does not flood your context.
    latest_version {"ecosystem":"npm","name":"lodash"} — the registry's version list: does the proposed
    fix version exist at all, and what has appeared since? Use it before you propose an upgrade.
+   For Maven it reads maven-metadata.xml on Maven Central (repo1.maven.org); artifacts that live only
+   in another repository (Google's Maven repository for androidx.*, JitPack, a company Nexus) are
+   reported as not found there. Its "latest" is the release Maven Central names, which is the most
+   recently deployed one — a note says so when a higher version exists.
    What this system does NOT do: it judges the DECLARED dependencies of a lock file. It finds neither
    vulnerabilities in your own code nor ones in container images, and without a lock file it cannot
    work — a manifest declares ranges, and a range is not a fact. If a project has no lock file, that is
-   a finding of its own, not a clean result.
+   a finding of its own, not a clean result. (The resolved tree from "gradlew dependencies" is a fact,
+   which is why query_batch accepts it.)
    Every call goes out through the egress proxy. If an action reports a host as unreachable, that host
    is missing from the allowlist — name it in your answer instead of retrying.`
-}

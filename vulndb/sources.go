@@ -32,6 +32,7 @@ var (
 	npmBase      = "https://registry.npmjs.org"
 	packagistAPI = "https://repo.packagist.org"
 	pubBase      = "https://pub.dev"
+	mavenBase    = "https://repo1.maven.org"
 )
 
 // Advisory ist die zusammengeführte Detailansicht einer Schwachstelle über
@@ -198,6 +199,9 @@ type VersionInfo struct {
 	Latest    string   `json:"latest,omitempty"`
 	Versions  []string `json:"versions,omitempty"`
 	Truncated bool     `json:"truncated,omitempty"`
+	// Notes carries what the registry's own answer leaves unsaid — for Maven,
+	// that the release it names is not necessarily the highest version.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // maxVersions kappt die Versionsliste. Ein altes Paket hat hunderte Versionen;
@@ -253,13 +257,33 @@ func fetchVersions(ctx context.Context, c *http.Client, ecosystem, name string) 
 		for _, v := range out.Versions {
 			info.Versions = append(info.Versions, v.Version)
 		}
+	case EcosystemMaven:
+		p, err := mavenMetadataPath(name)
+		if err != nil {
+			return info, err
+		}
+		text, err := getText(ctx, c, mavenBase+"/maven2/"+p, nil)
+		if errors.Is(err, errNotFound) {
+			return info, mavenNotFound(name)
+		}
+		if err != nil {
+			return info, err
+		}
+		if info.Latest, info.Versions, err = parseMavenMetadata(text); err != nil {
+			return info, fmt.Errorf("%s: %w", name, err)
+		}
 	default:
 		return info, fmt.Errorf("unknown ecosystem %q", ecosystem)
 	}
 
-	sortVersions(info.Versions)
+	sortVersions(ecosystem, info.Versions)
 	if info.Latest == "" && len(info.Versions) > 0 {
 		info.Latest = info.Versions[len(info.Versions)-1]
+	}
+	if ecosystem == EcosystemMaven {
+		if note := mavenReleaseNote(info.Latest, info.Versions); note != "" {
+			info.Notes = append(info.Notes, note)
+		}
 	}
 	if len(info.Versions) > maxVersions {
 		info.Versions = info.Versions[len(info.Versions)-maxVersions:]
@@ -280,13 +304,27 @@ func npmPath(name string) string {
 
 // sortVersions sortiert aufsteigend. Was sich nicht als Punktversion lesen
 // lässt (dev-Branches), wandert ans Ende — es ist keine Freigabe.
-func sortVersions(versions []string) {
+//
+// Two Maven versions can both parse and still have no order (two different
+// unknown qualifiers on the same core, 32.0.0-jre and 32.0.0-android). For a
+// display order that is no claim, so they fall back to the string order.
+func sortVersions(ecosystem string, versions []string) {
+	parses := func(v string) bool {
+		if ecosystem == EcosystemMaven {
+			_, ok := parseMavenVersion(v)
+			return ok
+		}
+		_, _, ok := splitVersion(v)
+		return ok
+	}
 	sort.SliceStable(versions, func(i, j int) bool {
-		if c, ok := compareVersions(versions[i], versions[j]); ok {
+		if c, ok := compareVersionsFor(ecosystem, versions[i], versions[j]); ok {
 			return c < 0
 		}
-		_, _, okI := splitVersion(versions[i])
-		_, _, okJ := splitVersion(versions[j])
+		okI, okJ := parses(versions[i]), parses(versions[j])
+		if okI && okJ {
+			return versions[i] < versions[j]
+		}
 		return okI && !okJ
 	})
 }
@@ -311,7 +349,7 @@ func mergeAdvisory(id string, osv *osvVuln, ghsa *ghsaAdvisory, nvdScore float64
 			}
 		}
 		for _, aff := range osv.Affected {
-			_, candidates, rangeText := resolveFix(aff.Ranges, "")
+			_, candidates, rangeText := resolveFix(aff.Package.Ecosystem, aff.Ranges, "")
 			ap := AdvisoryPackage{
 				Ecosystem: aff.Package.Ecosystem, Name: aff.Package.Name,
 				VulnerableRange: rangeText,

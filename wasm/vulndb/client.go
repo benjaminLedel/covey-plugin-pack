@@ -9,7 +9,7 @@ import (
 	"github.com/benjaminLedel/covey-plugin-pack/wasm/covey"
 )
 
-// The shared request layer of the six sources.
+// The shared request layer of the seven sources.
 //
 // A module does not dial. It hands the host a URL and gets an answer, and the
 // host decides whether the request may leave at all — which is why every host
@@ -18,7 +18,7 @@ import (
 //
 // None of these calls carries a credential, and none can. The host attaches the
 // brokered token only to the system an organisation pointed the plugin at, and
-// this plugin points at nobody: all six sources are public. That is a property,
+// this plugin points at nobody: all seven sources are public. That is a property,
 // not a limitation — the whole plugin runs with no secret at all.
 
 // doFetch is the one seam in this file. In the module it is covey.Fetch and
@@ -48,7 +48,46 @@ func postJSON(rawURL string, body, out any) error {
 	}), rawURL, out)
 }
 
+// getText fetches a non-JSON answer (maven-metadata.xml). The host hands a
+// body that is not valid JSON over as Text; Body is only a fallback for a
+// source that unexpectedly answers JSON.
+func getText(rawURL string, header map[string]string) (string, error) {
+	resp := doFetch(covey.Request{Method: "GET", Path: rawURL, Header: header})
+	if err := check(resp, rawURL); err != nil {
+		return "", err
+	}
+	text := resp.Text
+	if text == "" {
+		text = string(resp.Body)
+	}
+	if text == "" {
+		return "", fmt.Errorf("%s: empty answer (HTTP %d)", hostOf(rawURL), resp.Status)
+	}
+	return text, nil
+}
+
 func do(resp covey.Response, rawURL string, out any) error {
+	if err := check(resp, rawURL); err != nil {
+		return err
+	}
+	if out == nil {
+		return nil
+	}
+	host := hostOf(rawURL)
+	if len(resp.Body) == 0 {
+		// A source that answers 200 with nothing is broken in a way worth
+		// naming, rather than an empty result worth merging.
+		return fmt.Errorf("%s: empty answer (HTTP %d)", host, resp.Status)
+	}
+	if err := json.Unmarshal(resp.Body, out); err != nil {
+		return fmt.Errorf("%s: answer is not valid JSON: %w", host, err)
+	}
+	return nil
+}
+
+// check turns a transport error or an error status into an error, whatever
+// the body's format.
+func check(resp covey.Response, rawURL string) error {
 	host := hostOf(rawURL)
 	// A transport error is the common operating fault of this plugin, and the
 	// agent can only report it if the message names it: the calls run in the
@@ -68,17 +107,6 @@ func do(resp covey.Response, rawURL string, out any) error {
 		return fmt.Errorf("%s: refused without a body (HTTP 403) — the host is probably missing from the egress allowlist", host)
 	case resp.Status >= 400:
 		return fmt.Errorf("%s: HTTP %d: %s", host, resp.Status, snippet(resp.Text, resp.Body))
-	}
-	if out == nil {
-		return nil
-	}
-	if len(resp.Body) == 0 {
-		// A source that answers 200 with nothing is broken in a way worth
-		// naming, rather than an empty result worth merging.
-		return fmt.Errorf("%s: empty answer (HTTP %d)", host, resp.Status)
-	}
-	if err := json.Unmarshal(resp.Body, out); err != nil {
-		return fmt.Errorf("%s: answer is not valid JSON: %w", host, err)
 	}
 	return nil
 }

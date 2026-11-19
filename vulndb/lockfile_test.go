@@ -194,3 +194,86 @@ func TestParseLockfileUnsupported(t *testing.T) {
 		t.Errorf("the error must name the way out (query_batch): %v", err)
 	}
 }
+
+// gradle.lockfile as Gradle writes it. Checked: the comment header and the
+// empty= line are skipped, the name is groupId:artifactId, a module locked
+// only for test configurations is a dev dependency, and the same module in
+// two versions (two configurations resolving differently) stays two packages.
+func TestParseGradleLock(t *testing.T) {
+	raw := []byte("# This is a Gradle generated file for dependency locking.\r\n" +
+		"# Manual edits can break the build and are not advised.\r\n" +
+		"# This file is expected to be part of source control.\r\n" +
+		"com.fasterxml.jackson.core:jackson-databind:2.13.3=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath\r\n" +
+		"com.google.guava:guava:33.4.0-jre=compileClasspath,runtimeClasspath\r\n" +
+		"org.hibernate:hibernate-core:5.4.20.Final=runtimeClasspath\r\n" +
+		"org.junit.jupiter:junit-jupiter-api:5.10.0=testCompileClasspath,testRuntimeClasspath\r\n" +
+		"androidx.test:core:1.5.0=debugAndroidTestRuntimeClasspath\r\n" +
+		"org.slf4j:slf4j-api:1.7.36=compileClasspath\r\n" +
+		"org.slf4j:slf4j-api:2.0.16=runtimeClasspath\r\n" +
+		"empty=annotationProcessor,testAnnotationProcessor\r\n")
+	res, err := ParseLockfile("app/gradle.lockfile", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Ecosystem != EcosystemMaven {
+		t.Errorf("ecosystem = %q, want %q", res.Ecosystem, EcosystemMaven)
+	}
+	if len(res.Packages) != 7 {
+		t.Fatalf("got %d packages, want 7: %+v", len(res.Packages), res.Packages)
+	}
+	if p := find(t, res, "com.fasterxml.jackson.core:jackson-databind"); p.Version != "2.13.3" || p.Dependency != "" || p.Ecosystem != EcosystemMaven {
+		t.Errorf("jackson-databind = %+v, want 2.13.3 with an unknown role (also on the main classpath)", p)
+	}
+	if p := find(t, res, "com.google.guava:guava"); p.Version != "33.4.0-jre" {
+		t.Errorf("guava = %+v", p)
+	}
+	if p := find(t, res, "org.hibernate:hibernate-core"); p.Version != "5.4.20.Final" {
+		t.Errorf("hibernate-core = %+v", p)
+	}
+	if p := find(t, res, "org.junit.jupiter:junit-jupiter-api"); p.Dependency != depDev {
+		t.Errorf("junit = %+v, want dev — it is locked for test configurations only", p)
+	}
+	if p := find(t, res, "androidx.test:core"); p.Dependency != depDev {
+		t.Errorf("androidx.test:core = %+v, want dev (androidTest)", p)
+	}
+	versions := []string{}
+	for _, p := range res.Packages {
+		if p.Name == "org.slf4j:slf4j-api" {
+			versions = append(versions, p.Version)
+		}
+	}
+	if strings.Join(versions, ",") != "1.7.36,2.0.16" {
+		t.Errorf("slf4j-api versions = %v, want both", versions)
+	}
+	if len(res.Notes) == 0 || !strings.Contains(res.Notes[0], "dependencyInsight") {
+		t.Errorf("the flat-list caveat must be reported: %v", res.Notes)
+	}
+
+	// The buildscript and settings lock files have the same format.
+	for _, name := range []string{"buildscript-gradle.lockfile", "settings-gradle.lockfile"} {
+		if _, err := ParseLockfile(name, []byte("org.example:plugin:1.0=classpath\n")); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A line Gradle would not write stops the parse instead of being skipped —
+// a half-read lock file reads like an all-clear.
+func TestParseGradleLockRefusesMalformedLines(t *testing.T) {
+	for _, raw := range []string{
+		"com.google.guava:guava=compileClasspath\n",         // no version
+		"com.google.guava:guava:33.4.0-jre:extra=runtime\n", // four parts
+		"guava 33.4.0\n", // not coordinates at all
+	} {
+		if _, err := ParseLockfile("gradle.lockfile", []byte("# header\n"+raw)); err == nil {
+			t.Errorf("%q must be refused", raw)
+		} else if !strings.Contains(err.Error(), "line 2") {
+			t.Errorf("%q: the error must name the line: %v", raw, err)
+		}
+	}
+	// A project whose configurations all resolve to nothing has nothing to
+	// scan; that is said, not reported as clean.
+	if _, err := ParseLockfile("gradle.lockfile", []byte("# header\nempty=compileClasspath,runtimeClasspath\n")); err == nil {
+		t.Error("a lock file without packages must be an error")
+	}
+}

@@ -59,10 +59,12 @@ func ParseLockfile(name string, data []byte) (LockfileResult, error) {
 		return parseComposerLock(data)
 	case "pubspec.lock":
 		return parsePubspecLock(data)
+	case "gradle.lockfile", "buildscript-gradle.lockfile", "settings-gradle.lockfile":
+		return parseGradleLock(data)
 	case "yarn.lock", "pnpm-lock.yaml", "pnpm-lock.yml":
 		return LockfileResult{}, fmt.Errorf("%s is not supported — its format changes between major versions and a half-read lock file reports fewer packages than there are. Extract the name/version pairs yourself and send them through query_batch", base)
 	default:
-		return LockfileResult{}, fmt.Errorf("unknown lock file %q — supported: package-lock.json, npm-shrinkwrap.json, composer.lock, pubspec.lock", base)
+		return LockfileResult{}, fmt.Errorf("unknown lock file %q — supported: package-lock.json, npm-shrinkwrap.json, composer.lock, pubspec.lock, gradle.lockfile", base)
 	}
 }
 
@@ -297,6 +299,74 @@ func parsePubspecLock(data []byte) (LockfileResult, error) {
 	}
 	sortPackages(res.Packages)
 	return res, nil
+}
+
+// --- Gradle (Maven) ---
+
+// parseGradleLock reads Gradle's dependency lock file (Gradle 6 and later),
+// one resolved module per line:
+//
+//	# This is a Gradle generated file for dependency locking.
+//	com.google.guava:guava:33.4.0-jre=compileClasspath,runtimeClasspath
+//	org.junit.jupiter:junit-jupiter-api:5.10.0=testCompileClasspath
+//	empty=annotationProcessor
+//
+// "empty=" lists the configurations that resolve to nothing. A line that fits
+// none of these shapes stops the parse: a lock file read halfway reports fewer
+// packages than there are, which reads like an all-clear.
+func parseGradleLock(data []byte) (LockfileResult, error) {
+	res := LockfileResult{Ecosystem: EcosystemMaven}
+	seen := map[string]bool{}
+	for n, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		coords, confs, _ := strings.Cut(line, "=")
+		if coords == "empty" {
+			continue
+		}
+		parts := strings.Split(coords, ":")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return LockfileResult{}, fmt.Errorf("gradle.lockfile line %d: %q is not group:artifact:version=configurations", n+1, line)
+		}
+		name, version := parts[0]+":"+parts[1], parts[2]
+		if seen[name+"@"+version] {
+			continue
+		}
+		seen[name+"@"+version] = true
+		dep := ""
+		if testOnly(confs) {
+			dep = depDev
+		}
+		res.Packages = append(res.Packages, Package{
+			Ecosystem: EcosystemMaven, Name: name, Version: version, Dependency: dep,
+		})
+	}
+	if len(res.Packages) == 0 {
+		return res, fmt.Errorf("gradle.lockfile contains no packages")
+	}
+	res.Notes = append(res.Notes, "gradle.lockfile lists the resolved classpaths flat — direct and transitive are not distinguishable in it; use `./gradlew dependencyInsight --dependency <artifact> --configuration <configuration>` in the checkout for the path")
+	sortPackages(res.Packages)
+	return res, nil
+}
+
+// testOnly: is a module locked only for test configurations
+// (testRuntimeClasspath, androidTestCompileClasspath,
+// debugUnitTestRuntimeClasspath, integrationTestRuntimeClasspath)? Then it is
+// the Gradle counterpart of a dev dependency. Without a configuration list the
+// role is unknown and stays empty.
+func testOnly(confs string) bool {
+	if strings.TrimSpace(confs) == "" {
+		return false
+	}
+	for _, c := range strings.Split(confs, ",") {
+		c = strings.TrimSpace(c)
+		if !strings.HasPrefix(c, "test") && !strings.Contains(c, "Test") {
+			return false
+		}
+	}
+	return true
 }
 
 // sortPackages sorgt für eine stabile Reihenfolge: Go-Kartenläufe sind zufällig,
