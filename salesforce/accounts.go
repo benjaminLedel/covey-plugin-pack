@@ -141,8 +141,8 @@ func (c *Client) normalizeAccount(row map[string]any) Account {
 // not owned by a queue at all, so there is nothing to narrow them to — they are
 // simply out of reach.
 func (c *Client) outsidePinnedQueue(what string) error {
-	if q := strings.TrimSpace(c.cfg.Queue); q != "" {
-		return fmt.Errorf("this credential is pinned to the queue %q and reaches only its cases; %s are outside it", q, what)
+	if c.cfg.Pinned() {
+		return fmt.Errorf("this credential is pinned to %s and reaches only those cases; %s are outside it", c.cfg.pinText(), what)
 	}
 	return nil
 }

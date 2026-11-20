@@ -62,6 +62,16 @@ func init() {
    this is per agent, not per installation: which queue is mine is a property
    of the employee, not of the machine they run on.
 
+   Does your team take cases out of the queue into their own lists and keep
+   them there? Then the agent loses a case the moment a person takes it — a
+   customer's answer neither wakes it nor can it read the case. Name those
+   people next to the queue:
+     salesforce_url = https://acme.my.salesforce.com queue="Support Tier 1" owners="Ada Lovelace, Alan Turing"
+   The pin is then the queue plus these users, for everything above. Names are
+   full user names as a case's owner shows them; one that matches no active
+   user, or more than one, is an error rather than a gap in the pin. owners=
+   alone, without queue=, pins the agent to those people's cases.
+
    Without a connected app — where nobody will create one for you — a user
    name and a password work too:
    salesforce_token = user:agent@acme.example:<password + security token>
@@ -83,8 +93,8 @@ func init() {
    needs read on Account, Task and Event. The org's own account fields are
    named in the URL, by API name:
      salesforce_url = https://acme.my.salesforce.com account_fields="ARR__c,Brand__c"
-   A credential pinned to a queue (queue=) does not reach accounts or
-   activities at all — the pin is a wall around that queue's cases.
+   A credential pinned to a queue or to owners (queue=, owners=) does not
+   reach accounts or activities at all — the pin is a wall around those cases.
 
 5. Intake — one of the two, or both:
    a) By heartbeat (works without any setup in Salesforce). In HEARTBEAT.md:
@@ -169,8 +179,8 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 	// can be handed. Checking each call site would mean remembering to check
 	// the next one too.
 	var guarded *Case
-	if q := strings.TrimSpace(c.cfg.Queue); q != "" && (in.CaseID != "" || in.CaseNumber != "") {
-		k, err := c.CaseInQueue(ctx, in.CaseID, in.CaseNumber, q)
+	if c.cfg.Pinned() && (in.CaseID != "" || in.CaseNumber != "") {
+		k, err := c.CaseInReach(ctx, in.CaseID, in.CaseNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -319,8 +329,9 @@ func escalate(ctx context.Context, c *Client, caseID, note string) (any, error) 
 const docCases = `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
    {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
    (plus "queue":"Support Tier 1" for only what that queue owns — the name comes from list_queues;
-   queue and assigned exclude each other. Is your credential pinned to a queue, that queue is a
-   CEILING: you see and touch its cases and no others, and naming a different one is an error),
+   queue and assigned exclude each other. Is your credential pinned to a queue — and possibly to the
+   people who take its cases — that pin is a CEILING: you see and touch those cases and no others;
+   naming the pinned queue narrows to the cases nobody has taken yet, naming a different one is an error),
    list_messages {"case_id":"500…"} (the whole conversation: incoming and outgoing mail plus comments,
    oldest first), search_cases {"query":"…","limit":10} (how was this answered before?),
    reply {"case_id":"500…","body":"…","internal":true|false,"subject":"…","to":"…"},
