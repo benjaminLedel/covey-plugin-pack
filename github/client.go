@@ -38,7 +38,11 @@ const defaultBaseURL = "https://api.github.com"
 type Client struct {
 	BaseURL string
 	Token   string
-	HTTP    *http.Client
+	// Login is the account the token acts as when the host names it
+	// (Credential.Login) — a GitHub App's "name[bot]", which /user would refuse
+	// to give. Empty: ask /user.
+	Login string
+	HTTP  *http.Client
 }
 
 // NewClient normalises the endpoint. Three spellings arrive here and all three
@@ -322,6 +326,16 @@ const perPage = 100
 // CurrentUser — GET /user: the bot's own identity. Needed everywhere a decision
 // hangs off "did I write that myself?".
 func (c *Client) CurrentUser(ctx context.Context) (User, error) {
+	if c.Login != "" {
+		typ := "User"
+		if strings.HasSuffix(strings.ToLower(c.Login), "[bot]") {
+			typ = "Bot"
+		}
+		return User{Login: c.Login, Type: typ}, nil
+	}
+	if c.isApp() {
+		return User{}, fmt.Errorf("GitHub App token without a login: the host has to name the bot (Credential.Login) — GET /user refuses installation tokens")
+	}
 	var u User
 	err := c.do(ctx, http.MethodGet, "/user", nil, &u)
 	return u, err
@@ -330,6 +344,10 @@ func (c *Client) CurrentUser(ctx context.Context) (User, error) {
 // ListRepos — GET /user/repos: the repositories the bot user can reach. The
 // entry point for agents that do not yet know their repo names.
 func (c *Client) ListRepos(ctx context.Context) ([]Repo, error) {
+	if c.isApp() {
+		repos, _, err := c.installationRepos(ctx, perPage)
+		return repos, err
+	}
 	var out []Repo
 	err := c.do(ctx, http.MethodGet,
 		fmt.Sprintf("/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=%d", perPage), nil, &out)

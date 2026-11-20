@@ -128,6 +128,12 @@ func (c *Client) createCommit(ctx context.Context, repo, message, treeSHA, paren
 	if parent != "" {
 		in["parents"] = []string{parent}
 	}
+	if author, committer := commitIdentities(ctx, c); author != nil {
+		in["author"] = author
+		if committer != nil {
+			in["committer"] = committer
+		}
+	}
 	var out Commit
 	err = c.do(ctx, http.MethodPost, p, in, &out)
 	return out, err
