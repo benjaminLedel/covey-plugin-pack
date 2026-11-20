@@ -48,6 +48,7 @@ type fakeOrg struct {
 
 	cases    []map[string]any
 	queues   []map[string]any // QueueSobject rows (queue join table)
+	users    []map[string]any // User rows (owners= resolution)
 	noQueue  bool             // the queue lookup finds nothing
 	messages []map[string]any
 	comments []map[string]any
@@ -143,6 +144,8 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 			writeRecords(w, f.tasks)
 		case strings.Contains(q, "FROM Event"):
 			writeRecords(w, f.events)
+		case strings.Contains(q, "FROM User"):
+			writeRecords(w, f.users)
 		case strings.Contains(q, "FROM QueueSobject"):
 			writeRecords(w, f.queues)
 		case strings.Contains(q, "FROM Group"):
@@ -1436,5 +1439,151 @@ func TestHasWorkOnATie(t *testing.T) {
 	has, _, err := sys.HasWorkSigned(context.Background(), f.cred(), "")
 	if err != nil || !has {
 		t.Fatalf("a tie must not silently swallow the customer's message: %v %v", has, err)
+	}
+}
+
+// credPin is the double reached with a queue AND named owners in salesforce_url
+// — the team that takes cases out of the queue into their own lists.
+func (f *fakeOrg) credPin(queue, owners string) target.Credential {
+	base := f.srv.URL
+	if queue != "" {
+		base += ` queue="` + queue + `"`
+	}
+	return target.Credential{BaseURL: base + ` owners="` + owners + `"`, Token: "key-" + f.t.Name() + ":secret"}
+}
+
+func userRow(id, name string) map[string]any { return map[string]any{"Id": id, "Name": name} }
+
+func lastCaseQuery(f *fakeOrg) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cases string
+	for _, q := range f.queries {
+		if strings.Contains(q, "FROM Case ") {
+			cases = q
+		}
+	}
+	return cases
+}
+
+func TestParseConfigReadsTheOwners(t *testing.T) {
+	cfg, err := ParseConfig(`https://acme.my.salesforce.com queue="Support" owners="Ada  Lovelace, Alan Turing,"`, "key:secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Owners) != 2 || cfg.Owners[0] != "Ada Lovelace" || cfg.Owners[1] != "Alan Turing" {
+		t.Fatalf("owners trimmed, inner spaces collapsed, empty entries dropped: %q", cfg.Owners)
+	}
+	if !cfg.Reaches("support") || !cfg.Reaches("alan turing") || cfg.Reaches("Grace Hopper") {
+		t.Fatalf("the pin is the queue plus the owners, nothing else: %+v", cfg)
+	}
+	if _, err := ParseConfig(`https://acme.my.salesforce.com owners=""`, "key:secret"); err == nil {
+		t.Fatal("an empty owners= must not quietly mean no owners")
+	}
+}
+
+// The case the person took is in reach again — the point of owners=.
+func TestListCasesReachesTheQueueAndItsOwners(t *testing.T) {
+	f := newFakeOrg(t)
+	f.users = []map[string]any{userRow("0058d000001AdaAAA", "Ada Lovelace"), userRow("0058d000001AlanAAA", "Alan Turing")}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{}`),
+		f.credPin("Support", "Ada Lovelace, Alan Turing")); err != nil {
+		t.Fatal(err)
+	}
+	q := lastCaseQuery(f)
+	if !strings.Contains(q, "OwnerId IN ('00G8d000001QueueAA','0058d000001AdaAAA','0058d000001AlanAAA')") {
+		t.Fatalf("queue and owners in one WHERE: %s", q)
+	}
+}
+
+// Naming the pinned queue narrows to it: the cases nobody has taken yet.
+func TestListCasesNamingThePinnedQueueNarrowsToIt(t *testing.T) {
+	f := newFakeOrg(t)
+	f.users = []map[string]any{userRow("0058d000001AdaAAA", "Ada Lovelace")}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"queue":"Support"}`),
+		f.credPin("Support", "Ada Lovelace")); err != nil {
+		t.Fatal(err)
+	}
+	if q := lastCaseQuery(f); !strings.Contains(q, "OwnerId = '00G8d000001QueueAA'") || strings.Contains(q, "AdaAAA") {
+		t.Fatalf("only the queue: %s", q)
+	}
+}
+
+// owners= without queue= pins to the people alone.
+func TestOwnersWithoutAQueue(t *testing.T) {
+	f := newFakeOrg(t)
+	f.users = []map[string]any{userRow("0058d000001AdaAAA", "Ada Lovelace")}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{}`), f.credPin("", "Ada Lovelace")); err != nil {
+		t.Fatal(err)
+	}
+	if q := lastCaseQuery(f); !strings.Contains(q, "OwnerId = '0058d000001AdaAAA'") {
+		t.Fatalf("only the named person: %s", q)
+	}
+	if _, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{"queue":"Support"}`),
+		f.credPin("", "Ada Lovelace")); err == nil || !strings.Contains(err.Error(), "out of its reach") {
+		t.Fatalf("a queue outside the pin stays out of reach: %v", err)
+	}
+}
+
+// A name that matches nobody — or two people — is an error, not a gap.
+func TestOwnersThatDoNotResolveAreAnError(t *testing.T) {
+	for name, users := range map[string][]map[string]any{
+		"unknown":   {userRow("0058d000001AdaAAA", "Ada Lovelace")},
+		"ambiguous": {userRow("0058d000001AdaAAA", "Ada Lovelace"), userRow("0058d000001AlanAAA", "Alan Turing"), userRow("0058d000001Ala2AAA", "Alan Turing")},
+	} {
+		f := newFakeOrg(t)
+		f.users = users
+		_, err := sys.Execute(context.Background(), "list_cases", json.RawMessage(`{}`), f.credPin("Support", "Ada Lovelace, Alan Turing"))
+		if err == nil || !strings.Contains(err.Error(), "Alan Turing") {
+			t.Fatalf("%s: the name that does not resolve must be named: %v", name, err)
+		}
+	}
+}
+
+// The wall: a named owner's case can be read and noted, anybody else's not.
+func TestOwnersCaseIsInReachOthersAreNot(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{
+		openCase(caseA, "00001026", "Ada Lovelace", "2026-08-17T08:00:00.000+0000"),
+		openCase(caseB, "00001027", "Grace Hopper", "2026-08-17T09:00:00.000+0000"),
+	}
+	cred := f.credPin("Support", "Ada Lovelace")
+	if _, err := sys.Execute(context.Background(), "reply",
+		json.RawMessage(`{"case_id":"`+caseA+`","internal":true,"body":"Notiz"}`), cred); err != nil {
+		t.Fatalf("a note on a named owner's case goes through: %v", err)
+	}
+	_, err := sys.Execute(context.Background(), "get_case", json.RawMessage(`{"case_number":"00001027"}`), cred)
+	if err == nil || !strings.Contains(err.Error(), "Grace Hopper") || !strings.Contains(err.Error(), "Ada Lovelace") {
+		t.Fatalf("another person's case is out of reach, and the error says whose it is and what the pin is: %v", err)
+	}
+}
+
+// search_cases has no WHERE; it is narrowed to the same set.
+func TestSearchReachesTheOwners(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{
+		openCase(caseA, "00001026", "Support", "2026-08-17T08:00:00.000+0000"),
+		openCase(caseB, "00001027", "Ada Lovelace", "2026-08-17T09:00:00.000+0000"),
+		openCase("500000000000003AAA", "00001028", "Grace Hopper", "2026-08-17T10:00:00.000+0000"),
+	}
+	res, err := sys.Execute(context.Background(), "search_cases", json.RawMessage(`{"query":"Login"}`), f.credPin("Support", "Ada Lovelace"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list := res.([]Case); len(list) != 2 {
+		t.Fatalf("queue and owner, not the third person: %+v", list)
+	}
+}
+
+// The heartbeat pre-check inherits the set: a customer answering on a case a
+// person took wakes the agent.
+func TestHasWorkReachesTheOwners(t *testing.T) {
+	f := newFakeOrg(t)
+	f.users = []map[string]any{userRow("0058d000001AdaAAA", "Ada Lovelace")}
+	if _, err := sys.HasWork(context.Background(), f.credPin("Support", "Ada Lovelace")); err != nil {
+		t.Fatal(err)
+	}
+	if q := lastCaseQuery(f); !strings.Contains(q, "'0058d000001AdaAAA'") {
+		t.Fatalf("the pre-check sees the owners' cases too: %s", q)
 	}
 }

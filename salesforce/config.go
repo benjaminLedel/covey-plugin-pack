@@ -72,6 +72,12 @@ type Config struct {
 	// installation, and "which queue is mine" is a property of the employee,
 	// not of the machine they run on.
 	Queue string
+	// Owners are the users whose cases this agent reaches besides the queue's
+	// — the people who take cases out of the queue and keep them in their own
+	// list (owners="Name A, Name B"). Together with Queue they are the pin:
+	// the set of case owners the credential reaches, and nothing else. A
+	// person's full name, as a case's owner shows it.
+	Owners []string
 	// AccountFields are the org's own account fields (an ARR field, a brand
 	// field) that get_account and search_accounts read on top of the standard
 	// ones. In the credential for the same reason as the queue: which fields
@@ -133,6 +139,12 @@ func ParseConfig(baseURL, token string) (Config, error) {
 			cfg.LoginURL = strings.TrimRight(strings.TrimPrefix(part, "login="), "/")
 		case strings.HasPrefix(part, "queue="):
 			cfg.Queue = strings.TrimSpace(strings.Trim(strings.TrimPrefix(part, "queue="), `"`))
+		case strings.HasPrefix(part, "owners="):
+			owners, err := parseOwners(strings.Trim(strings.TrimPrefix(part, "owners="), `"`))
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.Owners = owners
 		case strings.HasPrefix(part, "account_fields="):
 			fields, err := parseAccountFields(strings.Trim(strings.TrimPrefix(part, "account_fields="), `"`))
 			if err != nil {
@@ -142,7 +154,7 @@ func ParseConfig(baseURL, token string) (Config, error) {
 		case cfg.InstanceURL == "":
 			cfg.InstanceURL = strings.TrimRight(part, "/")
 		default:
-			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…] [queue=\"…\"] [account_fields=\"…\"])", part)
+			return Config{}, fmt.Errorf("salesforce_url: unexpected component %q (expected: https://<my-domain>.my.salesforce.com [api=…] [login=…] [queue=\"…\"] [owners=\"…\"] [account_fields=\"…\"])", part)
 		}
 	}
 	if cfg.InstanceURL == "" {
@@ -185,6 +197,59 @@ func ParseConfig(baseURL, token string) (Config, error) {
 	}
 	cfg.StaticToken = token
 	return cfg, nil
+}
+
+// parseOwners reads owners="Name A, Name B". An empty list is refused rather
+// than read as "no owners": whoever writes owners= means to widen the pin, and
+// a typo that silently narrows it to the queue alone is a gap nobody notices.
+func parseOwners(v string) ([]string, error) {
+	var out []string
+	for _, name := range strings.Split(v, ",") {
+		if name = strings.Join(strings.Fields(name), " "); name != "" {
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf(`salesforce_url: owners= names no user (expected owners="Name A, Name B")`)
+	}
+	return out, nil
+}
+
+// Pinned says whether the credential is limited to a set of case owners — a
+// queue, named users, or both.
+func (c Config) Pinned() bool {
+	return strings.TrimSpace(c.Queue) != "" || len(c.Owners) > 0
+}
+
+// Reaches says whether a case with this owner lies inside the pin. Without a
+// pin every owner does.
+func (c Config) Reaches(owner string) bool {
+	if !c.Pinned() {
+		return true
+	}
+	owner = strings.TrimSpace(owner)
+	if q := strings.TrimSpace(c.Queue); q != "" && strings.EqualFold(owner, q) {
+		return true
+	}
+	for _, o := range c.Owners {
+		if strings.EqualFold(owner, o) {
+			return true
+		}
+	}
+	return false
+}
+
+// pinText names the pin in an error — "the queue "X"", "the queue "X" and the
+// cases of A, B" — so that whoever hits the wall reads where it stands.
+func (c Config) pinText() string {
+	var parts []string
+	if q := strings.TrimSpace(c.Queue); q != "" {
+		parts = append(parts, fmt.Sprintf("the queue %q", q))
+	}
+	if len(c.Owners) > 0 {
+		parts = append(parts, "the cases of "+strings.Join(c.Owners, ", "))
+	}
+	return strings.Join(parts, " and ")
 }
 
 func checkURL(field, raw string) error {

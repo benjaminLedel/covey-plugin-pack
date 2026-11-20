@@ -32,6 +32,8 @@ type Client struct {
 
 	// meID is the run-as user, resolved on first use (see MeID).
 	meID string
+	// ownerIDs are the owners= users, resolved on first use (see OwnerIDs).
+	ownerIDs []string
 }
 
 // NewClient parses the brokered credential and prepares the client. It does not
@@ -382,39 +384,70 @@ func (c *Client) ListCases(ctx context.Context, opt ListOptions) ([]Case, error)
 	// empty list would read as a quiet day instead of as a contradiction.
 	queue := strings.TrimSpace(opt.Queue)
 	pinned := strings.TrimSpace(c.cfg.Queue)
-	if pinned != "" {
-		// A pinned queue is a CEILING, not a suggestion. Naming another one is
-		// not a narrower request but a wider one, and the whole point of
-		// putting the queue in the credential is that the agent cannot widen
-		// its own reach.
+	// The owners the WHERE clause admits. Empty means "no owner filter".
+	var ownerIDs []string
+	if c.cfg.Pinned() {
+		// A pin is a CEILING, not a suggestion. Naming another queue is not a
+		// narrower request but a wider one, and the whole point of putting the
+		// pin in the credential is that the agent cannot widen its own reach.
+		// Naming the pinned queue itself narrows to the queue alone — the
+		// cases nobody has taken yet.
 		if queue != "" && !strings.EqualFold(queue, pinned) {
+			if pinned == "" {
+				return nil, fmt.Errorf("this credential is pinned to %s; the queue %q is out of its reach", c.cfg.pinText(), queue)
+			}
 			return nil, fmt.Errorf("this credential is pinned to the queue %q; %q is out of its reach", pinned, queue)
 		}
-		// assigned means "owned by the run-as user" — and a case owned by the
-		// queue is not owned by a user. Under a pinned queue the two can never
-		// both hold, so say so instead of returning an empty list that reads
-		// like a quiet day.
+		// assigned means "owned by the run-as user" — and a pinned case is
+		// owned by the queue or by one of the named people, not by the run-as
+		// user. Under a pin the two can never both hold, so say so instead of
+		// returning an empty list that reads like a quiet day.
 		if opt.AssignedOnly {
-			return nil, fmt.Errorf("assigned does not work under a pinned queue: the cases of queue %q are owned by the queue, not by the run-as user", pinned)
+			return nil, fmt.Errorf("assigned does not work under a pinned queue: the cases of %s are not owned by the run-as user", c.cfg.pinText())
 		}
-		queue = pinned
-	}
-	if queue != "" && opt.AssignedOnly {
-		return nil, fmt.Errorf("assigned and queue exclude each other: the first means the cases of the run-as user, the second the cases of a queue")
-	}
-	if opt.AssignedOnly {
-		me, err := c.MeID(ctx)
-		if err != nil {
-			return nil, err
+		if pinned != "" {
+			id, err := c.QueueID(ctx, pinned)
+			if err != nil {
+				return nil, err
+			}
+			ownerIDs = append(ownerIDs, id)
 		}
-		where = append(where, fmt.Sprintf("OwnerId = '%s'", soqlEscape(me)))
-	}
-	if queue != "" {
-		id, err := c.QueueID(ctx, queue)
-		if err != nil {
-			return nil, err
+		if queue == "" && len(c.cfg.Owners) > 0 {
+			ids, err := c.OwnerIDs(ctx)
+			if err != nil {
+				return nil, err
+			}
+			ownerIDs = append(ownerIDs, ids...)
 		}
-		where = append(where, fmt.Sprintf("OwnerId = '%s'", soqlEscape(id)))
+	} else {
+		if queue != "" && opt.AssignedOnly {
+			return nil, fmt.Errorf("assigned and queue exclude each other: the first means the cases of the run-as user, the second the cases of a queue")
+		}
+		if opt.AssignedOnly {
+			me, err := c.MeID(ctx)
+			if err != nil {
+				return nil, err
+			}
+			ownerIDs = append(ownerIDs, me)
+		}
+		if queue != "" {
+			id, err := c.QueueID(ctx, queue)
+			if err != nil {
+				return nil, err
+			}
+			ownerIDs = append(ownerIDs, id)
+		}
+	}
+	switch len(ownerIDs) {
+	case 0:
+	case 1:
+		where = append(where, fmt.Sprintf("OwnerId = '%s'", soqlEscape(ownerIDs[0])))
+	default:
+		quoted := make([]string, len(ownerIDs))
+		for i, id := range ownerIDs {
+			quoted[i] = "'" + soqlEscape(id) + "'"
+		}
+		where = append(where, "OwnerId IN ("+strings.Join(quoted, ",")+")")
 	}
 	clause := ""
 	if len(where) > 0 {
@@ -479,11 +512,10 @@ func (c *Client) SearchCases(ctx context.Context, term string, limit int) ([]Cas
 	// must not — otherwise the one action without a WHERE clause would be the
 	// hole in the wall. SOSL cannot filter on the polymorphic owner, so the
 	// narrowing happens here.
-	pinned := strings.TrimSpace(c.cfg.Queue)
 	out := make([]Case, 0, len(res.SearchRecords))
 	for _, r := range res.SearchRecords {
 		k := c.normalize(r)
-		if pinned != "" && !strings.EqualFold(strings.TrimSpace(k.Owner), pinned) {
+		if !c.cfg.Reaches(k.Owner) {
 			continue
 		}
 		out = append(out, k)
@@ -739,15 +771,16 @@ func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
 	return out, nil
 }
 
-// CaseInQueue is the wall around a pinned queue. Narrowing list_cases alone
-// would only hide cases, not put them out of reach: every other action
+// CaseInReach is the wall around a pinned credential. Narrowing list_cases
+// alone would only hide cases, not put them out of reach: every other action
 // addresses a case by id or by the number a customer quotes, and a number is
 // something an agent can simply be told. So the case is fetched once and its
-// owner checked before anything happens to it.
+// owner checked against the pin — the queue and the named owners — before
+// anything happens to it.
 //
 // The case comes back so that the caller does not read it twice — for get_case
 // the check IS the read.
-func (c *Client) CaseInQueue(ctx context.Context, caseID, caseNumber, queue string) (Case, error) {
+func (c *Client) CaseInReach(ctx context.Context, caseID, caseNumber string) (Case, error) {
 	var (
 		k   Case
 		err error
@@ -760,13 +793,53 @@ func (c *Client) CaseInQueue(ctx context.Context, caseID, caseNumber, queue stri
 	if err != nil {
 		return Case{}, err
 	}
-	if !strings.EqualFold(strings.TrimSpace(k.Owner), strings.TrimSpace(queue)) {
+	if !c.cfg.Reaches(k.Owner) {
 		// The owner is named rather than hidden: whoever hits this wall is
 		// usually an agent that was given the wrong case number, and "belongs
 		// to somebody else" without saying whom costs a second round.
-		return Case{}, fmt.Errorf("case %s belongs to %q — this credential reaches only the queue %q", k.Number, k.Owner, queue)
+		return Case{}, fmt.Errorf("case %s belongs to %q — this credential reaches only %s", k.Number, k.Owner, c.cfg.pinText())
 	}
 	return k, nil
+}
+
+// OwnerIDs resolves the owners= names to user ids, once per client. A name
+// that matches no active user, or more than one, is an error: a pin with a
+// silent gap would quietly hide a person's cases — the very failure owners=
+// exists to end — and a pin that guesses between two people would widen it.
+func (c *Client) OwnerIDs(ctx context.Context) ([]string, error) {
+	if c.ownerIDs != nil {
+		return c.ownerIDs, nil
+	}
+	quoted := make([]string, len(c.cfg.Owners))
+	for i, name := range c.cfg.Owners {
+		quoted[i] = "'" + soqlEscape(name) + "'"
+	}
+	rows, err := queryRows[struct {
+		ID   string `json:"Id"`
+		Name string `json:"Name"`
+	}](ctx, c, fmt.Sprintf("SELECT Id, Name FROM User WHERE IsActive = true AND Name IN (%s)", strings.Join(quoted, ",")))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(c.cfg.Owners))
+	for _, name := range c.cfg.Owners {
+		var found []string
+		for _, r := range rows {
+			if strings.EqualFold(strings.TrimSpace(r.Name), name) {
+				found = append(found, r.ID)
+			}
+		}
+		switch len(found) {
+		case 0:
+			return nil, fmt.Errorf("owners=: no active Salesforce user is named %q", name)
+		case 1:
+			ids = append(ids, found[0])
+		default:
+			return nil, fmt.Errorf("owners=: %d active Salesforce users are named %q — the pin cannot tell them apart", len(found), name)
+		}
+	}
+	c.ownerIDs = ids
+	return ids, nil
 }
 
 // ---------------------------------------------------------------- identity
