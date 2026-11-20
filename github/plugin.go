@@ -26,7 +26,7 @@ func init() {
 		},
 		Name:        "github",
 		Label:       "GitHub",
-		Description: "GitHub issues and pull requests as the working set: find issues (list_repos/list_issues, by milestone too), file externally reported bugs as a ticket (create_issue), maintain the working state on the board (set_labels/assign), check out source code and verify bugs against the code (checkout + sandbox shell), look at screenshots attached to issues (download_attachment + vision), develop fixes — commit onto a feature branch (commit), open a pull request (create_pull_request, optionally with a QA agent as reviewer) and live the review loop: check open PRs for new review feedback (list_pull_requests/list_pr_comments/comment_pr), diagnose red Actions runs yourself (list_workflow_runs/list_run_jobs/get_job_log) and react to the merge. Usable as a QA/test agent too: test others' pull requests in which you are entered as reviewer end to end and give feedback (approve_pr/request_changes, nur-wenn: github:review). Intake either through HEARTBEAT.md (polling) or through the webhook; auth by API token (the secret github_token; github_url only for GitHub Enterprise Server).",
+		Description: "GitHub issues and pull requests as the working set: find issues (list_repos/list_issues, by milestone too), file externally reported bugs as a ticket (create_issue), maintain the working state on the board (set_labels/assign), check out source code and verify bugs against the code (checkout + sandbox shell), look at screenshots attached to issues (download_attachment + vision), develop fixes — commit onto a feature branch (commit), open a pull request (create_pull_request, optionally with a QA agent as reviewer) and live the review loop: check open PRs for new review feedback (list_pull_requests/list_pr_comments/comment_pr), diagnose red Actions runs yourself (list_workflow_runs/list_run_jobs/get_job_log) and react to the merge. Usable as a QA/test agent too: test others' pull requests in which you are entered as reviewer end to end and give feedback (approve_pr/request_changes, nur-wenn: github:review). Intake either through HEARTBEAT.md (polling) or through the webhook; auth by API token (the secret github_token; github_url only for GitHub Enterprise Server) or by a GitHub App the organisation connects in covey (the platform mints the installation token; agents then share the App's bot name and are told apart by their signature and commit author).",
 		Kind:        "builtin",
 		Category:    target.CategoryCode,
 		Scopes:      []string{"read", "write", "comment", "merge"},
@@ -154,7 +154,7 @@ func (System) HasWorkKind(ctx context.Context, cred target.Credential, kind stri
 // piece of feedback means work (reported defects) or only information (an
 // approval) is thus decided by the agent and not by the gate.
 func (System) HasWorkSigned(ctx context.Context, cred target.Credential, kind string) (bool, string, error) {
-	gc := NewClient(cred.BaseURL, cred.Token)
+	gc := newClientFor(cred)
 	var (
 		waiting []string
 		err     error
@@ -525,7 +525,7 @@ var actions = map[string]action{
 			}
 			assignees = []string{u.Login}
 		}
-		return gc.CreateIssue(ctx, in.Repo, in.Title, in.Description, splitLabels(in.Labels), assignees)
+		return gc.CreateIssue(ctx, in.Repo, in.Title, stamp(ctx, gc, in.Description), splitLabels(in.Labels), assignees)
 	}),
 	"list_comments": repoAction(func(ctx context.Context, gc *Client, in actionParams) (any, error) {
 		if in.IssueNumber == 0 {
@@ -537,11 +537,12 @@ var actions = map[string]action{
 		if in.IssueNumber == 0 || strings.TrimSpace(in.Body) == "" {
 			return nil, fmt.Errorf("issue_number or body missing")
 		}
-		if cs, err := gc.ListComments(ctx, in.Repo, in.IssueNumber); err == nil && isDuplicateComment(ctx, gc, cs, in.Body) {
+		body := stamp(ctx, gc, in.Body)
+		if cs, err := gc.ListComments(ctx, in.Repo, in.IssueNumber); err == nil && isDuplicateComment(ctx, gc, cs, body) {
 			return map[string]any{"skipped": "duplicate",
 				"reason": "identical to your own last comment — not posted again"}, nil
 		}
-		return gc.Comment(ctx, in.Repo, in.IssueNumber, in.Body)
+		return gc.Comment(ctx, in.Repo, in.IssueNumber, body)
 	}),
 	"set_state": repoAction(func(ctx context.Context, gc *Client, in actionParams) (any, error) {
 		if in.IssueNumber == 0 {
@@ -580,7 +581,7 @@ var actions = map[string]action{
 		if note == "" {
 			note = "Escalated by a Covey agent."
 		}
-		return map[string]any{"escalated": true}, gc.Escalate(ctx, in.Repo, in.IssueNumber, note)
+		return map[string]any{"escalated": true}, gc.Escalate(ctx, in.Repo, in.IssueNumber, stamp(ctx, gc, note))
 	}),
 	"download_attachment": func(ctx context.Context, gc *Client, in actionParams) (any, error) {
 		if strings.TrimSpace(in.URL) == "" {
@@ -663,11 +664,12 @@ var actions = map[string]action{
 		if in.PRNumber == 0 || strings.TrimSpace(in.Body) == "" {
 			return nil, fmt.Errorf("pr_number or body missing")
 		}
-		if cs, err := gc.ListPullComments(ctx, in.Repo, in.PRNumber); err == nil && isDuplicateComment(ctx, gc, cs, in.Body) {
+		body := stamp(ctx, gc, in.Body)
+		if cs, err := gc.ListPullComments(ctx, in.Repo, in.PRNumber); err == nil && isDuplicateComment(ctx, gc, cs, body) {
 			return map[string]any{"skipped": "duplicate",
 				"reason": "identical to your own last comment — not posted again"}, nil
 		}
-		return gc.Comment(ctx, in.Repo, in.PRNumber, in.Body)
+		return gc.Comment(ctx, in.Repo, in.PRNumber, body)
 	}),
 	"create_pull_request": repoAction(func(ctx context.Context, gc *Client, in actionParams) (any, error) {
 		head := strings.TrimSpace(in.Head)
@@ -709,7 +711,7 @@ var actions = map[string]action{
 		if err != nil {
 			return nil, err
 		}
-		pr, err := gc.CreatePull(ctx, in.Repo, head, base, in.Title, in.Description, in.Draft)
+		pr, err := gc.CreatePull(ctx, in.Repo, head, base, in.Title, stamp(ctx, gc, in.Description), in.Draft)
 		if err != nil {
 			return nil, err
 		}
@@ -759,7 +761,7 @@ var actions = map[string]action{
 		if in.PRNumber == 0 {
 			return nil, fmt.Errorf("pr_number missing")
 		}
-		if _, err := gc.ApprovePull(ctx, in.Repo, in.PRNumber, in.Body); err != nil {
+		if _, err := gc.ApprovePull(ctx, in.Repo, in.PRNumber, stamp(ctx, gc, in.Body)); err != nil {
 			return nil, err
 		}
 		return map[string]any{"approved": true, "pr_number": in.PRNumber}, nil
@@ -768,7 +770,7 @@ var actions = map[string]action{
 		if in.PRNumber == 0 {
 			return nil, fmt.Errorf("pr_number missing")
 		}
-		if _, err := gc.RequestChanges(ctx, in.Repo, in.PRNumber, in.Body); err != nil {
+		if _, err := gc.RequestChanges(ctx, in.Repo, in.PRNumber, stamp(ctx, gc, in.Body)); err != nil {
 			return nil, err
 		}
 		return map[string]any{"changes_requested": true, "pr_number": in.PRNumber}, nil
@@ -825,7 +827,7 @@ func (System) Execute(ctx context.Context, actionName string, params json.RawMes
 	if err := json.Unmarshal(params, &in); err != nil {
 		return nil, fmt.Errorf("params: %w", err)
 	}
-	return fn(ctx, NewClient(cred.BaseURL, cred.Token), in)
+	return fn(ctx, newClientFor(cred), in)
 }
 
 func (System) PromptDoc() string {
