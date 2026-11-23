@@ -951,6 +951,44 @@ func TestHasWorkSigned(t *testing.T) {
 	}
 }
 
+// TestListCasesWaiting: list_cases {"waiting":true} shows exactly the cases the
+// intake gate wakes the agent for. Left to work that out from list_messages,
+// an agent that filtered the output missed its own note and noted the same case
+// again on the next run.
+func TestListCasesWaiting(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{
+		openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000"),
+		openCase(caseB, "00001027", "Support Tier 1", "2026-08-17T08:30:00.000+0000"),
+	}
+	// A: the customer wrote, then an internal note — answered.
+	// B: a note, then the customer wrote again — waiting.
+	f.messages = []map[string]any{
+		{"Id": "02s0000000001AAA", "ParentId": caseA, "MessageDate": "2026-08-17T08:00:00.000+0000", "Incoming": true},
+		{"Id": "02s0000000002AAA", "ParentId": caseB, "MessageDate": "2026-08-17T11:00:00.000+0000", "Incoming": true},
+	}
+	f.comments = []map[string]any{
+		{"Id": "00a0000000001AAA", "ParentId": caseA, "CreatedDate": "2026-08-17T09:00:00.000+0000"},
+		{"Id": "00a0000000002AAA", "ParentId": caseB, "CreatedDate": "2026-08-17T10:00:00.000+0000"},
+	}
+
+	got := exec(t, f, "list_cases", `{"open":true,"waiting":true}`).([]Case)
+	if len(got) != 1 || got[0].ID != caseB {
+		t.Fatalf("only the case the customer wrote on last: %+v", got)
+	}
+	if all := exec(t, f, "list_cases", `{"open":true}`).([]Case); len(all) != 2 {
+		t.Fatalf("without waiting the list stays whole: %+v", all)
+	}
+
+	// Nothing waiting is an empty list, not null — the agent reads "[]" as "done".
+	f.mu.Lock()
+	f.comments = append(f.comments, map[string]any{"Id": "00a0000000003AAA", "ParentId": caseB, "CreatedDate": "2026-08-17T12:00:00.000+0000"})
+	f.mu.Unlock()
+	if none := exec(t, f, "list_cases", `{"open":true,"waiting":true}`).([]Case); none == nil || len(none) != 0 {
+		t.Fatalf("an empty, non-nil list: %#v", none)
+	}
+}
+
 func TestHasWorkAssignedNarrowsToTheOwnUser(t *testing.T) {
 	f := newFakeOrg(t)
 	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
