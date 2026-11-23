@@ -165,6 +165,7 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		Name       string `json:"name"`
 		Path       string `json:"path"`
 		Assigned   bool   `json:"assigned"`
+		Waiting    bool   `json:"waiting"`
 		Open       *bool  `json:"open"`
 		Limit      int    `json:"limit"`
 	}
@@ -200,13 +201,32 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 		return c.GetCase(ctx, in.CaseID)
 
 	case "list_cases":
-		return c.ListCases(ctx, ListOptions{
+		cases, err := c.ListCases(ctx, ListOptions{
 			OpenOnly:     in.Open == nil || *in.Open,
 			AssignedOnly: in.Assigned,
 			Queue:        in.Queue,
 			Status:       in.Status,
 			Limit:        in.Limit,
 		})
+		if err != nil || !in.Waiting {
+			return cases, err
+		}
+		// waiting: only the cases whose newest inbound message is newer than
+		// anything that went out or was noted since — the rule the intake gate
+		// wakes the agent by. An agent deciding this itself from list_messages
+		// misses its own note as soon as it filters the output, and notes the
+		// same case twice.
+		waiting, err := awaitingReply(ctx, c, cases)
+		if err != nil {
+			return nil, err
+		}
+		out := []Case{}
+		for _, k := range cases {
+			if _, ok := waiting[k.ID]; ok {
+				out = append(out, k)
+			}
+		}
+		return out, nil
 
 	case "list_messages":
 		return c.Messages(ctx, in.CaseID, in.Limit)
@@ -328,6 +348,9 @@ func escalate(ctx context.Context, c *Client, caseID, note string) (any, error) 
 // customers does not carry the case ones.
 const docCases = `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
    {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
+   (plus "waiting":true for only the cases waiting for an answer: the customer wrote last, or nobody has
+   written yet — an internal note counts as an answer, so a case you have noted drops out until the
+   customer writes again)
    (plus "queue":"Support Tier 1" for only what that queue owns — the name comes from list_queues;
    queue and assigned exclude each other. Is your credential pinned to a queue — and possibly to the
    people who take its cases — that pin is a CEILING: you see and touch those cases and no others;

@@ -75,8 +75,27 @@ func casesAwaitingReply(ctx context.Context, c *Client, assignedOnly bool) ([]st
 	if err != nil {
 		return nil, err
 	}
+	last, err := awaitingReply(ctx, c, cases)
+	if err != nil {
+		return nil, err
+	}
+	waiting := make([]string, 0, len(last))
+	for id, ts := range last {
+		waiting = append(waiting, "case:"+id+"@"+ts)
+	}
+	sort.Strings(waiting) // the signature has to be stable, the map is not
+	return waiting, nil
+}
+
+// awaitingReply applies the rule above to a given set of cases: it returns,
+// for every case that waits, the timestamp of its last inbound message (or its
+// creation, for a case nobody has written on yet). The intake gate and
+// list_cases {"waiting":true} share it, so the agent is shown exactly the
+// cases the gate woke it for — and does not have to work the rule out again
+// from a conversation it may only half read.
+func awaitingReply(ctx context.Context, c *Client, cases []Case) (map[string]string, error) {
 	if len(cases) == 0 {
-		return nil, nil
+		return map[string]string{}, nil
 	}
 
 	byID := make(map[string]Case, len(cases))
@@ -98,10 +117,6 @@ func casesAwaitingReply(ctx context.Context, c *Client, assignedOnly bool) ([]st
 		return nil, err
 	}
 
-	// The timestamps are compared as strings. That is sound here and nowhere
-	// else: Salesforce returns every date in the same ISO-8601 format and in
-	// UTC, so lexical order and chronological order are the same thing — and a
-	// comparison that cannot fail to parse beats one that can.
 	inbound := map[string]string{}
 	answered := map[string]string{}
 	newer := func(m map[string]string, id, ts string) {
@@ -120,25 +135,16 @@ func casesAwaitingReply(ctx context.Context, c *Client, assignedOnly bool) ([]st
 		newer(answered, m.ParentID, m.CreatedDate)
 	}
 
-	var waiting []string
+	waiting := map[string]string{}
 	for id, k := range byID {
 		last := inbound[id]
 		if last == "" {
-			// No incoming mail: then the case itself is what came in.
 			last = k.CreatedAt
 		}
-		// >=, not >: Salesforce timestamps have millisecond resolution, and two
-		// events inside the same millisecond compare equal. With a strict
-		// comparison such a tie reads as "answered" — and because neither
-		// timestamp ever changes again, that message would never wake anybody:
-		// a customer silently waiting forever. A tie therefore counts as
-		// waiting. The cost of erring this way is one run that finds nothing to
-		// do, and the signature stops it from repeating.
 		if last >= answered[id] {
-			waiting = append(waiting, "case:"+id+"@"+last)
+			waiting[id] = last
 		}
 	}
-	sort.Strings(waiting) // the signature has to be stable, the map is not
 	return waiting, nil
 }
 
