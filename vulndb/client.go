@@ -59,28 +59,29 @@ func postJSON(ctx context.Context, c *http.Client, rawURL string, body, out any)
 	return do(ctx, c, req, out)
 }
 
-func do(ctx context.Context, c *http.Client, req *http.Request, out any) error {
-	resp, err := c.Do(req)
+// getText fetches a non-JSON answer (maven-metadata.xml).
+func getText(ctx context.Context, c *http.Client, rawURL string, header map[string]string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return netError(req.URL, err)
+		return nil, err
 	}
-	defer resp.Body.Close()
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+	raw, err := fetch(c, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%s: empty answer", req.URL.Host)
+	}
+	return raw, nil
+}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+func do(ctx context.Context, c *http.Client, req *http.Request, out any) error {
+	raw, err := fetch(c, req)
 	if err != nil {
-		return fmt.Errorf("%s: reading the answer: %w", req.URL.Host, err)
-	}
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return errNotFound
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return fmt.Errorf("%s: rate limit reached (HTTP 429) — wait or store an API key as vulndb_token", req.URL.Host)
-	case resp.StatusCode == http.StatusForbidden && len(raw) == 0:
-		// Ein leerer 403 kommt in dieser Umgebung fast immer vom
-		// Egress-Proxy, nicht von der Datenbank.
-		return fmt.Errorf("%s: refused without a body (HTTP 403) — the host is probably missing from the egress allowlist", req.URL.Host)
-	case resp.StatusCode >= 400:
-		return fmt.Errorf("%s: HTTP %d: %s", req.URL.Host, resp.StatusCode, snippet(raw))
+		return err
 	}
 	if out == nil {
 		return nil
@@ -89,6 +90,34 @@ func do(ctx context.Context, c *http.Client, req *http.Request, out any) error {
 		return fmt.Errorf("%s: answer is not valid JSON: %w", req.URL.Host, err)
 	}
 	return nil
+}
+
+// fetch makes the request and turns a transport error or an error status
+// into an error, whatever the body's format.
+func fetch(c *http.Client, req *http.Request) ([]byte, error) {
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, netError(req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("%s: reading the answer: %w", req.URL.Host, err)
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, errNotFound
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, fmt.Errorf("%s: rate limit reached (HTTP 429) — wait or store an API key as vulndb_token", req.URL.Host)
+	case resp.StatusCode == http.StatusForbidden && len(raw) == 0:
+		// Ein leerer 403 kommt in dieser Umgebung fast immer vom
+		// Egress-Proxy, nicht von der Datenbank.
+		return nil, fmt.Errorf("%s: refused without a body (HTTP 403) — the host is probably missing from the egress allowlist", req.URL.Host)
+	case resp.StatusCode >= 400:
+		return nil, fmt.Errorf("%s: HTTP %d: %s", req.URL.Host, resp.StatusCode, snippet(raw))
+	}
+	return raw, nil
 }
 
 // errNotFound trennt „gibt es nicht" von „ging schief" — ein Advisory, das eine

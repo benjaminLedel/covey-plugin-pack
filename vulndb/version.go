@@ -19,6 +19,17 @@ import (
 // compareVersions als solches — der Aufrufer nennt dann alle Kandidaten statt
 // einen zu raten.
 
+// compareVersionsFor compares two versions under the ordering of their
+// ecosystem. Maven is the one ecosystem here whose versions are not
+// semver-shaped ("1.0.0.Final", "33.4.0-jre"), so it gets its own comparison
+// (maven.go); everything else goes through compareVersions.
+func compareVersionsFor(ecosystem, a, b string) (cmp int, ok bool) {
+	if ecosystem == EcosystemMaven {
+		return compareMaven(a, b)
+	}
+	return compareVersions(a, b)
+}
+
 // compareVersions vergleicht zwei Versionen. ok=false heißt: mindestens eine
 // von beiden ist keine Punktversion (z. B. "dev-master"), eine Ordnung gibt es
 // dann nicht.
