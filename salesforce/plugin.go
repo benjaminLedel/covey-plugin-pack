@@ -192,13 +192,24 @@ func (System) Execute(ctx context.Context, action string, params json.RawMessage
 	case "get_case":
 		// Already read by the wall — reading it a second time would make the
 		// safety cost an API call for nothing.
+		// The custom fields cost one more query, so only get_case pays it —
+		// the reads behind the wall and list_cases stay with the standard set.
 		if guarded != nil {
-			return *guarded, nil
+			return c.withCustomFields(ctx, *guarded), nil
 		}
+		var (
+			k   Case
+			err error
+		)
 		if in.CaseID == "" && in.CaseNumber != "" {
-			return c.GetCaseByNumber(ctx, in.CaseNumber)
+			k, err = c.GetCaseByNumber(ctx, in.CaseNumber)
+		} else {
+			k, err = c.GetCase(ctx, in.CaseID)
 		}
-		return c.GetCase(ctx, in.CaseID)
+		if err != nil {
+			return nil, err
+		}
+		return c.withCustomFields(ctx, k), nil
 
 	case "list_cases":
 		cases, err := c.ListCases(ctx, ListOptions{
@@ -347,7 +358,9 @@ func escalate(ctx context.Context, c *Client, caseID, note string) (any, error) 
 // the account procedures through every turn, and an agent that only reads
 // customers does not carry the case ones.
 const docCases = `Available Salesforce actions: get_case {"case_id":"500…"} (a case number the customer quotes works too:
-   {"case_number":"00001026"}), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
+   {"case_number":"00001026"}; "fields" holds the org's own case fields that are set, by API name — a web
+   form often puts the customer's whole message there and leaves "description" empty, so read them
+   before you conclude a case has no content), list_cases {"open":true,"assigned":false,"status":"New","limit":20}
    (plus "waiting":true for only the cases waiting for an answer: the customer wrote last, or nobody has
    written yet — an internal note counts as an answer, so a case you have noted drops out until the
    customer writes again)

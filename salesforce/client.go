@@ -272,6 +272,10 @@ type Case struct {
 	CreatedAt    string `json:"created_at,omitempty"`
 	UpdatedAt    string `json:"updated_at,omitempty"`
 	URL          string `json:"url,omitempty"`
+	// Fields are the org's own case fields (API names ending in __c) that carry
+	// a value. Only get_case fills them — see CustomFields.
+	Fields      map[string]any `json:"fields,omitempty"`
+	FieldsError string         `json:"fields_error,omitempty"`
 }
 
 func (c *Client) normalize(r caseRecord) Case {
@@ -322,6 +326,61 @@ func (c *Client) GetCase(ctx context.Context, id string) (Case, error) {
 		return Case{}, fmt.Errorf("case %s not found (or not visible to the run-as user)", id)
 	}
 	return c.normalize(rows[0]), nil
+}
+
+// CustomFields reads the case's own fields — the ones an org adds, ending in
+// __c. A web-to-case form often writes the customer's whole message into such
+// a field and leaves Description empty; without them the agent sees a case
+// with no content. FIELDS(CUSTOM) selects them without knowing their names, so
+// a field added to the form later shows up without touching the credential.
+// Empty and false values are left out: an org with dozens of unused checkboxes
+// would otherwise bury the one field that matters.
+func (c *Client) CustomFields(ctx context.Context, id string) (map[string]any, error) {
+	if err := checkID("case_id", id); err != nil {
+		return nil, err
+	}
+	rows, err := queryRows[map[string]any](ctx, c, fmt.Sprintf("SELECT FIELDS(CUSTOM) FROM Case WHERE Id = '%s' LIMIT 1", soqlEscape(id)))
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	out := map[string]any{}
+	for k, v := range rows[0] {
+		if !strings.HasSuffix(k, "__c") {
+			continue
+		}
+		switch x := v.(type) {
+		case nil:
+			continue
+		case string:
+			if strings.TrimSpace(x) == "" {
+				continue
+			}
+		case bool:
+			if !x {
+				continue
+			}
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// withCustomFields adds the custom fields to a case read for get_case. A
+// failure does not cost the case: the agent still gets it, with the reason.
+func (c *Client) withCustomFields(ctx context.Context, k Case) Case {
+	fields, err := c.CustomFields(ctx, k.ID)
+	if err != nil {
+		k.FieldsError = err.Error()
+		return k
+	}
+	k.Fields = fields
+	return k
 }
 
 // GetCaseByNumber reads a case by the number a customer quotes ("00001026").

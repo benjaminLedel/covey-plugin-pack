@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,7 @@ type fakeOrg struct {
 	soapRequest  string
 	soapFault    string // when set, the SOAP login answers with this fault
 	failNextAuth bool   // the next API call answers INVALID_SESSION_ID
+	fieldsFail   bool   // SELECT FIELDS(CUSTOM) answers with an error
 
 	cases    []map[string]any
 	queues   []map[string]any // QueueSobject rows (queue join table)
@@ -127,6 +129,11 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/query/"):
 		q := r.URL.Query().Get("q")
 		f.queries = append(f.queries, q)
+		if f.fieldsFail && strings.Contains(q, "FIELDS(CUSTOM)") {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `[{"message":"FIELDS() is not supported","errorCode":"MALFORMED_QUERY"}]`)
+			return
+		}
 		switch {
 		case strings.Contains(q, "FROM CaseComment"):
 			writeRecords(w, f.comments)
@@ -389,6 +396,63 @@ func TestGetCase(t *testing.T) {
 	res = exec(t, f, "get_case", `{"case_number":"00001026"}`)
 	if res.(Case).ID != caseA {
 		t.Fatalf("lookup by number: %+v", res)
+	}
+}
+
+// A web form that writes the message into a custom field leaves Description
+// empty — the agent has to see the field, or it asks the customer what they
+// meant while the answer sits on the case.
+func TestGetCaseShowsCustomFields(t *testing.T) {
+	f := newFakeOrg(t)
+	k := openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")
+	k["Web_Message__c"] = "Please let blank rows be ignored in the average."
+	k["Brand__c"] = "Other App"
+	k["Unused_Text__c"] = ""
+	k["Unused_Flag__c"] = false
+	k["Nothing__c"] = nil
+	k["Opted_In__c"] = true
+	f.cases = []map[string]any{k}
+
+	got := exec(t, f, "get_case", fmt.Sprintf(`{"case_id":%q}`, caseA)).(Case)
+	want := map[string]any{"Web_Message__c": "Please let blank rows be ignored in the average.", "Brand__c": "Other App", "Opted_In__c": true}
+	if len(got.Fields) != len(want) {
+		t.Fatalf("fields: want only the set custom ones %v, got %v", want, got.Fields)
+	}
+	for name, v := range want {
+		if got.Fields[name] != v {
+			t.Fatalf("field %s: want %v, got %v", name, v, got.Fields[name])
+		}
+	}
+	if !slices.ContainsFunc(f.queries, func(q string) bool { return strings.Contains(q, "FIELDS(CUSTOM)") && strings.Contains(q, "LIMIT 1") }) {
+		t.Fatalf("custom fields have to be selected with FIELDS(CUSTOM) and a LIMIT: %v", f.queries)
+	}
+
+	// By number, too.
+	got = exec(t, f, "get_case", `{"case_number":"00001026"}`).(Case)
+	if got.Fields["Brand__c"] != "Other App" {
+		t.Fatalf("by number: %+v", got.Fields)
+	}
+
+	// list_cases stays with the standard set — one query, no fields.
+	f.queries = nil
+	exec(t, f, "list_cases", `{"open":true}`)
+	for _, q := range f.queries {
+		if strings.Contains(q, "FIELDS(CUSTOM)") {
+			t.Fatalf("list_cases must not pay for custom fields: %v", f.queries)
+		}
+	}
+}
+
+// The custom fields are an addition: when Salesforce refuses the query, the
+// case still comes back, with the reason beside it.
+func TestGetCaseCustomFieldsFailureKeepsCase(t *testing.T) {
+	f := newFakeOrg(t)
+	f.fieldsFail = true
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
+
+	got := exec(t, f, "get_case", fmt.Sprintf(`{"case_id":%q}`, caseA)).(Case)
+	if got.Number != "00001026" || got.FieldsError == "" || got.Fields != nil {
+		t.Fatalf("want the case with fields_error, got %+v", got)
 	}
 }
 
@@ -757,7 +821,10 @@ func TestOwnCasePassesAndIsReadOnce(t *testing.T) {
 	defer f.mu.Unlock()
 	var n int
 	for _, q := range f.queries {
-		if strings.Contains(q, "FROM Case ") {
+		// The custom fields are a query of their own on purpose (only
+		// get_case pays for them); what must not happen twice is the read
+		// of the case itself.
+		if strings.Contains(q, "FROM Case ") && !strings.Contains(q, "FIELDS(CUSTOM)") {
 			n++
 		}
 	}
