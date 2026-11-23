@@ -22,7 +22,16 @@ import (
 // tickets with Files, old ones with Attachments, and an Email-to-Case setup
 // that may still produce either.
 //
-// So the plugin asks for both and says which kind it found. A plugin that knew
+// And there is a second axis: where the file hangs. A file a user drops onto a
+// case is linked to the case. A file that came in with a mail is not —
+// Email-to-Case stores the mail as an EmailMessage under the case and links the
+// file to that message. An org that does its support by mail therefore has
+// almost all of its screenshots one level below the case, and a plugin that
+// asks the case alone comes back empty on every one of them (covey-plugin-pack
+// #105).
+//
+// So the plugin asks both worlds, for the case and for its mails, and says
+// which kind it found. A plugin that knew
 // only Files would come back empty on an old case and would not mention that it
 // had looked in one place only, which is the worst of the three possible
 // behaviours: the agent concludes there is no screenshot and answers as if
@@ -44,10 +53,23 @@ type FileRef struct {
 	Extension string `json:"extension,omitempty"`
 	Bytes     int    `json:"bytes"`
 	CreatedAt string `json:"created_at,omitempty"`
+	// EmailID is set when the file came in with a mail rather than being put
+	// on the case directly — the id list_messages shows for that mail.
+	EmailID string `json:"email_id,omitempty"`
 }
+
+// maxEmailsForFiles caps how many of a case's mails list_files looks under. A
+// case is a conversation, not an archive; the cap keeps the IN list of the
+// following queries well below SOQL's length limit.
+const maxEmailsForFiles = 200
 
 type contentLinkRecord struct {
 	ContentDocumentID string `json:"ContentDocumentId"`
+	LinkedEntityID    string `json:"LinkedEntityId"`
+}
+
+type idRecord struct {
+	ID string `json:"Id"`
 }
 
 type contentVersionRecord struct {
@@ -65,27 +87,60 @@ type legacyAttachmentRecord struct {
 	ContentType string `json:"ContentType"`
 	BodyLength  int    `json:"BodyLength"`
 	CreatedDate string `json:"CreatedDate"`
+	ParentID    string `json:"ParentId"`
 }
 
-// ListFiles returns everything attached to a case, from both storage worlds,
-// newest first.
+// ListFiles returns everything attached to a case or to one of its mails, from
+// both storage worlds, newest first.
 func (c *Client) ListFiles(ctx context.Context, caseID string) ([]FileRef, error) {
 	if err := checkID("case_id", caseID); err != nil {
 		return nil, err
 	}
 	id := soqlEscape(caseID)
 
+	mails, err := queryRows[idRecord](ctx, c, fmt.Sprintf(
+		"SELECT Id FROM EmailMessage WHERE ParentId = '%s' ORDER BY MessageDate DESC LIMIT %d", id, maxEmailsForFiles))
+	if err != nil {
+		return nil, err
+	}
+	parents := []string{"'" + id + "'"}
+	isMail := map[string]bool{}
+	for _, m := range mails {
+		if m.ID == "" || checkID("email_id", m.ID) != nil {
+			continue
+		}
+		isMail[m.ID] = true
+		parents = append(parents, "'"+soqlEscape(m.ID)+"'")
+	}
+	in := strings.Join(parents, ",")
+	// emailOf names the mail a parent id stands for, or "" for the case.
+	emailOf := func(parent string) string {
+		if isMail[parent] {
+			return parent
+		}
+		return ""
+	}
+
 	links, err := queryRows[contentLinkRecord](ctx, c, fmt.Sprintf(
-		"SELECT ContentDocumentId FROM ContentDocumentLink WHERE LinkedEntityId = '%s'", id))
+		"SELECT ContentDocumentId, LinkedEntityId FROM ContentDocumentLink WHERE LinkedEntityId IN (%s)", in))
 	if err != nil {
 		return nil, err
 	}
 
 	out := []FileRef{}
 	if len(links) > 0 {
+		// One document can be linked to the case and to a mail at once; it is
+		// one file. The mail wins, because it says where the file came from.
+		via := map[string]string{}
 		docs := make([]string, 0, len(links))
 		for _, l := range links {
-			docs = append(docs, "'"+soqlEscape(l.ContentDocumentID)+"'")
+			prev, seen := via[l.ContentDocumentID]
+			if !seen {
+				docs = append(docs, "'"+soqlEscape(l.ContentDocumentID)+"'")
+			}
+			if !seen || prev == "" {
+				via[l.ContentDocumentID] = emailOf(l.LinkedEntityID)
+			}
 		}
 		// IsLatest: a document may have many versions, and the agent wants the
 		// one the customer would see.
@@ -102,13 +157,13 @@ func (c *Client) ListFiles(ctx context.Context, caseID string) ([]FileRef, error
 			}
 			out = append(out, FileRef{
 				ID: v.ID, Kind: "file", Name: name, Extension: v.FileExtension,
-				Bytes: v.ContentSize, CreatedAt: v.CreatedDate,
+				Bytes: v.ContentSize, CreatedAt: v.CreatedDate, EmailID: via[v.ContentDocumentID],
 			})
 		}
 	}
 
 	legacy, err := queryRows[legacyAttachmentRecord](ctx, c, fmt.Sprintf(
-		"SELECT Id, Name, ContentType, BodyLength, CreatedDate FROM Attachment WHERE ParentId = '%s'", id))
+		"SELECT Id, Name, ContentType, BodyLength, CreatedDate, ParentId FROM Attachment WHERE ParentId IN (%s)", in))
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +171,7 @@ func (c *Client) ListFiles(ctx context.Context, caseID string) ([]FileRef, error
 		out = append(out, FileRef{
 			ID: a.ID, Kind: "attachment", Name: a.Name,
 			Extension: strings.TrimPrefix(filepath.Ext(a.Name), "."),
-			Bytes:     a.BodyLength, CreatedAt: a.CreatedDate,
+			Bytes:     a.BodyLength, CreatedAt: a.CreatedDate, EmailID: emailOf(a.ParentID),
 		})
 	}
 

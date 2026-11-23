@@ -340,7 +340,8 @@ const docCases = `Available Salesforce actions: get_case {"case_id":"500…"} (a
    list_files {"case_id":"500…"}, download_file {"file_id":"068…","name":"screenshot.png"},
    attach_file {"case_id":"500…","path":"screenshot.png"}.
    A case with a screenshot is answered by LOOKING at it: list_files, then download_file, then read the
-   file at the returned path — do not guess from the text what the picture shows.
+   file at the returned path — do not guess from the text what the picture shows. list_files also finds
+   what came in with the case's mails; such a file carries the email_id of its message.
    reply with internal=true writes an internal note; internal=false answers the customer — depending on the
    instance as a portal-visible comment or as a mail (the result says which one it was).
    Correlation key for status blocked: salesforce:case:<case_id>.`
