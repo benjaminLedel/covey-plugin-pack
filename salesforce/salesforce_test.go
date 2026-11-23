@@ -133,11 +133,11 @@ func (f *fakeOrg) handle(w http.ResponseWriter, r *http.Request) {
 		case strings.Contains(q, "FROM EmailMessage"):
 			writeRecords(w, f.messages)
 		case strings.Contains(q, "FROM ContentDocumentLink"):
-			writeRecords(w, f.links)
+			writeRecords(w, onParents(f.links, "LinkedEntityId", q))
 		case strings.Contains(q, "FROM ContentVersion"):
 			writeRecords(w, f.versions)
 		case strings.Contains(q, "FROM Attachment"):
-			writeRecords(w, f.legacy)
+			writeRecords(w, onParents(f.legacy, "ParentId", q))
 		case strings.Contains(q, "FROM Account"):
 			writeRecords(w, f.accounts)
 		case strings.Contains(q, "FROM Task"):
@@ -1297,6 +1297,68 @@ func TestListFilesFindsBothWorlds(t *testing.T) {
 	}
 	if files[1].Kind != "attachment" || files[1].Name != "log.txt" {
 		t.Fatalf("legacy attachment: %+v", files[1])
+	}
+}
+
+// onParents keeps the rows whose parent field names an id the query asks for —
+// the double's version of "WHERE LinkedEntityId IN (…)". A row without the
+// field is kept, so seeds that do not care about the parent stay as they were.
+func onParents(rows []map[string]any, field, q string) []map[string]any {
+	var out []map[string]any
+	for _, r := range rows {
+		p, ok := r[field].(string)
+		if !ok || strings.Contains(q, "'"+p+"'") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestListFilesFindsTheMailsFiles: Email-to-Case links a customer's screenshot
+// to the EmailMessage, not to the case. Asking the case alone came back empty
+// on every mailed-in case (covey-plugin-pack #105); the files of the case's
+// mails belong in the list, each saying which mail it came with.
+func TestListFilesFindsTheMailsFiles(t *testing.T) {
+	f := newFakeOrg(t)
+	const mail = "02s0000000001AAA"
+	f.messages = []map[string]any{{"Id": mail, "ParentId": caseA}}
+	f.links = []map[string]any{
+		{"ContentDocumentId": "0698d000000DocuAAG", "LinkedEntityId": mail},
+		// The same document also linked to the case: one file, not two.
+		{"ContentDocumentId": "0698d000000DocuAAG", "LinkedEntityId": caseA},
+		// A file on some other record entirely must not show up.
+		{"ContentDocumentId": "0698d000000ElseAAG", "LinkedEntityId": "5008d000000OtherAA"},
+	}
+	f.versions = []map[string]any{{
+		"Id": fileID, "ContentDocumentId": "0698d000000DocuAAG", "Title": "screenshot",
+		"FileExtension": "png", "ContentSize": 4, "CreatedDate": "2026-08-17T09:00:00.000+0000",
+	}}
+	f.legacy = []map[string]any{
+		{"Id": legacyID, "Name": "old.png", "BodyLength": 3, "CreatedDate": "2026-08-16T09:00:00.000+0000", "ParentId": mail},
+		{"Id": "00P8d000000NoneAAG", "Name": "foreign.txt", "BodyLength": 1, "CreatedDate": "2026-08-15T09:00:00.000+0000", "ParentId": "5008d000000OtherAA"},
+	}
+
+	files := exec(t, f, "list_files", `{"case_id":"`+caseA+`"}`).([]FileRef)
+	if len(files) != 2 {
+		t.Fatalf("the mail's file and the mail's legacy attachment, once each: %+v", files)
+	}
+	if files[0].ID != fileID || files[0].EmailID != mail {
+		t.Fatalf("a file that came with a mail says which one: %+v", files[0])
+	}
+	if files[1].ID != legacyID || files[1].EmailID != mail {
+		t.Fatalf("the old world hangs off the mail as well: %+v", files[1])
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var asked bool
+	for _, q := range f.queries {
+		if strings.Contains(q, "FROM ContentDocumentLink") && strings.Contains(q, "'"+mail+"'") && strings.Contains(q, "'"+caseA+"'") {
+			asked = true
+		}
+	}
+	if !asked {
+		t.Fatalf("the link query has to name the case and its mails: %v", f.queries)
 	}
 }
 
