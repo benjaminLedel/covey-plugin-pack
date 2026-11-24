@@ -1056,6 +1056,59 @@ func TestListCasesWaiting(t *testing.T) {
 	}
 }
 
+// TestAutoResponseIsNoAnswer: Email-to-Case acknowledges a customer's mail
+// from a no-reply address seconds after it arrives. Counted as an answer, it
+// made every new case look settled, and an agent working from the waiting list
+// never saw one (#111). A human reply from any other address still settles it.
+func TestAutoResponseIsNoAnswer(t *testing.T) {
+	f := newFakeOrg(t)
+	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
+	f.messages = []map[string]any{
+		{"Id": "02s0000000001AAA", "ParentId": caseA, "MessageDate": "2026-08-17T08:00:00.000+0000", "Incoming": true, "FromAddress": "ada@example.org"},
+		{"Id": "02s0000000002AAA", "ParentId": caseA, "MessageDate": "2026-08-17T08:00:04.000+0000", "Incoming": false, "FromAddress": "no-reply@example.com"},
+	}
+	ctx := context.Background()
+
+	has, sig, err := sys.HasWorkSigned(ctx, f.cred(), "")
+	if err != nil || !has {
+		t.Fatalf("a case with only an acknowledgement is still waiting: %v %v", has, err)
+	}
+	if sig != "case:"+caseA+"@2026-08-17T08:00:00.000+0000" {
+		t.Fatalf("signature: %s", sig)
+	}
+	if got := exec(t, f, "list_cases", `{"open":true,"waiting":true}`).([]Case); len(got) != 1 || got[0].ID != caseA {
+		t.Fatalf("the waiting list has to show it too: %+v", got)
+	}
+
+	f.mu.Lock()
+	f.messages = append(f.messages, map[string]any{"Id": "02s0000000003AAA", "ParentId": caseA, "MessageDate": "2026-08-17T09:00:00.000+0000", "Incoming": false, "FromAddress": "support@example.com"})
+	f.mu.Unlock()
+	if has, _, _ := sys.HasWorkSigned(ctx, f.cred(), ""); has {
+		t.Fatal("a reply from a real address still answers the case")
+	}
+}
+
+func TestIsAutoResponse(t *testing.T) {
+	for from, want := range map[string]bool{
+		"no-reply@example.com":                   true,
+		"NoReply@example.com":                    true,
+		"no_reply@example.com":                   true,
+		"do-not-reply@example.com":               true,
+		"donotreply@example.com":                 true,
+		"noreply-support@example.com":            true,
+		"Example Support <no-reply@example.com>": true,
+		"support@example.com":                    false,
+		"ada@example.org":                        false,
+		"reply@example.com":                      false,
+		"":                                       false,
+		"no-reply":                               false,
+	} {
+		if got := isAutoResponse(from); got != want {
+			t.Errorf("isAutoResponse(%q) = %v, want %v", from, got, want)
+		}
+	}
+}
+
 func TestHasWorkAssignedNarrowsToTheOwnUser(t *testing.T) {
 	f := newFakeOrg(t)
 	f.cases = []map[string]any{openCase(caseA, "00001026", "Support Tier 1", "2026-08-17T08:00:00.000+0000")}
