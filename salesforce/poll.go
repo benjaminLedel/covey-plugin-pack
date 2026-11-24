@@ -66,7 +66,10 @@ func (System) HasWorkSigned(ctx context.Context, cred target.Credential, kind st
 // that went out or was noted. Who answered is deliberately not asked. In a
 // shared queue a colleague's answer is an answer too, and the agent's own
 // internal note ("waiting for the log file") is a deliberate pause — both mean
-// the case is not waiting for the agent right now.
+// the case is not waiting for the agent right now. The one exception is a mail
+// from an address nobody can answer (see isAutoResponse): Email-to-Case sends
+// its acknowledgement seconds after the customer's mail, and counting it made
+// every new case look answered from its first second.
 //
 // A case with no activity at all counts as waiting: it IS the customer's first
 // message.
@@ -107,7 +110,7 @@ func awaitingReply(ctx context.Context, c *Client, cases []Case) (map[string]str
 	in := strings.Join(ids, ",")
 
 	emails, err := queryRows[emailRecord](ctx, c, fmt.Sprintf(
-		"SELECT Id, ParentId, MessageDate, Incoming FROM EmailMessage WHERE ParentId IN (%s)", in))
+		"SELECT Id, ParentId, MessageDate, Incoming, FromAddress FROM EmailMessage WHERE ParentId IN (%s)", in))
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +128,12 @@ func awaitingReply(ctx context.Context, c *Client, cases []Case) (map[string]str
 		}
 	}
 	for _, e := range emails {
-		if e.Incoming {
+		switch {
+		case e.Incoming:
 			newer(inbound, e.ParentID, e.MessageDate)
-		} else {
+		case isAutoResponse(e.FromAddress):
+			// An acknowledgement, not an answer — the customer is still waiting.
+		default:
 			newer(answered, e.ParentID, e.MessageDate)
 		}
 	}
@@ -146,6 +152,24 @@ func awaitingReply(ctx context.Context, c *Client, cases []Case) (map[string]str
 		}
 	}
 	return waiting, nil
+}
+
+// isAutoResponse reports whether an outgoing mail came from an address that
+// cannot be answered — the sender of auto-response rules and other system
+// mail. The local part decides, with separators ignored, so "no-reply",
+// "noreply", "no_reply", "do-not-reply" and "donotreply" all match, as does a
+// suffix such as "noreply-support".
+func isAutoResponse(from string) bool {
+	addr := strings.ToLower(strings.TrimSpace(from))
+	if i := strings.LastIndex(addr, "<"); i >= 0 { // "Name <addr>"
+		addr = strings.TrimSuffix(addr[i+1:], ">")
+	}
+	local, _, ok := strings.Cut(addr, "@")
+	if !ok {
+		return false
+	}
+	local = strings.NewReplacer("-", "", "_", "", ".", "").Replace(local)
+	return strings.HasPrefix(local, "noreply") || strings.HasPrefix(local, "donotreply")
 }
 
 // sigWritingActions are the actions that can move the work signature. The
