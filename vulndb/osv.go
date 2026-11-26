@@ -225,6 +225,7 @@ func toFinding(p Package, v osvVuln) Finding {
 			break
 		}
 	}
+	var ranges []osvRange
 	for _, a := range v.Affected {
 		if !strings.EqualFold(a.Package.Name, p.Name) || !strings.EqualFold(a.Package.Ecosystem, p.Ecosystem) {
 			continue
@@ -232,9 +233,16 @@ func toFinding(p Package, v osvVuln) Finding {
 		if f.Severity == "" {
 			f.Severity = strings.ToUpper(a.DatabaseSpecific.Severity)
 		}
-		fixed, candidates, rangeText := resolveFix(p.Ecosystem, a.Ranges, p.Version)
+		// An advisory may list the same package in several affected entries,
+		// one per release line (GitHub's advisories do this routinely). The
+		// version's line can sit in any of them, so all ranges are collected
+		// before the fix is resolved; stopping at the first entry reported the
+		// wrong line, or none at all.
+		ranges = append(ranges, a.Ranges...)
+	}
+	if len(ranges) > 0 {
+		fixed, candidates, rangeText := resolveFix(p.Ecosystem, ranges, p.Version)
 		f.Fixed, f.FixedCandidates, f.AffectedRange = fixed, candidates, rangeText
-		break
 	}
 	for _, r := range v.References {
 		if r.Type == "ADVISORY" && r.URL != "" {
