@@ -35,6 +35,9 @@ func (plugin) Describe() covey.Description {
 		Description: "Known vulnerabilities in declared package dependencies: scan a lock file (package-lock.json, composer.lock, pubspec.lock, gradle.lockfile) against OSV.dev in one batch (scan_lockfile), check individual packages (query/query_batch), fetch an advisory merged from OSV, the GitHub Advisory Database and NVD (advisory), and look up the next safe version in the registry (latest_version). Covers npm, Packagist (Composer), Pub (Dart/Flutter) and Maven (Java/Kotlin, Gradle). Needs no credentials — every source is public.",
 		Category:    "dev",
 		Scopes:      []string{"read"},
+		// Every source is public and reached through a declared host, which
+		// never gets a credential anyway — so none is asked for.
+		Credentials: covey.CredentialsNone,
 		// Declared, not reached at runtime: an operator sees the whole list
 		// before installing. They are also exactly the hosts that have to be
 		// in the egress allowlist, and naming them here is what lets the store

@@ -107,6 +107,14 @@ type Description struct {
 	// Auth says where the host should put the token. Empty =
 	// "Authorization: Bearer {token}".
 	Auth AuthDesc `json:"auth,omitempty"`
+	// Credentials says whether the plugin needs a brokered secret at all:
+	// CredentialsRequired (the default) — <name>_token and <name>_url;
+	// CredentialsOptional — granted without a secret, whatever is stored is
+	// passed on; CredentialsNone — never needs one, for a plugin that reaches
+	// only hosts it declares. Both of the latter make <name>_url optional. An
+	// unknown value reads as the default. Needs a covey that knows the field;
+	// an older one ignores it and keeps asking for both secrets.
+	Credentials string `json:"credentials,omitempty"`
 	// Hosts are additional hosts this plugin reaches beyond the one brokered
 	// base URL. Declared, not requested at runtime, so an operator sees them
 	// BEFORE installing rather than in a log afterwards. The brokered
@@ -142,6 +150,13 @@ type WebhookDesc struct {
 	// SignatureHeader carries it (default "X-Hub-Signature").
 	SignatureHeader string `json:"signature_header,omitempty"`
 }
+
+// The values of Description.Credentials.
+const (
+	CredentialsRequired = ""
+	CredentialsOptional = "optional"
+	CredentialsNone     = "none"
+)
 
 type AuthDesc struct {
 	Header string `json:"header,omitempty"`
