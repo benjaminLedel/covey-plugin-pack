@@ -12,7 +12,8 @@
 //
 // It is the odd one among the three in a way worth stating: it has no brokered
 // system at all. All seven sources are public, so the module declares them as
-// hosts and runs with no credential — there is nothing here to leak.
+// hosts, runs with no credential and says so (credentials: "none") — there is
+// nothing here to leak.
 package main
 
 import (
@@ -35,6 +36,13 @@ func (plugin) Describe() covey.Description {
 		Description: "Known vulnerabilities in declared package dependencies: scan a lock file (package-lock.json, composer.lock, pubspec.lock, gradle.lockfile) against OSV.dev in one batch (scan_lockfile), check individual packages (query/query_batch), fetch an advisory merged from OSV, the GitHub Advisory Database and NVD (advisory), and look up the next safe version in the registry (latest_version). Covers npm, Packagist (Composer), Pub (Dart/Flutter) and Maven (Java/Kotlin, Gradle). Needs no credentials — every source is public.",
 		Category:    "dev",
 		Scopes:      []string{"read"},
+		// Every source is public and reached as an absolute URL on a declared
+		// host, where the host never sends a credential. "none" rather than
+		// "optional": a stored vulndb_token could not reach NVD from here, so
+		// offering one would promise a rate limit the module cannot raise.
+		// Without the declaration the broker denies every action for a
+		// vulndb_token nobody needs.
+		Credentials: "none",
 		// Declared, not reached at runtime: an operator sees the whole list
 		// before installing. They are also exactly the hosts that have to be
 		// in the egress allowlist, and naming them here is what lets the store
