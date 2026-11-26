@@ -100,6 +100,44 @@ func TestResolveFixIgnoresGitRanges(t *testing.T) {
 	}
 }
 
+// GitHub's advisories list one affected entry per release line, all for the
+// same package. GHSA-p6pp-m3f8-5c89 (jackson-core) has three such lines; a
+// version on the middle one must get the middle line's fix, not the first
+// entry's.
+func TestToFindingSearchesEveryAffectedEntry(t *testing.T) {
+	line := func(name, introduced, fixed string) osvAffected {
+		a := osvAffected{Ranges: []osvRange{{Type: "ECOSYSTEM", Events: []map[string]string{
+			{"introduced": introduced}, {"fixed": fixed},
+		}}}}
+		a.Package.Name = name
+		a.Package.Ecosystem = EcosystemMaven
+		return a
+	}
+	const core = "com.fasterxml.jackson.core:jackson-core"
+	v := osvVuln{ID: "GHSA-p6pp-m3f8-5c89", Affected: []osvAffected{
+		line(core, "2.17.0", "2.18.11"),
+		line(core, "2.19.0", "2.21.7"),
+		line(core, "2.22.0", "2.22.3"),
+		line("tools.jackson.core:jackson-core", "3.0.0", "3.1.7"),
+	}}
+
+	f := toFinding(Package{Ecosystem: EcosystemMaven, Name: core, Version: "2.21.4"}, v)
+	if f.Fixed != "2.21.7" {
+		t.Errorf("fixed = %q, want 2.21.7 (the line 2.21.4 sits on)", f.Fixed)
+	}
+	if len(f.FixedCandidates) != 0 {
+		t.Errorf("fixed_candidates = %v — the line is decidable", f.FixedCandidates)
+	}
+	for _, want := range []string{"2.18.11", "2.21.7", "2.22.3"} {
+		if !strings.Contains(f.AffectedRange, want) {
+			t.Errorf("affected_range %q misses the line ending at %s", f.AffectedRange, want)
+		}
+	}
+	if strings.Contains(f.AffectedRange, "3.1.7") {
+		t.Errorf("affected_range %q contains another package's line", f.AffectedRange)
+	}
+}
+
 func TestToFindingPrefersCVE(t *testing.T) {
 	v := osvVuln{
 		ID:      "GHSA-35jh-r3h4-6jhm",
